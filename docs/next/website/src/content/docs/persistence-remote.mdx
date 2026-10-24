@@ -1,0 +1,312 @@
+---
+title: Persistence and remote access
+description: Detach from Herdr, reattach later, use named sessions, and connect over SSH.
+---
+
+Herdr keeps panes running in a background server. Your terminal client can detach and reconnect later.
+
+For the local, SSH, and `herdr --remote` workflows, see [How to work with Herdr](/docs/how-to-work/).
+
+## Detach and reattach
+
+Detach the client with `ctrl+b q`; panes and agents keep running. Reattach by running `herdr` again. Stop the session and its panes with `herdr server stop`.
+
+When Herdr starts again after a full server stop, it restores the saved session shape. For what survives detach, server restart, screen history replay, native agent session restore, and live handoff, see [Session state and restore](/docs/session-state/).
+
+## Named sessions
+
+Use named sessions when you want independent Herdr servers.
+
+```bash
+herdr session list
+herdr session attach work
+herdr session attach side-project
+herdr session stop work
+herdr session delete side-project
+```
+
+A named session has its own panes, tabs, workspaces, sockets, and runtime state. It still shares the same global config file.
+
+Use `--json` for scripts:
+
+```bash
+herdr session list --json
+herdr session stop work --json
+herdr session delete side-project --json
+```
+
+## Saved SSH machines
+
+Save repeat targets to work across several machines from one Herdr client:
+
+```bash
+herdr machine add workbox --label "Build machine" --remote-session agents
+herdr machine add ssh://you@server:2222 --label "Production" --remote-session operations
+herdr machine list
+```
+
+`machine add` prepares Herdr on the remote machine and starts the requested session's background server before saving the profile. It checks the running server separately from the installed binary and keeps compatible servers, even when their release versions differ from your client. If the running server needs an upgrade, setup uses live handoff when supported to preserve pane processes; otherwise it asks before stopping the server. Missing or incompatible installations use the same approval-based setup as `--remote`; run the command in an interactive terminal when approval is needed. Cancelling setup leaves the profile unsaved. The remote server keeps running after setup exits.
+
+Saved-machine changes apply to open local Herdr clients automatically, normally within a second. An in-progress machine switch finishes before the change is applied. Added or enabled SSH machines appear with Local in the machine sidebar and connect in the background without changing your selection. Select a machine or one of its workspaces to switch to it. Herdr keeps metadata, agent state, and notifications from connected machines available, but streams pane surfaces, input, geometry, and graphics only for the selected machine. Workspace, tab, pane, agent, and graphics identities stay scoped to their machine even when two servers happen to use the same internal ID.
+
+Local opens directly on startup, without waiting for saved SSH machines or showing a connection badge. With enabled saved machines, the client can also open if Local actually fails, and stopping or restarting Local does not close healthy SSH connections. Local reconnects when its server returns, without taking selection away from the machine you are using. A stalled machine cannot block another machine's input or connection handling.
+
+Herdr checks connected SSH machines for application-level activity and uses a lightweight health probe while they are quiet. Local relies on its native connection closing or failing, not remote health probes. After sleep, a network interruption, or SSH failure, an unhealthy machine changes to Reconnecting and retries with bounded backoff. Its last workspace, agent, and selected pane state remains visible but dimmed and frozen; input and navigation into that cached state stay disabled until a fresh connection and coherent surface arrive. Reconnects never answer prompts or install, update, restart, or hand off a remote server. A target that needs host-key approval, authentication, or a compatible Herdr install shows Attention while Local and other machines keep working. Run the profile's explicit standalone command in a terminal to finish setup, for example:
+
+```bash
+herdr --remote workbox --session agents --handoff
+```
+
+If the machine shows Attention, restart the client after setup to retry its connection. Rename, disable, or remove profiles by their opaque ID:
+
+```bash
+herdr machine rename <profile-id> --label "New name"
+herdr machine disable <profile-id>
+herdr machine enable <profile-id>
+herdr machine remove <profile-id>
+```
+
+Renaming updates the label without reconnecting. Removing or disabling a machine disconnects only that machine from the client; its remote sessions keep running, even if the machine is unreachable. If you remove or disable the machine you are viewing, the client returns to Local. If Local is unavailable, it shows that and reconnects rather than selecting another remote. An unreadable or invalid saved-machine file leaves current connections unchanged and shows a notice; the client retries reading it automatically.
+
+Saved profiles contain only the opaque ID, label, SSH target, explicit remote session, and enabled state. Passwords, private keys, agent tickets, and SSH control sockets are never stored in the machine catalog.
+
+The client uses local keybindings by default. Custom commands advertised by the selected machine still execute on that machine. Herdr does not copy local command plugins, configuration, executables, or secrets to SSH hosts; a missing remote command or plugin fails visibly.
+
+## Remote attach over SSH
+
+Herdr supports two remote modes. [How to work with Herdr](/docs/how-to-work/) compares them. SSH to the server and run `herdr` there for the tmux-style path, use saved SSH machines for persistent multi-machine work, or attach through SSH from your local machine:
+
+```bash
+herdr --remote workbox
+herdr --remote ssh://you@server:2222
+```
+
+In this mode, your local Herdr is a thin client. It connects over SSH, starts or attaches to the remote Herdr server, and streams the UI back to your local terminal. Because the client runs locally, Herdr can bridge local desktop features such as image clipboard paste into the remote session by copying the image to a remote temp file and pasting that path.
+
+By default, `herdr --remote` uses your local Herdr keybindings for that attach. This keeps local muscle memory even when the remote server has different config. The local keybindings are a snapshot from attach time; detach and reattach after editing local keybindings. Use `--remote-keybindings server` when you want the remote server config instead. Local custom command keybindings are not sent, because those commands would run on the remote host.
+
+For repeat targets, use your SSH config:
+
+```text
+Host workbox
+  HostName server.example.com
+  User you
+  Port 2222
+```
+
+Then attach with:
+
+```bash
+herdr --remote workbox
+```
+
+Remote attach supports Linux, macOS, and Windows local clients connecting to Linux or macOS hosts on x86_64 and aarch64. Herdr checks the remote platform, prefers a compatible `herdr` already on the remote `PATH`, then checks common direct, Homebrew, mise, and Nix profile install paths. Local and remote versions do not need to match once both support the stable endpoint generation. If no compatible binary exists, interactive runs prompt to install one to `~/.local/bin/herdr`; non-interactive runs fail instead of modifying the host. If `~/.local/bin` is not on the remote `PATH`, Herdr warns after install. Windows is not supported as the remote host.
+
+By default, `herdr --remote` runs remote setup and the bridge through a temporary SSH config that includes your SSH config first, then adds fallback keepalive settings. Existing user keepalive settings win. Linux and macOS clients also use a private per-attach control socket for connection reuse; Windows OpenSSH does not. Set `[remote].manage_ssh_config = false` to use plain `ssh` without Herdr's generated config or control socket.
+
+Remote attach uses your normal OpenSSH authentication. If the target uses a passphrase-protected key in a non-interactive shell, script, CI job, or mobile terminal that cannot show the passphrase prompt, load the key into ssh-agent first:
+
+```bash
+ssh-add
+herdr --remote workbox
+```
+
+For any remote authentication failure, verify plain SSH access first with `ssh workbox`, then run `herdr --remote workbox` again.
+
+A version difference alone does not replace or restart a running remote server. Remote attach uses the restart/stop flow only for a server that predates the stable endpoint generation or the detached-daemon baseline. To opt into experimental live handoff when that one-time upgrade is needed, pass `--handoff`:
+
+```bash
+herdr --remote workbox --handoff
+```
+
+If you SSH into the server first and run `herdr` there, Herdr runs entirely on the server and cannot access your local desktop clipboard beyond normal terminal text paste.
+
+When your local and remote platforms match, Herdr can copy the current local binary for direct installs. For Homebrew, mise, and Nix installs, or when the platforms differ, it downloads the matching release asset for the current client version from `https://herdr.dev/latest.json`.
+
+For local builds or custom binaries, set `HERDR_REMOTE_BINARY` to a local file path before running remote attach.
+
+```bash
+HERDR_REMOTE_BINARY=target/release/herdr herdr --remote workbox
+```
+
+## Remote named sessions
+
+Use `--session` with `--remote` to attach to a named session on the remote host:
+
+```bash
+herdr --remote workbox --session agents
+```
+
+## Several displays, one session
+
+Attach the same session from more than one terminal and each attachment keeps
+its own place in it: its own workspace, its own tab, and its own focused pane.
+Five tabs can be open on five monitors at once, all live, and clicking a tab on
+one monitor does not move any of the others.
+
+Sizing follows from that. A tab is sized to the smallest display watching it, so
+a tab only one display is watching keeps that display's full size and gives up
+nothing. Only a tab two displays are looking at has to fit both.
+
+A display that has just attached starts on the tab the session is being worked
+in, and becomes independent from the moment it is attached.
+
+To go back to one shared view on every display -- useful when pairing, or
+presenting -- turn the behaviour off:
+
+```toml
+[session]
+per_display_focus = false
+```
+
+## Direct terminal attach
+
+Full Herdr attach opens the whole workspace UI. Direct attach opens one server-owned terminal in your current terminal.
+
+Direct terminal attach is Unix-only on Windows.
+
+Attach by agent target:
+
+```bash
+herdr agent attach reviewer
+```
+
+Attach by terminal ID:
+
+```bash
+herdr terminal attach term_abc123
+```
+
+Direct attach streams the current rendered terminal state, then live ANSI frames. Input goes straight to that terminal.
+
+Detach with `ctrl+b q`. Send a literal `ctrl+b` with `ctrl+b ctrl+b`.
+
+Only one writable direct attach client owns input and resize for a terminal. Use `--takeover` to replace an existing owner:
+
+```bash
+herdr terminal attach term_abc123 --takeover
+```
+
+For third-party bridges that only need rendered terminal bytes, use a read-only
+terminal session observer:
+
+```bash
+herdr terminal session observe w1:p1 --cols 120 --rows 40
+```
+
+It prints newline-delimited JSON `terminal.frame` records with base64 ANSI
+bytes, then a `terminal.closed` record when the server closes the stream.
+Multiple observers can watch the same terminal without taking input, resize,
+scroll, or takeover ownership.
+
+For an interactive bridge, use a writable terminal session controller:
+
+```bash
+herdr terminal session control w1:p1 --takeover --cols 120 --rows 40
+```
+
+Control mode prints the same newline-delimited frame records and reads
+newline-delimited JSON commands on stdin. `terminal.input` sends text or
+base64 bytes, `terminal.resize` changes the controller viewport,
+`terminal.scroll` scrolls the attached viewport, and `terminal.release` closes
+the controller. Only one controller owns input and resize at a time.
+
+## Phones and tablets
+
+Herdr reshapes itself for the viewport it is given, on both axes.
+
+A narrow terminal takes the mobile shell: no sidebar, no tab strip, a two-row
+header above a full-width terminal. The threshold is `ui.mobile_width_threshold`
+(64 columns by default) — raise it for a tablet, lower it if you want the
+desktop shell on a narrow split.
+
+A short terminal keeps the desktop shell but stops spending rows on chrome: the
+sidebar folds to its status rail and a tab strip showing a single tab goes away.
+Both come back when the viewport grows. Expanding the sidebar yourself overrides
+the fold for the rest of the session.
+
+### Two drawers
+
+The mobile header has a button at each edge.
+
+The left button opens **spaces**: your workspaces and worktrees, then the agents
+running in them, then the menu. The right button opens **tabs** for the
+workspace you are in — as does the active-tab strip between the two buttons,
+which is the larger target for the same intent.
+
+Each drawer covers three quarters of the width. The quarter left showing is the
+live terminal, and tapping it closes the drawer.
+
+Each drawer keeps its create action — `+ new workspace` on the left, `+ new
+tab` on the right — pinned to a footer band at the bottom, beside **select
+text**. The band never scrolls with the list, so the way back out of select
+text is always one tap away.
+
+### Driving it from the keyboard
+
+Every row a finger can reach is reachable from the keyboard, because on iOS
+terminals a tap is often not forwarded as a click at all.
+
+| Key | Action |
+|---|---|
+| `↑` `↓` (or `k` `j`) | Move the drawer cursor |
+| `Enter` | Activate the row under the cursor |
+| `Tab` | Swap between the two drawers |
+| `Esc` | Close the drawer |
+
+The cursor opens on the row you are already in — the active workspace, the
+active tab — so the first arrow key moves relative to your context.
+
+### The spaces drawer
+
+The left drawer shows the same tree the desktop sidebar shows, at three levels:
+the repository, the checkouts under it, and each checkout's remembered chats.
+Tapping a repository row folds its linked worktrees away and tapping it again
+brings them back — the checkout they branch from stays either way, so you never
+lose your place.
+
+The workspace you are in shows the chats it remembers straight away, and its row
+carries a second line naming its branch and agent state. Every other workspace
+takes one row. Tapping the row you are already on folds its chats away and
+leaves the drawer open; tapping any other row switches to it and closes.
+
+Earlier releases flattened this to a single list of checkouts. Worktrees from
+different repositories sat side by side with nothing saying which was which, and
+remembered chats could not be reached from a phone at all.
+
+### Scrolling the terminal
+
+Your client reports a swipe as a mouse wheel event. On a desktop that wheel goes
+to the program running in the pane, which is what lets you scroll inside its own
+lists and viewers. Coding agents ask for mouse reporting but usually do nothing
+with the wheel, so on a phone that handover left the content area looking frozen.
+
+In the mobile shell a vertical swipe over the terminal scrolls Herdr's own
+scrollback instead. Programs that scroll with arrow keys, such as `less` and
+`vim`, are unaffected — their swipe still reaches them. On a desktop-width
+terminal nothing changes.
+
+### Selecting and copying text
+
+Herdr captures mouse input so its own interface is clickable. While it does,
+your terminal app's press-and-hold text selection is suppressed: the drag is
+forwarded to Herdr, and the client's selection handles never appear. Some
+clients, Termius among them, also bind long-press to arrow keys, so a finger
+dragging across text moves a cursor instead.
+
+Turn **select text** on in the spaces drawer's menu. Herdr releases mouse
+capture, your client's own selection works normally, and turning it off restores
+the previous setting. While it is on, the header says so and names the way back —
+taps do not reach Herdr at all in that state, so use the keyboard to switch it
+off.
+
+Copying works with no extra setup as long as your client honours OSC 52: over
+SSH, Herdr writes the selection out as an OSC 52 clipboard sequence, which the
+client puts on the phone's clipboard. Pasting is your client's own paste.
+
+### What Herdr cannot do
+
+Herdr cannot hide your on-screen keyboard. Keyboard visibility is a property of
+the client app, and no terminal escape sequence controls it. Use your client's
+own gesture — a keyboard button or a downward swipe. Opening a drawer does stop
+your keystrokes from reaching the agent: they drive the drawer instead.

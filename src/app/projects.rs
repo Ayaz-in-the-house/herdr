@@ -1,0 +1,1278 @@
+//! Projects-tab chat actions (Task #5): opening a Claude Code chat session as
+//! a new tab in the right workspace. The pure launch planning lives here so it
+//! is testable without PTYs; the tab spawn itself reuses the proven
+//! `Workspace::create_tab_argv_command` path (same as plugin panes).
+
+/// Agent CLIs a NEW project chat can launch with, in menu order. The entries
+/// double as the selector menu items and the `[projects] default_chat_agent`
+/// config values.
+pub(crate) const CHAT_AGENTS: &[&str] = &["claude", "codex", "gemini", "opencode"];
+
+/// The project-header context menu when the project is also open as a
+/// workspace: every chat agent plus that workspace's worktree actions. Must
+/// stay `CHAT_AGENTS` followed by the two worktree rows — the menu handler
+/// matches the labels and a test pins the sync.
+pub(crate) const PROJECT_CHAT_MENU_WITH_WORKTREES: &[&str] = &[
+    "claude",
+    "codex",
+    "gemini",
+    "opencode",
+    "New worktree",
+    "Open worktree...",
+];
+
+/// Builds the argv + extra launch env for opening a project chat.
+///
+/// `session_id` `Some` resumes that session with `claude --resume <id>` —
+/// ALWAYS claude, whatever `agent` says, because the sidebar's sessions are
+/// Claude Code sessions no other CLI can resume. `None` starts a fresh chat
+/// with `agent` (falling back to claude for unknown ids so a stale config
+/// value can never break the "+" button). The claude launch mirrors the
+/// user's fish `cc` alias: permission prompts skipped, background tasks on.
+pub(crate) fn project_chat_launch(
+    agent: &str,
+    session_id: Option<&str>,
+) -> (Vec<String>, Vec<(String, String)>) {
+    let claude_launch = || {
+        (
+            vec![
+                "claude".to_string(),
+                "--dangerously-skip-permissions".to_string(),
+            ],
+            vec![("ENABLE_BACKGROUND_TASKS".to_string(), "1".to_string())],
+        )
+    };
+
+    if let Some(session_id) = session_id {
+        let (mut argv, env) = claude_launch();
+        argv.push("--resume".to_string());
+        argv.push(session_id.to_string());
+        return (argv, env);
+    }
+
+    match agent {
+        "claude" => claude_launch(),
+        "codex" | "gemini" | "opencode" => (vec![agent.to_string()], Vec::new()),
+        unknown => {
+            tracing::warn!(agent = unknown, "unknown default_chat_agent; using claude");
+            claude_launch()
+        }
+    }
+}
+
+/// How often the visible Projects tab re-checks the Claude session store for
+/// changes. Each check costs one `read_dir` per pinned project (metadata
+/// only), so this can be tight without measurable load.
+const PROJECTS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Fast poll interval right after this app spawned a chat: the session file
+/// appears within a second or two and should show up (with its focus marker)
+/// as soon as it does.
+const PROJECTS_POLL_HOT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// How long the fast interval stays armed after a spawn.
+const PROJECTS_POLL_HOT_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Cheap change fingerprint for one project's session directory: entry count
+/// plus the newest modification time. Reads directory metadata only — never
+/// file contents — so polling with it is effectively free. A new chat adds an
+/// entry; new messages/titles bump the session file's mtime.
+pub(crate) fn project_dir_fingerprint(
+    projects_dir: &std::path::Path,
+    project_path: &std::path::Path,
+) -> Option<(usize, std::time::SystemTime)> {
+    let encoded = crate::claude_sessions::encode_project_path(&project_path.to_string_lossy());
+    let entries = std::fs::read_dir(projects_dir.join(encoded)).ok()?;
+    let mut count = 0usize;
+    let mut newest = std::time::SystemTime::UNIX_EPOCH;
+    for entry in entries.flatten() {
+        count += 1;
+        if let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) {
+            if modified > newest {
+                newest = modified;
+            }
+        }
+    }
+    Some((count, newest))
+}
+
+impl super::App {
+    /// Keep the visible Projects tab in sync with the Claude session store so
+    /// chats opened meanwhile appear without a tab switch. Does NOTHING unless
+    /// the tab is visible and the poll interval elapsed; a due poll is one
+    /// metadata read per pinned project, and the expensive session re-read
+    /// runs only when a fingerprint actually changed. Returns whether the
+    /// cache changed (callers re-render).
+    pub(crate) fn refresh_projects_if_due(&mut self, now: std::time::Instant) -> bool {
+        if self.state.sidebar_tab != crate::app::state::SidebarTab::Projects {
+            return false;
+        }
+        // The tab is visible either as the desktop rail or as the phone
+        // drawer's projects segment (TP-MOB-91) — a collapsed desktop
+        // sidebar says nothing about a phone with its drawer open.
+        let desktop_visible = !self.state.sidebar_collapsed;
+        let mobile_visible = self.state.mobile_drawer.is_open();
+        if !desktop_visible && !mobile_visible {
+            return false;
+        }
+        if self.next_projects_poll.is_some_and(|due| now < due) {
+            return false;
+        }
+        let interval = if self
+            .projects_poll_hot_until
+            .is_some_and(|until| now < until)
+        {
+            PROJECTS_POLL_HOT_INTERVAL
+        } else {
+            PROJECTS_POLL_INTERVAL
+        };
+        self.next_projects_poll = Some(now + interval);
+        let Some(projects_dir) = crate::claude_sessions::default_claude_projects_dir() else {
+            return false;
+        };
+        self.refresh_projects_with_dir(&projects_dir)
+    }
+
+    /// Make the next Projects poll immediate and keep polling fast for a
+    /// short window — called right after spawning a chat, whose session file
+    /// only exists once claude writes it.
+    fn arm_projects_hot_poll(&mut self) {
+        self.next_projects_poll = None;
+        self.projects_poll_hot_until = Some(std::time::Instant::now() + PROJECTS_POLL_HOT_WINDOW);
+    }
+
+    /// Fingerprint-gated refresh against `projects_dir` (injected for tests).
+    fn refresh_projects_with_dir(&mut self, projects_dir: &std::path::Path) -> bool {
+        let fingerprints: Vec<_> = self
+            .state
+            .projects_pinned
+            .iter()
+            .map(|path| project_dir_fingerprint(projects_dir, path))
+            .collect();
+        if fingerprints == self.projects_dir_fingerprints {
+            return false;
+        }
+        self.projects_dir_fingerprints = fingerprints;
+        self.state.refresh_project_sessions_in(projects_dir);
+        true
+    }
+
+    /// Consume a queued Projects-tab chat request, if any. Returns whether a
+    /// request was handled so callers can trigger a re-render. Shared by the
+    /// headless server and the monolithic event loop deferred-request passes.
+    pub(crate) fn handle_project_chat_tab_request(&mut self) -> bool {
+        let Some(req) = self.state.request_project_chat_tab.take() else {
+            return false;
+        };
+        self.open_project_chat_tab(req);
+        true
+    }
+
+    /// Open a project chat (resume or new) as a tab in the right workspace.
+    /// New chats launch with the configured default agent; resumes are always
+    /// claude (see `project_chat_launch`).
+    fn open_project_chat_tab(&mut self, req: crate::app::state::ProjectChatTabRequest) {
+        let (argv, extra_env) =
+            project_chat_launch(&self.state.default_chat_agent, req.session_id.as_deref());
+        self.open_project_chat_tab_with_argv(req, &argv, extra_env);
+    }
+
+    /// Spawn `argv` as a new focused tab for `req`: prefer the workspace whose
+    /// identity matches the project directory, else the active workspace, else
+    /// (empty session) a fresh workspace in that directory. The tab's cwd is
+    /// always the project directory, and the tab is wired to the resumed
+    /// session id so later clicks can find it. Spawn failures are logged, not
+    /// fatal: the app must survive e.g. a deleted project directory.
+    /// pub(super): the preview module's tests spawn harmless sh tabs through
+    /// this seam to exercise the binding↔tab pid lookup against real panes.
+    pub(super) fn open_project_chat_tab_with_argv(
+        &mut self,
+        req: crate::app::state::ProjectChatTabRequest,
+        argv: &[String],
+        extra_env: Vec<(String, String)>,
+    ) {
+        self.open_project_chat_tab_homed(req, argv, extra_env, ChatTabHome::MatchingOrActive);
+    }
+
+    /// [`Self::open_project_chat_tab_with_argv`] with the fallback named: when
+    /// no workspace is rooted at the project directory, `MatchingOrActive`
+    /// adds the tab to the active workspace (a new chat from the Projects
+    /// tab), `OwnDirectory` opens a fresh workspace rooted there (a revival,
+    /// which must land where the conversation lives — TP-AGPANEL-74).
+    pub(super) fn open_project_chat_tab_homed(
+        &mut self,
+        req: crate::app::state::ProjectChatTabRequest,
+        argv: &[String],
+        extra_env: Vec<(String, String)>,
+        home: ChatTabHome,
+    ) {
+        // One session, one surface — but the surface is the AGENT, not the tab
+        // (TP-AGPANEL-56). A wired tab whose agent still runs is focused, as
+        // before. A wired tab whose agent has exited is the conversation's
+        // home with nobody in it: the agent is brought back INTO it, so the
+        // tab keeps its name and place and no twin appears. Only a tab that
+        // cannot be typed into at all (no runtime) gives its wiring up to a
+        // fresh spawn. A tab busy with something else is focused and left
+        // alone: typing a launch into a stranger's foreground is worse than
+        // asking the reader to look.
+        if let Some(session_id) = req.session_id.as_deref() {
+            if let Some((ws_idx, tab_idx)) = self.state.find_running_chat_tab(session_id) {
+                self.state.switch_workspace_tab(ws_idx, tab_idx);
+                self.state.mode = crate::app::Mode::Terminal;
+                return;
+            }
+            if let Some((ws_idx, tab_idx)) = self.state.find_resumed_chat_tab(session_id) {
+                match self.revive_in_wired_tab(ws_idx, tab_idx, argv, &extra_env) {
+                    WiredTabRevival::Launched | WiredTabRevival::Busy => {
+                        self.state.switch_workspace_tab(ws_idx, tab_idx);
+                        self.state.mode = crate::app::Mode::Terminal;
+                        return;
+                    }
+                    WiredTabRevival::NoRuntime => {
+                        self.state.workspaces[ws_idx].tabs[tab_idx].resumed_session_id = None;
+                    }
+                }
+            }
+        }
+
+        let (rows, cols) = self.state.estimate_pane_size();
+        let target_ws = self
+            .state
+            .workspaces
+            .iter()
+            .position(|ws| ws.effective_cwd() == req.project_path)
+            .or(match home {
+                ChatTabHome::MatchingOrActive => self.state.active,
+                ChatTabHome::OwnDirectory => None,
+            })
+            .filter(|ws_idx| *ws_idx < self.state.workspaces.len());
+
+        let Some(ws_idx) = target_ws else {
+            // No workspace to attach the tab to: open the chat in a fresh
+            // workspace rooted at the project directory instead.
+            match self.spawn_agent_workspace(
+                req.project_path.clone(),
+                rows,
+                cols,
+                argv,
+                extra_env,
+                true,
+            ) {
+                Ok((ws_idx, tab_idx, _pane_id)) => {
+                    apply_project_chat_tab_name(
+                        &mut self.state.workspaces[ws_idx],
+                        tab_idx,
+                        &req.project_path,
+                    );
+                    self.state.workspaces[ws_idx].tabs[tab_idx].resumed_session_id = req.session_id;
+                    // TP-TAB-CHAT-01: a resume already knows its chat's title
+                    // from the row that was clicked, so name the tab now rather
+                    // than waiting for the next sync.
+                    self.state.sync_bound_tab_titles();
+                    self.arm_projects_hot_poll();
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        project = %req.project_path.display(),
+                        err = ?err,
+                        "failed to open project chat in a new workspace"
+                    );
+                }
+            }
+            return;
+        };
+
+        let Some(ws) = self.state.workspaces.get_mut(ws_idx) else {
+            return;
+        };
+        let created = ws.create_tab_argv_command(
+            rows.max(4),
+            cols.max(10),
+            req.project_path.clone(),
+            argv,
+            extra_env,
+            self.state.pane_scrollback_limit_bytes,
+            self.state.host_terminal_theme,
+            self.state.host_terminal_appearance,
+        );
+        let (tab_idx, terminal, runtime) = match created {
+            Ok(result) => result,
+            Err(err) => {
+                tracing::warn!(
+                    project = %req.project_path.display(),
+                    err = %err,
+                    "failed to open project chat tab"
+                );
+                return;
+            }
+        };
+        let Some(root_pane) = self.register_new_tab_pane(ws_idx, tab_idx, terminal, runtime) else {
+            tracing::warn!(
+                project = %req.project_path.display(),
+                "the project chat tab disappeared before it could be registered"
+            );
+            return;
+        };
+
+        // Between the two halves, and only here: a project chat wears the
+        // project's name and remembers the session it resumed, and both have to
+        // be true before anything draws the tab it just moved to.
+        apply_project_chat_tab_name(
+            &mut self.state.workspaces[ws_idx],
+            tab_idx,
+            &req.project_path,
+        );
+        self.state.workspaces[ws_idx].tabs[tab_idx].resumed_session_id = req.session_id;
+        // TP-TAB-CHAT-01: name the tab after its chat immediately, from the
+        // row that was clicked to open it.
+        self.state.sync_bound_tab_titles();
+        self.arm_projects_hot_poll();
+
+        self.announce_new_tab(ws_idx, tab_idx, root_pane);
+    }
+}
+
+/// Where a project chat tab goes when no workspace is rooted at its directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChatTabHome {
+    /// Into the active workspace (the Projects tab's new-chat meaning).
+    MatchingOrActive,
+    /// Into a fresh workspace rooted at the directory.
+    OwnDirectory,
+}
+
+/// What happened when the chat road tried to bring an agent back into the
+/// tab that is wired to its conversation.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum WiredTabRevival {
+    /// The launch was typed into the tab's idle shell.
+    Launched,
+    /// Something else holds the foreground; the tab was left alone.
+    Busy,
+    /// The tab has no runtime to type into — a fresh tab must take the wiring.
+    NoRuntime,
+}
+
+impl super::App {
+    /// Type the agent's launch into the wired tab's shell (TP-AGPANEL-56).
+    ///
+    /// Rides the same submission road `agent start` uses for "start an agent
+    /// in an existing pane": the shell is asked for by name so quoting is the
+    /// shell's own, and the env the fresh-tab road would set is carried with
+    /// `env` — on unix, where `env` is a given; anywhere else an env-carrying
+    /// launch is refused into a shell rather than mangled.
+    fn revive_in_wired_tab(
+        &mut self,
+        ws_idx: usize,
+        tab_idx: usize,
+        argv: &[String],
+        extra_env: &[(String, String)],
+    ) -> WiredTabRevival {
+        let Some(terminal_id) = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|ws| ws.tabs.get(tab_idx))
+            .and_then(|tab| tab.terminal_id(tab.root_pane))
+            .cloned()
+        else {
+            return WiredTabRevival::NoRuntime;
+        };
+        let Some(runtime) = self.terminal_runtimes.get(&terminal_id) else {
+            return WiredTabRevival::NoRuntime;
+        };
+        let Some(shell_name) = super::agents::available_shell_name(runtime) else {
+            return WiredTabRevival::Busy;
+        };
+        let mut full: Vec<String> = Vec::with_capacity(argv.len() + 1 + extra_env.len());
+        if !extra_env.is_empty() {
+            if !cfg!(unix) {
+                return WiredTabRevival::Busy;
+            }
+            full.push("env".to_string());
+            full.extend(
+                extra_env
+                    .iter()
+                    .map(|(key, value)| format!("{key}={value}")),
+            );
+        }
+        full.extend(argv.iter().cloned());
+        let Some(command) = crate::platform::interactive_shell_command(&full, &shell_name) else {
+            return WiredTabRevival::Busy;
+        };
+        let bytes = crate::app::api_helpers::encode_api_submission(runtime, &command);
+        if let Err(err) = runtime.try_send_bytes(bytes::Bytes::from(bytes)) {
+            tracing::warn!(err = %err, "could not type the revival into the wired tab");
+            return WiredTabRevival::Busy;
+        }
+        WiredTabRevival::Launched
+    }
+}
+
+/// Seeds a freshly spawned project-chat tab's DERIVED name with its project
+/// label, so an unnamed tab reads as its directory until the chat it hosts is
+/// known and the sync overwrites it with the conversation's own title
+/// (TP-TAB-CHAT-01). Writes `chat_title`, not `custom_name`: an explicit
+/// rename still outranks both, and a resume that already knows its chat's
+/// title overrides this placeholder immediately. Left alone if the user (or
+/// anything else) already named the tab, and tolerant of a stale index.
+pub(crate) fn apply_project_chat_tab_name(
+    ws: &mut crate::workspace::Workspace,
+    tab_idx: usize,
+    project_path: &std::path::Path,
+) {
+    let Some(tab) = ws.tabs.get_mut(tab_idx) else {
+        return;
+    };
+    if tab.custom_name.is_none() && tab.chat_title.is_none() {
+        tab.chat_title = Some(crate::workspace::derive_label_from_cwd(project_path));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::path::{Path, PathBuf};
+
+    use crate::app::state::ProjectChatTabRequest;
+    use crate::workspace::Workspace;
+
+    fn test_app() -> crate::app::App {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        crate::app::App::new(
+            &crate::config::Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        )
+    }
+
+    /// A real, unique, empty directory: the spawned pane needs an existing cwd.
+    fn unique_project_dir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("herdr-projects-test-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create test project dir");
+        dir
+    }
+
+    /// A harmless real argv so tab-spawn tests never launch an actual agent.
+    fn sh_argv() -> Vec<String> {
+        vec!["/bin/sh".into(), "-c".into(), "exit 0".into()]
+    }
+
+    fn req(project_path: PathBuf, session_id: Option<&str>) -> ProjectChatTabRequest {
+        ProjectChatTabRequest {
+            project_path,
+            session_id: session_id.map(str::to_string),
+        }
+    }
+
+    // T5c: closing a resumed-chat tab must release its terminal runtime via
+    // the standard detached-runtime shutdown queue — the path that kills the
+    // pane's PTY session (claude + its MCP children) and frees the wiring.
+    // Phase 1 proves the close only QUEUES the shutdown; phase 2 proves the
+    // event-loop drain actually unregisters and shuts the runtime down.
+    #[tokio::test]
+    async fn closing_resumed_chat_tab_shuts_down_its_terminal_runtime() {
+        let dir = unique_project_dir("close");
+        let mut app = test_app();
+        let mut ws = Workspace::test_new("proj");
+        ws.identity_cwd = dir.clone();
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+
+        app.open_project_chat_tab_with_argv(
+            req(dir.clone(), Some("sess-7")),
+            &sh_argv(),
+            Vec::new(),
+        );
+        let ws = &app.state.workspaces[0];
+        assert_eq!(ws.tabs.len(), 2, "resume tab opened");
+        let tab = &ws.tabs[1];
+        let terminal_id = tab.panes[&tab.root_pane].attached_terminal_id.clone();
+        assert!(app.terminal_runtimes.get(&terminal_id).is_some());
+
+        // TUI-path close of the focused (resume) tab: queues the shutdown.
+        app.state.close_tab();
+        assert!(
+            app.state.terminal_runtime_shutdowns.contains(&terminal_id),
+            "close queues the detached terminal for shutdown"
+        );
+        assert!(
+            app.terminal_runtimes.get(&terminal_id).is_some(),
+            "runtime lives until the event loop drains the queue"
+        );
+
+        // The pass runtime.rs runs after every input event / API request.
+        app.shutdown_detached_terminal_runtimes();
+
+        assert!(
+            app.terminal_runtimes.get(&terminal_id).is_none(),
+            "runtime shut down and unregistered"
+        );
+        assert!(
+            !app.state.terminals.contains_key(&terminal_id),
+            "terminal state removed with the tab"
+        );
+        assert_eq!(
+            app.state.find_resumed_chat_tab("sess-7"),
+            None,
+            "chat wiring released by the close"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // T5c (live kill proof, linux): closing the tab must terminate the WHOLE
+    // pane session — the shell and its background child (a stand-in for MCP
+    // servers a chat spawns). The unique sleep durations act as markers that
+    // survive shell `exec`, so the tree is observable from outside via pgrep.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn closing_resumed_chat_tab_kills_the_pane_process_tree() {
+        fn pgrep(pattern: &str) -> Vec<u32> {
+            let out = std::process::Command::new("pgrep")
+                .args(["-f", pattern])
+                .output()
+                .expect("pgrep runs");
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|line| line.trim().parse().ok())
+                .collect()
+        }
+
+        let dir = unique_project_dir("kill");
+        let tag = format!("9{:05}", std::process::id() % 100_000);
+        let script = format!("sleep {tag}1 & sleep {tag}2");
+        let pattern = format!("sleep {tag}");
+        let argv = vec!["/bin/sh".to_string(), "-c".to_string(), script];
+
+        let mut app = test_app();
+        let mut ws = Workspace::test_new("proj");
+        ws.identity_cwd = dir.clone();
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.open_project_chat_tab_with_argv(req(dir.clone(), Some("sess-k")), &argv, Vec::new());
+
+        // Both the background and foreground sleeps must come up before we
+        // can prove they die (the PTY spawn is asynchronous).
+        let mut alive = Vec::new();
+        for _ in 0..100 {
+            alive = pgrep(&pattern);
+            if alive.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            alive.len() >= 2,
+            "pane process tree (shell child + background child) started: {alive:?}"
+        );
+
+        app.state.close_tab();
+        app.shutdown_detached_terminal_runtimes();
+
+        // shutdown_pane_processes escalates HUP→TERM→KILL with short graces;
+        // give the kernel a beat to reap before asserting extinction.
+        let mut remaining = pgrep(&pattern);
+        for _ in 0..100 {
+            if remaining.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            remaining = pgrep(&pattern);
+        }
+        assert!(
+            remaining.is_empty(),
+            "all pane session processes must be dead after tab close: {remaining:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // T5b (race guard): consuming a request whose session is already wired
+    // (e.g. a second click landed before the first spawn finished) focuses
+    // the wired tab instead of spawning a duplicate.
+    //
+    // The tab carries a runtime, as every spawned tab does from the instant it
+    // is registered (`register_new_tab_pane` runs before the wiring is set) —
+    // a wired tab with NO runtime cannot occur in production, and modelling
+    // one here would test a road nobody can reach (TP-AGPANEL-56 releases such
+    // a tab's wiring to a fresh spawn, which is exactly what this guard must
+    // not do for a real in-flight tab).
+    #[tokio::test]
+    async fn open_chat_tab_focuses_existing_wired_tab_instead_of_duplicating() {
+        let dir = unique_project_dir("dedup");
+        let mut app = test_app();
+        let mut ws = Workspace::test_new("proj");
+        ws.identity_cwd = dir.clone();
+        let tab_idx = ws.test_add_tab(Some("chat"));
+        ws.tabs[tab_idx].resumed_session_id = Some("sess-9".to_string());
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.ensure_test_terminals();
+        let tab = &app.state.workspaces[0].tabs[tab_idx];
+        let terminal_id = tab.panes[&tab.root_pane].attached_terminal_id.clone();
+        let (runtime, _typed) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.terminal_runtimes.insert(terminal_id, runtime);
+
+        app.open_project_chat_tab_with_argv(
+            req(dir.clone(), Some("sess-9")),
+            &sh_argv(),
+            Vec::new(),
+        );
+
+        assert_eq!(
+            app.state.workspaces[0].tabs.len(),
+            2,
+            "no duplicate tab spawned"
+        );
+        assert_eq!(
+            app.state.workspaces[0].active_tab_index(),
+            tab_idx,
+            "wired tab focused"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // TP-AGPANEL-56: a wired tab whose agent has EXITED is not "already
+    // open". The agent is brought back into that very tab — the launch is
+    // typed into its idle shell — so the conversation keeps its home and no
+    // twin tab appears. Reported 2026-09-14: both the graveyard and the daily
+    // area focused an empty shell tab named after the chat instead.
+    #[tokio::test]
+    async fn a_wired_tab_whose_agent_has_exited_gets_the_agent_back_inside_it() {
+        let dir = unique_project_dir("revive-in-place");
+        let mut app = test_app();
+        let mut ws = Workspace::test_new("proj");
+        ws.identity_cwd = dir.clone();
+        let tab_idx = ws.test_add_tab(Some("chat"));
+        ws.tabs[tab_idx].resumed_session_id = Some("sess-9".to_string());
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.ensure_test_terminals();
+        let tab = &app.state.workspaces[0].tabs[tab_idx];
+        let terminal_id = tab.panes[&tab.root_pane].attached_terminal_id.clone();
+        let (runtime, mut typed) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.terminal_runtimes.insert(terminal_id, runtime);
+
+        let launch = vec![
+            "claude".to_string(),
+            "--resume".to_string(),
+            "sess-9".to_string(),
+        ];
+        app.open_project_chat_tab_with_argv(
+            req(dir.clone(), Some("sess-9")),
+            &launch,
+            vec![("ENABLE_BACKGROUND_TASKS".to_string(), "1".to_string())],
+        );
+
+        assert_eq!(app.state.workspaces[0].tabs.len(), 2, "no twin tab");
+        assert_eq!(
+            app.state.workspaces[0].active_tab_index(),
+            tab_idx,
+            "its own tab took focus"
+        );
+        assert_eq!(
+            app.state.workspaces[0].tabs[tab_idx]
+                .resumed_session_id
+                .as_deref(),
+            Some("sess-9"),
+            "the wiring survives: the tab is still the conversation's home"
+        );
+        let sent = typed
+            .try_recv()
+            .expect("the launch was typed into the wired tab");
+        let sent = String::from_utf8_lossy(&sent);
+        assert!(sent.contains("--resume sess-9"), "typed: {sent:?}");
+        assert!(
+            sent.contains("ENABLE_BACKGROUND_TASKS=1"),
+            "env rides along: {sent:?}"
+        );
+        assert!(
+            sent.ends_with('\r'),
+            "and it is submitted, not just typed: {sent:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // TP-AGPANEL-56 (the half that must not change): a wired tab whose agent
+    // is STILL RUNNING is focused and nothing is typed into it.
+    #[tokio::test]
+    async fn a_wired_tab_whose_agent_still_runs_is_only_focused() {
+        let dir = unique_project_dir("still-running");
+        let mut app = test_app();
+        let mut ws = Workspace::test_new("proj");
+        ws.identity_cwd = dir.clone();
+        let tab_idx = ws.test_add_tab(Some("chat"));
+        ws.tabs[tab_idx].resumed_session_id = Some("sess-9".to_string());
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.ensure_test_terminals();
+        let tab = &app.state.workspaces[0].tabs[tab_idx];
+        let terminal_id = tab.panes[&tab.root_pane].attached_terminal_id.clone();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("test terminal")
+            .set_agent_name("herdr-inatci-media".to_string());
+        let (runtime, mut typed) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.terminal_runtimes.insert(terminal_id, runtime);
+
+        app.open_project_chat_tab_with_argv(
+            req(dir.clone(), Some("sess-9")),
+            &sh_argv(),
+            Vec::new(),
+        );
+
+        assert_eq!(app.state.workspaces[0].tabs.len(), 2, "no twin tab");
+        assert_eq!(app.state.workspaces[0].active_tab_index(), tab_idx);
+        assert!(
+            typed.try_recv().is_err(),
+            "nothing typed into a running agent"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // T5a-7: the tab must land in the workspace whose identity matches the
+    // chat's project directory (not the active one), get the project as cwd,
+    // be wired to the session id, and take focus.
+    #[tokio::test]
+    async fn open_chat_tab_targets_workspace_matching_project_dir() {
+        let dir = unique_project_dir("match");
+        let mut app = test_app();
+        let mut other = Workspace::test_new("other");
+        other.identity_cwd = PathBuf::from("/");
+        let mut matching = Workspace::test_new("proj");
+        matching.identity_cwd = dir.clone();
+        app.state.workspaces = vec![other, matching];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+
+        app.open_project_chat_tab_with_argv(
+            req(dir.clone(), Some("sess-9")),
+            &sh_argv(),
+            Vec::new(),
+        );
+
+        assert_eq!(
+            app.state.workspaces[0].tabs.len(),
+            1,
+            "active-but-unrelated workspace must stay untouched"
+        );
+        let ws = &app.state.workspaces[1];
+        assert_eq!(ws.tabs.len(), 2, "tab added to the matching workspace");
+        let tab = &ws.tabs[1];
+        assert_eq!(tab.resumed_session_id.as_deref(), Some("sess-9"));
+        assert_eq!(app.state.active, Some(1), "focus follows the new tab");
+        assert_eq!(ws.active_tab_index(), 1);
+        let terminal_id = tab.panes[&tab.root_pane].attached_terminal_id.clone();
+        let terminal = app
+            .state
+            .terminals
+            .get(&terminal_id)
+            .expect("terminal registered");
+        assert_eq!(terminal.cwd, dir, "tab cwd is the chat's project dir");
+        assert!(
+            app.terminal_runtimes.get(&terminal_id).is_some(),
+            "runtime registered"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // T5a-8: with no identity match the tab opens in the ACTIVE workspace —
+    // TP-TAB-CHAT-01: resuming a chat from history names the tab after the
+    // conversation itself, not just its directory, so a person recognises the
+    // tab they reopened. The name is derived (not an explicit rename), so a
+    // later rename of the chat or the tab still behaves correctly.
+    #[tokio::test]
+    async fn resuming_a_chat_names_the_tab_after_the_conversation() {
+        let dir = unique_project_dir("named");
+        let mut app = test_app();
+        let mut ws = Workspace::test_new("proj");
+        ws.identity_cwd = dir.clone();
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        // The chat exists as a drawer row carrying its title — this is the row
+        // the person clicked to reopen it.
+        let key = crate::persist::workspace_chats::ledger_key(&dir);
+        app.state.workspace_chat_rows.insert(
+            key,
+            vec![crate::app::state::WorkspaceChatRow {
+                session_id: "sess-named".to_string(),
+                agent: "claude".to_string(),
+                title: Some("Fix login bug".to_string()),
+                last_seen_ms: 1,
+                last_modified: None,
+                last_message_at: None,
+            }],
+        );
+
+        app.open_project_chat_tab_with_argv(
+            req(dir.clone(), Some("sess-named")),
+            &sh_argv(),
+            Vec::new(),
+        );
+
+        let ws = &app.state.workspaces[0];
+        let tab_idx = ws.tabs.len() - 1;
+        assert_eq!(
+            ws.tabs[tab_idx].resumed_session_id.as_deref(),
+            Some("sess-named"),
+        );
+        assert_eq!(
+            ws.tab_display_name(tab_idx).as_deref(),
+            Some("Fix login bug"),
+            "the resumed tab wears its chat's title, not the directory",
+        );
+        assert!(
+            ws.tabs[tab_idx].custom_name.is_none(),
+            "the name is derived, so an explicit rename would still win",
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // TP-AGPANEL-74: a revival lands in its directory's own workspace — a
+    // fresh one rooted there when none is open — never in whichever
+    // workspace happens to be active; the Projects tab's new chat keeps the
+    // active fallback.
+    #[tokio::test]
+    async fn a_revival_opens_in_its_own_directory_not_the_active_workspace() {
+        let dir = unique_project_dir("own-home");
+        let mut app = test_app();
+        let mut ws = Workspace::test_new("elsewhere");
+        ws.identity_cwd = PathBuf::from("/");
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        let tabs_before = app.state.workspaces[0].tabs.len();
+
+        app.open_project_chat_tab_homed(
+            req(dir.clone(), Some("sess-home")),
+            &sh_argv(),
+            Vec::new(),
+            ChatTabHome::OwnDirectory,
+        );
+
+        assert_eq!(
+            app.state.workspaces[0].tabs.len(),
+            tabs_before,
+            "the active workspace is not borrowed"
+        );
+        let (ws_idx, _) = app
+            .state
+            .find_resumed_chat_tab("sess-home")
+            .expect("the revival is wired");
+        assert_eq!(
+            app.state.workspaces[ws_idx].effective_cwd(),
+            dir.as_path(),
+            "it lives in a workspace rooted at its own directory"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // but its cwd must still be the project directory, and a new chat
+    // (session_id None) must not wire a session id.
+    #[tokio::test]
+    async fn open_chat_tab_falls_back_to_active_workspace() {
+        let dir = unique_project_dir("fallback");
+        let mut app = test_app();
+        let mut ws = Workspace::test_new("elsewhere");
+        ws.identity_cwd = PathBuf::from("/");
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+
+        app.open_project_chat_tab_with_argv(req(dir.clone(), None), &sh_argv(), Vec::new());
+
+        let ws = &app.state.workspaces[0];
+        assert_eq!(ws.tabs.len(), 2, "tab added to the active workspace");
+        let tab = &ws.tabs[1];
+        assert_eq!(tab.resumed_session_id, None, "new chat is not wired");
+        let terminal_id = tab.panes[&tab.root_pane].attached_terminal_id.clone();
+        let terminal = app
+            .state
+            .terminals
+            .get(&terminal_id)
+            .expect("terminal registered");
+        assert_eq!(terminal.cwd, dir);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // T5a-9: with no workspaces at all a fresh one is created in the project
+    // directory (a tab cannot exist outside a workspace).
+    #[tokio::test]
+    async fn open_chat_tab_spawns_workspace_when_none_exists() {
+        let dir = unique_project_dir("spawn");
+        let mut app = test_app();
+        assert!(app.state.workspaces.is_empty());
+
+        app.open_project_chat_tab_with_argv(
+            req(dir.clone(), Some("sess-3")),
+            &sh_argv(),
+            Vec::new(),
+        );
+
+        assert_eq!(app.state.workspaces.len(), 1, "workspace created");
+        let ws = &app.state.workspaces[0];
+        assert_eq!(ws.tabs[0].resumed_session_id.as_deref(), Some("sess-3"));
+        assert_eq!(app.state.active, Some(0), "new workspace focused");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // TP-TAB-NEW-01: opening a project chat announces the tab and its pane.
+    //
+    // TP-CHROME-61 holds this for the right-press path; nothing held it here.
+    // An unannounced tab leaves every API subscriber with a tab list that is
+    // missing a tab, and these two emissions are exactly the lines a shared
+    // helper would move — so they need an owner before anything moves them.
+    #[tokio::test]
+    async fn open_chat_tab_announces_the_tab_and_its_pane() {
+        let dir = unique_project_dir("announce");
+        let mut app = test_app();
+        app.state.workspaces = vec![Workspace::test_new("proj")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+
+        app.open_project_chat_tab_with_argv(req(dir.clone(), None), &sh_argv(), Vec::new());
+
+        let announced = app
+            .event_hub
+            .events_after(0)
+            .into_iter()
+            .map(|(_, event)| event.event)
+            .collect::<Vec<_>>();
+        assert!(
+            announced.contains(&crate::api::schema::EventKind::TabCreated),
+            "the new tab was never announced: {announced:?}"
+        );
+        assert!(
+            announced.contains(&crate::api::schema::EventKind::PaneCreated),
+            "the new tab's pane was never announced: {announced:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // TP-TAB-NEW-02: a new root pane clears the alias it shadows, and only that
+    // one.
+    //
+    // The quietest step in the sequence: if it stopped happening nothing on
+    // screen would change, and an old alias would simply go on resolving to a
+    // pane that is no longer what it names. It is the line a refactor is
+    // likeliest to swallow, which is why it needs a name of its own.
+    #[tokio::test]
+    async fn open_chat_tab_clears_only_the_alias_its_new_pane_shadows() {
+        let dir = unique_project_dir("alias");
+        let mut app = test_app();
+        app.state.workspaces = vec![Workspace::test_new("proj")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+
+        // A pane's id is not known until it exists, and ids come from a counter
+        // this test cannot rewind, so a window above the counter's current
+        // position is seeded and the assertion is about which entry survived.
+        // A fixed range would work only until something else allocated first.
+        // The window also catches the opposite mistake — clearing the whole
+        // table rather than the one entry.
+        let probe = crate::layout::PaneId::alloc().raw();
+        let window = probe..probe.saturating_add(64);
+        for raw in window.clone() {
+            app.state
+                .pane_id_aliases
+                .insert(raw, crate::layout::PaneId::from_raw(raw));
+        }
+        let seeded = app.state.pane_id_aliases.len();
+
+        app.open_project_chat_tab_with_argv(req(dir.clone(), None), &sh_argv(), Vec::new());
+
+        let ws = &app.state.workspaces[0];
+        let root = ws.tabs[ws.tabs.len() - 1].root_pane;
+        assert!(
+            window.contains(&root.raw()),
+            "the seeded window no longer covers the new pane's id, so this test would \
+             pass over nothing at all"
+        );
+        assert!(
+            !app.state.pane_id_aliases.contains_key(&root.raw()),
+            "the alias the new pane shadows survived"
+        );
+        assert_eq!(
+            app.state.pane_id_aliases.len(),
+            seeded - 1,
+            "clearing the shadowed alias took other entries with it"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // T5a-10: the deferred request is consumed exactly once, and a spawn
+    // failure (nonexistent project dir) must not panic or leave the request
+    // stuck — the app survives e.g. a project deleted after pinning.
+    #[tokio::test]
+    async fn handle_project_chat_tab_request_consumes_queued_request() {
+        let mut app = test_app();
+        app.state.request_project_chat_tab =
+            Some(req(PathBuf::from("/nonexistent/herdr-projects-test"), None));
+
+        assert!(app.handle_project_chat_tab_request());
+        assert_eq!(app.state.request_project_chat_tab, None);
+        assert!(
+            !app.handle_project_chat_tab_request(),
+            "second pass has nothing to consume"
+        );
+    }
+
+    // T11a-F1: the fingerprint reflects directory contents cheaply — new
+    // session files and message writes change it; a missing dir is None.
+    #[test]
+    fn project_dir_fingerprint_tracks_new_and_modified_sessions() {
+        let root = unique_project_dir("fp-root");
+        let project = PathBuf::from("/home/x/proj");
+        assert_eq!(
+            project_dir_fingerprint(&root, &project),
+            None,
+            "no session dir yet"
+        );
+
+        let dir = root.join(crate::claude_sessions::encode_project_path("/home/x/proj"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fp_empty = project_dir_fingerprint(&root, &project).expect("dir exists");
+        std::fs::write(dir.join("a.jsonl"), b"{}\n").unwrap();
+        let fp_one = project_dir_fingerprint(&root, &project).expect("dir exists");
+        assert_ne!(fp_empty, fp_one, "a new session changes the fingerprint");
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(dir.join("a.jsonl"), b"{}\n{}\n").unwrap();
+        let fp_touched = project_dir_fingerprint(&root, &project).expect("dir exists");
+        assert_ne!(fp_one, fp_touched, "message writes bump the fingerprint");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // T13 (incremental cache): an unchanged file ((mtime,size) key) is served
+    // from the cache — proven by poisoning the cached title and seeing it come
+    // back — while a real change (append) forces a re-parse.
+    #[test]
+    fn session_parse_cache_skips_unchanged_files() {
+        let root = unique_project_dir("parse-cache");
+        let dir = root.join(crate::claude_sessions::encode_project_path("/home/x/proj"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("s1.jsonl");
+        std::fs::write(
+            &file,
+            b"{\"type\":\"custom-title\",\"customTitle\":\"real\"}\n",
+        )
+        .unwrap();
+
+        let mut cache = crate::claude_sessions::SessionParseCache::default();
+        let (first, _) = crate::claude_sessions::read_recent_sessions_for_project_cached(
+            &root,
+            "/home/x/proj",
+            8,
+            &mut cache,
+        );
+        assert_eq!(first[0].title, "real");
+
+        cache.retitle_remembered_for_test("from-cache");
+        let (second, _) = crate::claude_sessions::read_recent_sessions_for_project_cached(
+            &root,
+            "/home/x/proj",
+            8,
+            &mut cache,
+        );
+        assert_eq!(second[0].title, "from-cache", "unchanged file not re-read");
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(
+            &file,
+            b"{\"type\":\"custom-title\",\"customTitle\":\"real\"}\n{}\n",
+        )
+        .unwrap();
+        let (third, _) = crate::claude_sessions::read_recent_sessions_for_project_cached(
+            &root,
+            "/home/x/proj",
+            8,
+            &mut cache,
+        );
+        assert_eq!(third[0].title, "real", "changed file re-parsed");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // T11a-F2..F5: the poll does nothing while the tab is hidden or between
+    // intervals, and the expensive re-read runs only on a real change.
+    #[tokio::test]
+    async fn refresh_projects_poll_is_gated_and_fingerprint_driven() {
+        let root = unique_project_dir("fp-poll");
+        let dir = root.join(crate::claude_sessions::encode_project_path("/home/x/proj"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("s1.jsonl"), b"not json\n").unwrap();
+
+        let mut app = test_app();
+        app.state.projects_pinned = vec![PathBuf::from("/home/x/proj")];
+        let now = std::time::Instant::now();
+
+        // F2: hidden tab → no work at all, even when due.
+        app.state.sidebar_tab = crate::app::state::SidebarTab::Spaces;
+        assert!(!app.refresh_projects_if_due(now));
+        assert!(app.projects_dir_fingerprints.is_empty());
+
+        // F3: visible poll arms the interval; an immediate re-poll is skipped.
+        app.state.sidebar_tab = crate::app::state::SidebarTab::Projects;
+        let _ = app.refresh_projects_if_due(now);
+        assert!(!app.refresh_projects_if_due(now + std::time::Duration::from_millis(100)));
+        assert_eq!(app.next_projects_poll, Some(now + PROJECTS_POLL_INTERVAL));
+
+        // F6 (hot window): after a spawn the poll runs at the fast interval.
+        app.arm_projects_hot_poll();
+        assert_eq!(
+            app.next_projects_poll, None,
+            "spawn makes the next poll immediate"
+        );
+        let hot_now = std::time::Instant::now();
+        let _ = app.refresh_projects_if_due(hot_now);
+        assert_eq!(
+            app.next_projects_poll,
+            Some(hot_now + PROJECTS_POLL_HOT_INTERVAL),
+            "hot window polls fast"
+        );
+
+        // F4/F5 against the injected store: first look loads the session,
+        // an unchanged store is a no-op, a new session file reloads the cache.
+        assert!(app.refresh_projects_with_dir(&root), "first look loads");
+        assert_eq!(app.state.projects_sessions.len(), 1);
+        assert_eq!(app.state.projects_sessions[0].sessions.len(), 1);
+        assert!(
+            !app.refresh_projects_with_dir(&root),
+            "unchanged store must not re-read"
+        );
+        std::fs::write(dir.join("s2.jsonl"), b"x\n").unwrap();
+        assert!(app.refresh_projects_with_dir(&root), "new chat reloads");
+        assert_eq!(app.state.projects_sessions[0].sessions.len(), 2);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // C1: a new chat launches with the selected agent's plain command and no
+    // claude-specific env; each catalog entry must map to a real CLI name.
+    #[test]
+    fn project_chat_launch_new_chat_uses_selected_agent() {
+        for agent in ["codex", "gemini", "opencode"] {
+            let (argv, env) = project_chat_launch(agent, None);
+            assert_eq!(argv, vec![agent.to_string()], "argv for {agent}");
+            assert!(env.is_empty(), "no claude env for {agent}");
+        }
+    }
+
+    // C1 (no-happy-path): a stale/unknown config value must never break the
+    // "+" button — it falls back to the claude launch.
+    #[test]
+    fn project_chat_launch_unknown_agent_falls_back_to_claude() {
+        let (argv, _env) = project_chat_launch("not-a-real-agent", None);
+        assert_eq!(argv[0], "claude");
+        assert_eq!(argv[1], "--dangerously-skip-permissions");
+    }
+
+    // C1 (guard): resuming ALWAYS uses claude even when another agent is the
+    // default — sidebar sessions are Claude Code sessions.
+    #[test]
+    fn project_chat_launch_resume_ignores_selected_agent() {
+        let (argv, _env) = project_chat_launch("codex", Some("sess-1"));
+        assert_eq!(
+            argv,
+            vec![
+                "claude".to_string(),
+                "--dangerously-skip-permissions".to_string(),
+                "--resume".to_string(),
+                "sess-1".to_string(),
+            ]
+        );
+    }
+
+    // T5a-1: resuming a chat must produce the exact fish-`cc` argv shape;
+    // a wrong flag order or missing id opens the wrong (or no) session.
+    #[test]
+    fn project_chat_launch_builds_resume_argv() {
+        let (argv, env) =
+            project_chat_launch("claude", Some("0d55b02e-aaaa-bbbb-cccc-111111111111"));
+        assert_eq!(
+            argv,
+            vec![
+                "claude".to_string(),
+                "--dangerously-skip-permissions".to_string(),
+                "--resume".to_string(),
+                "0d55b02e-aaaa-bbbb-cccc-111111111111".to_string(),
+            ]
+        );
+        assert_eq!(
+            env,
+            vec![("ENABLE_BACKGROUND_TASKS".to_string(), "1".to_string())]
+        );
+    }
+
+    // T5a-2: a new chat is the same launch without `--resume`; passing an
+    // empty `--resume` would make claude error out instead of starting fresh.
+    #[test]
+    fn project_chat_launch_builds_new_chat_argv() {
+        let (argv, env) = project_chat_launch("claude", None);
+        assert_eq!(
+            argv,
+            vec![
+                "claude".to_string(),
+                "--dangerously-skip-permissions".to_string(),
+            ]
+        );
+        assert_eq!(
+            env,
+            vec![("ENABLE_BACKGROUND_TASKS".to_string(), "1".to_string())]
+        );
+    }
+
+    #[test]
+    fn worktree_menu_extends_chat_agents_in_order() {
+        assert_eq!(
+            &PROJECT_CHAT_MENU_WITH_WORKTREES[..CHAT_AGENTS.len()],
+            CHAT_AGENTS,
+            "agent rows must stay in sync with CHAT_AGENTS"
+        );
+        assert_eq!(
+            &PROJECT_CHAT_MENU_WITH_WORKTREES[CHAT_AGENTS.len()..],
+            &["New worktree", "Open worktree..."]
+        );
+    }
+
+    // ---- apply_project_chat_tab_name (BUG-2b: agent panel project label) ----
+
+    #[test]
+    fn project_chat_tab_name_applied_to_auto_named_tab() {
+        let mut ws = Workspace::test_new("space");
+        apply_project_chat_tab_name(&mut ws, 0, Path::new("/herdr-test-nonexistent/my-project"));
+        // TP-TAB-CHAT-01: the project label is a DERIVED name, seeded into
+        // `chat_title` so the tab reads as its directory until the chat it
+        // hosts is known — and so an explicit rename (`custom_name`) still wins.
+        assert_eq!(ws.tabs[0].chat_title.as_deref(), Some("my-project"));
+        assert!(ws.tabs[0].custom_name.is_none());
+        assert_eq!(ws.tab_display_name(0).as_deref(), Some("my-project"));
+        assert!(
+            !ws.tabs[0].is_auto_named(),
+            "a derived-named tab is not unnamed"
+        );
+    }
+
+    #[test]
+    fn project_chat_tab_name_respects_existing_custom_name() {
+        let mut ws = Workspace::test_new("space");
+        ws.tabs[0].custom_name = Some("kept".into());
+        apply_project_chat_tab_name(&mut ws, 0, Path::new("/herdr-test-nonexistent/my-project"));
+        assert_eq!(ws.tabs[0].custom_name.as_deref(), Some("kept"));
+    }
+
+    #[test]
+    fn project_chat_tab_name_ignores_out_of_bounds_tab_index() {
+        let mut ws = Workspace::test_new("space");
+        apply_project_chat_tab_name(&mut ws, 99, Path::new("/herdr-test-nonexistent/my-project"));
+        assert!(ws.tabs[0].custom_name.is_none());
+    }
+}

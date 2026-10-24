@@ -1,0 +1,18 @@
+# Device jump — the bar's door to the tailnet
+
+`action = { kind = "devices" }` on a bar section opens a picker of the machines
+Tailscale knows; Enter attaches to the picked machine's own Herdr in a new tab
+running `herdr --remote <machine>`. Fork behavior; upstream has no such action.
+The picker is the Taildrop picker's box (`behaviors/files-surface.md`,
+TP-FSEND-TS) with a different verb, and shares its pin list.
+
+| ID | Behavior | Breaks if lost | Verified by |
+|---|---|---|---|
+| TP-JUMP-01 | `devices` is an action kind that reads no keys; every leftover (`argv`, `command`, `name`, `width`, `height`, `secondary`) is refused by name. | A half-finished edit beside the door parses silently and a person reads a setting that is never used. | `a_devices_action_reads_nothing_and_refuses_every_leftover` |
+| TP-JUMP-02 | A primary press on a `devices` section resolves to `OpenDevices`; a secondary press is inert and still consumed by the bar. | The press falls through to the surface behind, or a right press offers presentations for something the picker owns. | `a_devices_section_opens_the_picker_on_the_first_press_and_stays_chrome_on_the_second` |
+| TP-JUMP-03 | The picker opens on the tailnet as it is at the press, pinned machines first; an empty or unreadable tailnet says which; a press while it is up does not stack a second picker. | A blank box that reads as a hang, or Esc closing the picker onto itself. | `the_picker_opens_pinned_first_and_says_why_when_there_is_nothing_to_pick` |
+| TP-JUMP-04 | Enter on a machine that can host a Herdr hands the jump to the caller and closes the picker; the tab runs `<this binary> --remote <target>` and is named `↗ <label>`. | The tab opens under the picker, runs the wrong command, or cannot be told apart in the strip. | `enter_on_a_hosting_machine_hands_over_the_jump_and_closes_the_picker`, `a_remote_tab_runs_herdr_remote_for_the_machine_and_wears_its_name` |
+| TP-JUMP-05 | An offline machine, or one that cannot host a server (Windows, iOS, Android), refuses the jump on the status line and keeps the picker open. | A tab that can only fail opens, and the reader learns why from an ssh error instead of a sentence. | `a_machine_that_cannot_be_attached_to_refuses_on_the_status_line_and_stays_open` |
+| TP-JUMP-06 | Esc and q close the picker and hand the keyboard back; unknown keys are swallowed; `p` pins into the list the Taildrop picker shares and the highlight follows the machine. | Keys leak to the surface underneath, or a pin moves the row and Enter lands on the wrong machine. | `esc_closes_the_picker_and_hands_the_keyboard_back`, `p_pins_the_highlighted_machine_shares_the_list_with_taildrop_and_follows_it` |
+| TP-JUMP-07 | The picker is drawn as the Taildrop picker's box: title, one row per machine with its OS, offline rows marked in text and dimmed, the selected row highlighted, a footer naming the keys; the hit-test resolves the row that was drawn; an empty tailnet offers only a way out. | Rows and clicks drift apart, an offline machine looks attachable, or the footer promises Enter over nothing. | `the_picker_draws_the_tailnet_with_offline_machines_dimmed_and_says_what_enter_does`, `a_row_click_lands_on_the_machine_it_was_drawn_on`, `an_empty_tailnet_says_so_and_offers_only_a_way_out` |
+| TP-JUMP-08 | A second jump to a machine that already has its tab focuses that tab instead of opening a twin; a tab opened with a name is announced wearing it. | Two tabs fight over one remote, or the strip shows an unnamed tab that renames itself a frame later. | `a_second_jump_to_the_same_machine_focuses_its_tab_instead_of_opening_a_twin`, `a_tab_opened_with_a_name_is_announced_wearing_it` |

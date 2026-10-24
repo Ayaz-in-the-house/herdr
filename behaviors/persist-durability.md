@@ -1,0 +1,29 @@
+# Crash-durable state files — registered behaviors
+
+Fork feature. Every state file herdr owns (`session.json`, `session-history.json`,
+`workspace-chats.json`, `closed-agents.json`, `plugins.json`) is written and read
+through one road, `src/persist/durable.rs`.
+
+Why (measured 2026-08-26 on a btrfs home): the files were `fs::write(tmp)` +
+`rename` with no `fsync`. A system crash landed the renames before the bytes,
+every file came back empty, every loader "degraded to empty" as designed, and
+the next save overwrote the last good copy. 28 panes, 350 filed chats and every
+module row were lost with nothing on disk to recover from.
+
+Two ideas run through the family:
+
+- **The rename is the commit.** Bytes are synced before the rename and the
+  directory after it, so the visible file is always the previous one or the
+  complete new one.
+- **A file that does not parse is evidence, not a slot to overwrite.** It is
+  moved aside with a timestamp and the previous save stands in.
+
+| ID | Behavior | Breaks if lost | Verified by |
+|---|---|---|---|
+| TP-PERSIST-01 | A save is `tmp → fsync(file) → rename → fsync(dir)`; a failed sync leaves the previous file untouched and no temp file behind. | A crash between the rename and the data reaching disk produces an empty file that the next start reads as corrupt — the exact 2026-08-26 loss. | `a_save_syncs_the_bytes_before_the_rename_and_the_directory_after`, `a_failed_file_sync_leaves_the_previous_file_untouched` |
+| TP-PERSIST-02 | Before a save replaces a readable (non-empty) previous file, that file is kept as `<name>.bak`; a zero-byte file is never promoted to backup. | One save back is the only copy that exists after a torn primary; promoting the torn file would destroy it. | `a_save_keeps_the_previous_readable_file_as_a_backup`, `an_empty_previous_file_is_not_promoted_to_backup` |
+| TP-PERSIST-03 | A file that fails to parse (torn, malformed, or from a newer version) is moved aside as `<name>.corrupt-<secs>` and the `.bak` copy is loaded instead; with no backup the loader starts empty but the evidence survives; a missing primary with a backup restores the backup. | The loader's "degrade to empty" contract silently turns into "destroy on next save". | `a_corrupt_file_is_quarantined_and_the_backup_is_restored`, `a_corrupt_file_without_backup_is_quarantined_not_overwritten`, `a_newer_version_file_is_preserved_the_same_way`, `a_missing_primary_with_a_backup_restores_the_backup`, `a_missing_file_with_no_backup_is_a_first_run` |
+| TP-PERSIST-04 | The session snapshot, the workspace-chat ledger and the closed-agent graveyard all take that road: a torn file of each is quarantined and its previous save restored, and a session save leaves a `.bak`. | One store drifting back to a bare `fs::write` reopens the loss for that store alone, invisibly. | `a_corrupt_session_file_is_quarantined_and_the_backup_restored`, `a_session_save_leaves_a_backup_of_the_previous_session`, `a_torn_ledger_is_quarantined_and_the_previous_save_restored`, `a_torn_graveyard_is_quarantined_and_the_previous_save_restored` |
+| TP-PERSIST-05 | The managed spaces overlay (`spaces.managed.toml`), the managed bars overlay, release notes, product announcements and the live-handoff history freight all take the same durable road; the spaces overlay leaves a `.bak` and no temp file. | A promote, move or "Set directory" applied seconds before a crash is torn or gone; the freight replays as garbage on import. | `the_managed_spaces_overlay_is_written_durably_with_a_backup` |
+| TP-PERSIST-06 | A structural change (workspace, tab, pane, worktree created/closed/moved/renamed) schedules the session save for the very next loop turn; only non-structural dirt is debounced, and the debounce never pushes a sooner save later; `no_session` still writes nothing. | "I created a workspace and the crash undid it": the 5 s debounce was the window in which everything made in memory did not yet exist on disk. | `a_structural_change_schedules_the_save_now_not_after_the_debounce`, `debounced_dirt_never_pushes_a_sooner_save_later`, `a_no_session_run_schedules_nothing_even_for_structural_changes` |
+| TP-PERSIST-07 | Structural mutations that only reach the scheduler through `AppState` (workspace/tab/pane close, pane died, split, workspace move, worktree open/membership, agent start/rename, module/chat moves and renames from menus) raise `session_dirty_now`, and the scheduler turns that into an immediate save instead of the debounced one. | The API `create` is written at once (TP-PERSIST-06) while a `close` from the sidebar waits 5 s — the rule "what exists, exists on disk" holds for half the verbs. Measured live 2026-08-29: create → 1.5 s, close → 6 s. | `closing_a_workspace_asks_for_the_save_now_and_the_scheduler_obeys` |

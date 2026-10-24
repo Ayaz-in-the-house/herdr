@@ -1,0 +1,13231 @@
+//! Native file manager — navigation and tagged action input (A3/C1/C2).
+//!
+//! While the file manager is open it captures keyboard input (intercepted in
+//! `handle_key` before the mode dispatch), driving the cursor and directory
+//! navigation on `AppState.file_manager`. Client-side presentation input; keys
+//! that it does not use are swallowed so they never reach the hidden terminal.
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+use crate::app::state::{
+    AppState, ContextMenuKind, ContextMenuState, FileManagerContextMenuModel,
+    FileManagerHeaderAction, FileManagerLocationNavigationIntent,
+    FileManagerLocationNavigationRequest, FileManagerRowAction, MenuListState,
+};
+use crate::app::{App, Mode};
+use crate::fm::PdfPageStep;
+
+const FILE_MANAGER_VERTICAL_WHEEL_BURST_WINDOW: std::time::Duration =
+    std::time::Duration::from_millis(2);
+
+#[derive(Debug, Clone, Copy)]
+struct FileManagerVerticalWheelStamp {
+    files_generation: u32,
+    trail_col: usize,
+    direction: i8,
+    column: u16,
+    row: u16,
+    at: std::time::Instant,
+}
+
+/// Collapses only the raw SGR micro-burst measured from Ghostty: identical
+/// direction, owner and coordinates inside a 2 ms window. Reversals, column
+/// changes, pointer movement and human-scale detents remain independent.
+#[derive(Debug, Default)]
+pub(in crate::app) struct FileManagerVerticalWheelBurstGate {
+    last: Option<FileManagerVerticalWheelStamp>,
+}
+
+impl FileManagerVerticalWheelBurstGate {
+    fn accept_at(
+        &mut self,
+        files_generation: u32,
+        trail_col: usize,
+        direction: i8,
+        column: u16,
+        row: u16,
+        at: std::time::Instant,
+    ) -> bool {
+        let next = FileManagerVerticalWheelStamp {
+            files_generation,
+            trail_col,
+            direction,
+            column,
+            row,
+            at,
+        };
+        let duplicate = self.last.is_some_and(|last| {
+            last.files_generation == next.files_generation
+                && last.trail_col == next.trail_col
+                && last.direction == next.direction
+                && last.column == next.column
+                && last.row == next.row
+                && next
+                    .at
+                    .checked_duration_since(last.at)
+                    .is_some_and(|elapsed| elapsed < FILE_MANAGER_VERTICAL_WHEEL_BURST_WINDOW)
+        });
+        // Advance on every packet so an arbitrarily long dense host burst
+        // remains one semantic step instead of leaking every Nth duplicate.
+        self.last = Some(next);
+        !duplicate
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum FileManagerMouseDispatch {
+    NotHandled,
+    Consumed,
+    HeaderAction(FileManagerHeaderAction),
+    RowAction {
+        action: FileManagerRowAction,
+        entry_path: std::path::PathBuf,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum FileManagerKeyDispatch {
+    Consumed,
+    Inert,
+    DeferredLocationNavigation,
+    CancelOperation,
+    Refresh(Box<crate::fm::FmCurrentRefreshRequest>),
+    PreviewDirectory {
+        trail_col: usize,
+        entry_index: usize,
+        expected_path: std::path::PathBuf,
+    },
+    ActivateDirectory {
+        trail_col: usize,
+        entry_index: usize,
+        expected_path: std::path::PathBuf,
+    },
+}
+
+fn active_directory_dispatch(
+    file_manager: &crate::fm::FmState,
+    activate: bool,
+) -> Option<FileManagerKeyDispatch> {
+    let (trail_col, entry_index, expected_path, is_directory) =
+        file_manager.active_trail_entry_identity()?;
+    if !is_directory {
+        return None;
+    }
+    Some(if activate {
+        FileManagerKeyDispatch::ActivateDirectory {
+            trail_col,
+            entry_index,
+            expected_path,
+        }
+    } else {
+        FileManagerKeyDispatch::PreviewDirectory {
+            trail_col,
+            entry_index,
+            expected_path,
+        }
+    })
+}
+
+fn invalidate_deferred_location_navigation(state: &mut AppState) {
+    state.request_file_manager_location_navigation = None;
+    state.file_manager_locations.pending = None;
+}
+
+fn location_navigation_viewport_height(state: &AppState) -> u16 {
+    let view = &state.view.file_manager_locations;
+    view.layout
+        .rail
+        .map(|rail| rail.height)
+        .or_else(|| {
+            view.drawer_area
+                .map(crate::ui::locations_drawer_content_area)
+                .map(|content| content.height)
+        })
+        // Immediately after root Left opens the compact drawer, the next
+        // compute has not projected drawer_area yet. The Trail owns the same
+        // body rect, minus the drawer's one-cell top/bottom border.
+        .or_else(|| {
+            view.locations_action_area
+                .is_some()
+                .then(|| view.layout.trail.height.saturating_sub(2))
+        })
+        .unwrap_or(0)
+}
+
+fn stage_location_navigation(
+    state: &mut AppState,
+    path: std::path::PathBuf,
+    intent: FileManagerLocationNavigationIntent,
+) -> bool {
+    if !state
+        .file_manager_locations
+        .select_cursor(&path, &state.file_manager_locations_model)
+    {
+        return false;
+    }
+    // TP-SBS-FILES-02: on-screen authority, so the rail answers on the right half too.
+    let files_generation = state.on_screen_files_generation();
+    let model_revision = state.file_manager_locations_model.revision();
+    if intent == FileManagerLocationNavigationIntent::EnterTrail
+        && files_generation.is_some_and(|files_generation| {
+            state.file_manager_locations.promote_pending_intent(
+                &path,
+                files_generation,
+                model_revision,
+                intent,
+            )
+        })
+    {
+        // The exact worker ticket already owns this path. Upgrade its
+        // completion authority before the scheduled result drain can run;
+        // no duplicate request or render is needed.
+        state.request_file_manager_location_navigation = None;
+        return true;
+    }
+    state.request_file_manager_location_navigation =
+        Some(FileManagerLocationNavigationRequest::new(path, intent));
+    true
+}
+
+fn move_locations_rail_cursor(state: &mut AppState, delta: isize) -> FileManagerKeyDispatch {
+    match state
+        .file_manager_locations
+        .move_cursor(&state.file_manager_locations_model, delta)
+    {
+        crate::app::file_manager_locations::FileManagerLocationCursorMove::Inert => {
+            FileManagerKeyDispatch::Inert
+        }
+        crate::app::file_manager_locations::FileManagerLocationCursorMove::Moved(path) => {
+            let viewport_height = location_navigation_viewport_height(state);
+            let _ = state
+                .file_manager_locations
+                .ensure_cursor_visible(&state.file_manager_locations_model, viewport_height);
+            state.request_file_manager_location_navigation =
+                Some(FileManagerLocationNavigationRequest::new(
+                    path,
+                    FileManagerLocationNavigationIntent::FollowPreview,
+                ));
+            FileManagerKeyDispatch::Consumed
+        }
+    }
+}
+
+fn handle_locations_rail_key(
+    state: &mut AppState,
+    key: KeyEvent,
+) -> Option<FileManagerKeyDispatch> {
+    if state.file_manager_locations.focus != crate::app::FileManagerLocationsFocus::Rail {
+        return None;
+    }
+
+    let dispatch = match (key.code, key.modifiers) {
+        (KeyCode::Esc, _)
+            if state
+                .file_manager_operation
+                .as_ref()
+                .is_some_and(crate::app::state::FileManagerOperationState::is_running) =>
+        {
+            FileManagerKeyDispatch::CancelOperation
+        }
+        (KeyCode::Esc | KeyCode::Char('q'), _) => {
+            state.close_file_manager();
+            FileManagerKeyDispatch::Consumed
+        }
+        (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE) => {
+            move_locations_rail_cursor(state, 1)
+        }
+        (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) => {
+            move_locations_rail_cursor(state, -1)
+        }
+        (KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter, KeyModifiers::NONE) => {
+            let target = state
+                .file_manager_locations
+                .cursor_path(&state.file_manager_locations_model)
+                .map(std::path::Path::to_path_buf);
+            if target.is_some_and(|path| {
+                stage_location_navigation(
+                    state,
+                    path,
+                    FileManagerLocationNavigationIntent::EnterTrail,
+                )
+            }) {
+                FileManagerKeyDispatch::DeferredLocationNavigation
+            } else {
+                FileManagerKeyDispatch::Inert
+            }
+        }
+        (KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h'), KeyModifiers::NONE) => {
+            FileManagerKeyDispatch::Inert
+        }
+        _ => FileManagerKeyDispatch::Inert,
+    };
+    Some(dispatch)
+}
+
+fn focus_locations_from_trail_root(state: &mut AppState) -> bool {
+    let view = &state.view.file_manager_locations;
+    let frame_is_live = view.files_generation == state.on_screen_files_generation()
+        && view.model_revision == state.file_manager_locations_model.revision();
+    let has_wide_rail = view.layout.rail.is_some();
+    let has_compact_action = view.locations_action_area.is_some();
+    if !frame_is_live || (!has_wide_rail && !has_compact_action) {
+        return false;
+    }
+
+    invalidate_deferred_location_navigation(state);
+    if has_compact_action {
+        let _ = state.file_manager_locations.open_drawer();
+    } else {
+        let _ = state.file_manager_locations.focus_rail();
+    }
+    let _ = state
+        .file_manager_locations
+        .normalize_cursor_for_rail(&state.file_manager_locations_model);
+    let viewport_height = location_navigation_viewport_height(state);
+    let _ = state
+        .file_manager_locations
+        .ensure_cursor_visible(&state.file_manager_locations_model, viewport_height);
+    true
+}
+
+fn focus_file_manager_trail(state: &mut AppState) -> bool {
+    let deferred_changed = state
+        .request_file_manager_location_navigation
+        .take()
+        .is_some();
+    let focus_changed = state.file_manager_locations.focus_trail();
+    deferred_changed || focus_changed
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AttachmentPickerKeyDispatch {
+    Consumed,
+    Navigate(crate::fm::FmNavigationRequest),
+    Refresh(crate::fm::FmCurrentRefreshRequest),
+}
+
+/// Open the enlarged viewer on the current selection, if it has a picture.
+///
+/// Only a raster preview can be enlarged: a text or workbook preview is drawn
+/// from cells that already fill the panel, so "enlarging" it would be a
+/// different feature rather than a bigger version of this one. Refusing here
+/// keeps the viewer from opening onto a frame with nothing in it.
+pub(crate) fn open_preview_viewer(state: &mut AppState) -> bool {
+    let Some(file_manager) = state.file_manager.as_ref() else {
+        return false;
+    };
+    let source_path = match &file_manager.preview {
+        crate::fm::FmPreview::File(crate::fm::FmFilePreview::Image(preview)) => {
+            if matches!(
+                preview.state,
+                crate::fm::FmImagePreviewState::Unsupported
+                    | crate::fm::FmImagePreviewState::Unavailable { .. }
+            ) {
+                return false;
+            }
+            preview.source_path.clone()
+        }
+        crate::fm::FmPreview::File(crate::fm::FmFilePreview::Pdf(preview)) => {
+            if matches!(
+                preview.state,
+                crate::fm::FmPdfPreviewState::Unavailable { .. }
+            ) {
+                return false;
+            }
+            preview.source_path.clone()
+        }
+        _ => return false,
+    };
+    state.preview_viewer = Some(crate::app::state::PreviewViewerState { source_path });
+    state.enter_overlay_mode(Mode::PreviewViewer);
+    true
+}
+
+/// Queue the first matching plugin action for the file whose preview was
+/// clicked — the editor for a text file, the popup spreadsheet for a
+/// workbook, the popup viewer for a picture or PDF.
+///
+/// The click produces the SAME plugin intent the context menu emits, so both
+/// travel one dispatch seam and cannot drift. When several installed actions
+/// match the extension, the lowest qualified id wins — the same deterministic
+/// order the context menu lists them in, so the click opens what the menu
+/// shows first. Plugins choose their preview-click answer by naming an action
+/// that sorts first.
+/// Queue the first installed File-context plugin action matching `path` —
+/// the ONE seam every "open this file" click travels (the FM preview click,
+/// the context menu, and the pane's path click), so they cannot drift
+/// (TP-CLICKOPEN-01). False when nothing installed can open it.
+pub(crate) fn queue_file_open_intent(state: &mut AppState, path: std::path::PathBuf) -> bool {
+    let actions = crate::app::api::plugins::file_manifest_actions(&state.installed_plugins);
+    let paths = [path.clone()];
+    let Some(action) = actions.iter().find(|action| {
+        action
+            .contexts
+            .contains(&crate::api::schema::PluginActionContext::File)
+            && action.matches_paths(&paths)
+    }) else {
+        return false;
+    };
+    state.request_file_manager_context_action =
+        Some(crate::app::state::FileManagerContextActionIntent {
+            action: crate::app::state::FileManagerContextMenuAction::Plugin {
+                plugin_id: action.plugin_id.clone(),
+                action_id: action.action_id.clone(),
+            },
+            paths: vec![path],
+        });
+    true
+}
+
+pub(crate) fn queue_text_preview_editor(state: &mut AppState) -> bool {
+    let Some(file_manager) = state.file_manager.as_ref() else {
+        return false;
+    };
+    let path = match &file_manager.preview {
+        crate::fm::FmPreview::File(crate::fm::FmFilePreview::Text(preview)) => {
+            preview.source_path.clone()
+        }
+        crate::fm::FmPreview::File(crate::fm::FmFilePreview::Sheet(preview)) => {
+            preview.source_path.clone()
+        }
+        crate::fm::FmPreview::File(crate::fm::FmFilePreview::Image(preview)) => {
+            preview.source_path.clone()
+        }
+        crate::fm::FmPreview::File(crate::fm::FmFilePreview::Pdf(preview)) => {
+            preview.source_path.clone()
+        }
+        _ => return false,
+    };
+
+    // TP-FM-FOCUS-01: name the target the way the right-click road does.
+    // The scheduled boundary rebuilds its menu from the file manager's
+    // EXPLICIT selection, so a press that queues a path without establishing
+    // one hands the boundary something it cannot recognise — and the intent is
+    // dropped without a word. A press on the preview is a press on that file,
+    // so it owns the selection exactly as the context menu's press does, and
+    // an existing multi-selection that already holds the file is kept rather
+    // than collapsed.
+    let Some(file_manager) = state.file_manager.as_mut() else {
+        return false;
+    };
+    let Some(entry_index) = file_manager
+        .entries
+        .iter()
+        .position(|entry| entry.path == path)
+    else {
+        // The preview outlived its row. Refusing here keeps the press honest
+        // instead of queuing an intent the boundary will silently refuse.
+        return false;
+    };
+    let selection_ready = if file_manager.multi_selection_paths().contains(&path) {
+        file_manager.select(entry_index)
+    } else {
+        file_manager.replace_selection(entry_index)
+    };
+    if !selection_ready {
+        return false;
+    }
+
+    // No editor for this type: swallowing the click is honest; queuing an
+    // intent nothing can run fails out of sight.
+    queue_file_open_intent(state, path)
+}
+
+/// Open the Taildrop destination picker on `paths`.
+///
+/// The device list is read here, once, rather than while the picker is up: the
+/// tailnet does not change between opening a menu and choosing from it, and a
+/// list that reshuffled underneath the highlight would move the selection out
+/// from under the reader mid-press.
+///
+/// A failed read still opens the picker, carrying the reason. Refusing to open
+/// would leave the menu entry doing nothing at all, which reads as herdr being
+/// broken rather than tailscale being unavailable.
+pub(crate) fn open_tailscale_send(state: &mut AppState, paths: Vec<std::path::PathBuf>) -> bool {
+    let loaded = crate::tailscale::load_devices();
+    open_tailscale_send_with(state, paths, loaded)
+}
+
+/// The half of [`open_tailscale_send`] that does not touch the tailnet.
+///
+/// Split so the picker's state and drawing can be tested against a device list
+/// the test chose. Running `tailscale` inside a test would make the result
+/// depend on the machine it runs on, which is exactly the kind of test that
+/// passes everywhere except where it matters.
+pub(crate) fn open_tailscale_send_with(
+    state: &mut AppState,
+    paths: Vec<std::path::PathBuf>,
+    loaded: Result<Vec<crate::tailscale::TailscaleDevice>, String>,
+) -> bool {
+    if paths.is_empty() {
+        return false;
+    }
+    let pinned = state.tailscale_pinned_devices.clone();
+    let loaded = loaded.map(|mut devices| {
+        crate::tailscale::sort_devices(&mut devices, &pinned);
+        devices
+    });
+    let (devices, status) = match loaded {
+        Ok(devices) if devices.is_empty() => (
+            Vec::new(),
+            // An empty tailnet and a failed read look the same on screen unless
+            // one of them says so.
+            Some("  no other devices on this tailnet".to_owned()),
+        ),
+        Ok(devices) => (devices, None),
+        Err(reason) => (Vec::new(), Some(format!("  {reason}"))),
+    };
+    state.tailscale_send = Some(crate::app::state::TailscaleSendState {
+        paths,
+        devices,
+        selected: 0,
+        status,
+        sending: false,
+        sent_targets: Vec::new(),
+    });
+    state.enter_overlay_mode(Mode::TailscaleSend);
+    true
+}
+
+/// Close the picker and hand focus back to whoever had it.
+pub(crate) fn close_tailscale_send(state: &mut AppState) -> bool {
+    if state.tailscale_send.take().is_none() {
+        return false;
+    }
+    super::leave_modal(state);
+    true
+}
+
+/// Send to the highlighted device, reporting the outcome on the status line.
+///
+/// The picker stays open afterwards on purpose. Closing on success would take
+/// the confirmation away with it, and the reader would be left without the one
+/// piece of information they were waiting for.
+pub(crate) fn send_to_selected_device(state: &mut AppState) -> bool {
+    let Some(picker) = state.tailscale_send.as_mut() else {
+        return false;
+    };
+    if picker.sending {
+        return false;
+    }
+    let Some(device) = picker.selected_device().cloned() else {
+        return false;
+    };
+
+    picker.sending = true;
+    let paths = picker.paths.clone();
+    let outcome = crate::tailscale::send(&paths, &device.target);
+    let Some(picker) = state.tailscale_send.as_mut() else {
+        return false;
+    };
+    picker.sending = false;
+    // Only a success earns the row its mark. A failed send marked ✓ is worse
+    // than no mark: it tells the reader to stop trying exactly when they
+    // should try again.
+    if outcome.is_ok() && !picker.sent_targets.contains(&device.target) {
+        picker.sent_targets.push(device.target.clone());
+    }
+    picker.status = Some(format!(
+        "  {}",
+        crate::tailscale::send_outcome(&paths, &device.label, outcome.err().as_deref())
+    ));
+    true
+}
+
+/// Handle one key while the picker is open.
+///
+/// Everything unrecognised is swallowed: this is a blocking overlay, and a key
+/// that fell through to the file manager underneath would move a selection the
+/// reader cannot see.
+/// Returns the new pin list when this key changed it, so the caller — which
+/// owns config writing — can persist it. Returning it rather than writing here
+/// keeps this function testable without a config file.
+pub(crate) fn handle_tailscale_send_key(
+    state: &mut AppState,
+    key: KeyEvent,
+) -> Option<Vec<String>> {
+    match (key.code, key.modifiers) {
+        (KeyCode::Esc | KeyCode::Char('q'), KeyModifiers::NONE) => {
+            let _ = close_tailscale_send(state);
+        }
+        (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE) => {
+            if let Some(picker) = state.tailscale_send.as_mut() {
+                let _ = picker.move_selection(true);
+            }
+        }
+        (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) => {
+            if let Some(picker) = state.tailscale_send.as_mut() {
+                let _ = picker.move_selection(false);
+            }
+        }
+        (KeyCode::Enter, KeyModifiers::NONE) => {
+            let _ = send_to_selected_device(state);
+        }
+        (KeyCode::Char('p'), KeyModifiers::NONE) => {
+            return toggle_pin_on_selected_device(state);
+        }
+        _ => {}
+    }
+    None
+}
+
+/// Pin or unpin the highlighted machine, and follow it to its new row.
+///
+/// The highlight moves with the device rather than staying on the row index:
+/// pinning sends the machine to the top, and a highlight left behind would sit
+/// on a different machine than the one the reader just acted on — with `Enter`
+/// one keystroke away.
+///
+/// Returns the new pin list when it changed, so the caller can persist it.
+/// Writing the config file is not done here: this function is the decision and
+/// stays testable without touching disk.
+pub(crate) fn toggle_pin_on_selected_device(state: &mut AppState) -> Option<Vec<String>> {
+    let picker = state.tailscale_send.as_mut()?;
+    let device = picker.selected_device()?.clone();
+    let pinned = crate::tailscale::toggle_pin(&state.tailscale_pinned_devices, &device.target);
+
+    crate::tailscale::sort_devices(&mut picker.devices, &pinned);
+    picker.selected = picker
+        .devices
+        .iter()
+        .position(|candidate| candidate.target == device.target)
+        .unwrap_or(0);
+    state.tailscale_pinned_devices = pinned.clone();
+    Some(pinned)
+}
+
+/// Close the viewer and hand focus back to whoever had it.
+pub(crate) fn close_preview_viewer(state: &mut AppState) -> bool {
+    if state.preview_viewer.take().is_none() {
+        return false;
+    }
+    super::leave_modal(state);
+    true
+}
+
+/// Handle one key while the enlarged viewer is open.
+///
+/// `q` and `Esc` close the viewer rather than the application: the viewer owns
+/// the keyboard while it is up, and the tier that is forgotten is exactly this
+/// one — the suppressed global. Page keys keep working so a PDF can be read at
+/// full size. Everything else is swallowed, so no key reaches the surface
+/// underneath a blocking overlay.
+pub(crate) fn handle_preview_viewer_key(state: &mut AppState, key: KeyEvent) {
+    match (key.code, key.modifiers) {
+        (KeyCode::Esc | KeyCode::Char('q'), KeyModifiers::NONE) => {
+            let _ = close_preview_viewer(state);
+        }
+        (KeyCode::PageDown, KeyModifiers::NONE) => {
+            let _ = turn_previewed_pdf_page(state, PdfPageStep::Next);
+        }
+        (KeyCode::PageUp, KeyModifiers::NONE) => {
+            let _ = turn_previewed_pdf_page(state, PdfPageStep::Previous);
+        }
+        _ => {}
+    }
+}
+
+/// Turn the previewed PDF one page, reporting whether anything moved.
+///
+/// The bounds live in the model; input only names the direction.
+fn turn_previewed_pdf_page(state: &mut AppState, step: PdfPageStep) -> bool {
+    state
+        .file_manager
+        .as_mut()
+        .is_some_and(|file_manager| file_manager.turn_pdf_page(step))
+}
+
+/// Handle one key while the file manager is open. `Esc` requests cancellation
+/// for a running file operation and otherwise closes the file manager; `q`
+/// always closes it. The arrow keys and `hjkl` move the cursor or navigate
+/// directories; `.` toggles hidden files; Ctrl+A selects all; Ctrl+Shift+A
+/// clears the explicit selection. Any other key is a no-op (swallowed).
+pub(super) fn handle_file_manager_key(
+    state: &mut AppState,
+    key: KeyEvent,
+) -> FileManagerKeyDispatch {
+    if key.code == KeyCode::Esc && state.file_manager_locations.close_drawer() {
+        invalidate_deferred_location_navigation(state);
+        return FileManagerKeyDispatch::Consumed;
+    }
+    if let Some(dispatch) = handle_locations_rail_key(state, key) {
+        return dispatch;
+    }
+    if state.file_manager_locations.drawer_is_open() {
+        return FileManagerKeyDispatch::Consumed;
+    }
+    if key.code == KeyCode::Esc
+        && state
+            .file_manager_operation
+            .as_ref()
+            .is_some_and(crate::app::state::FileManagerOperationState::is_running)
+    {
+        return FileManagerKeyDispatch::CancelOperation;
+    }
+    // TP-FM-FILTER-03: while the filter is being typed, keys are text first —
+    // characters grow the pattern live, Backspace shrinks it (and walks out
+    // from empty), Esc drops the filter whole, Enter keeps it and hands the
+    // keys back. Arrows still move — WITHIN the matches.
+    if state
+        .file_manager
+        .as_ref()
+        .is_some_and(|fm| fm.trail_filter_editing)
+    {
+        if let Some(fm) = state.file_manager.as_mut() {
+            match (key.code, key.modifiers) {
+                (KeyCode::Esc, _) => fm.clear_trail_filter(),
+                (KeyCode::Enter, _) => fm.accept_trail_filter(),
+                (KeyCode::Backspace, _) => fm.pop_trail_filter_char(),
+                (KeyCode::Up, _) => {
+                    let _ = fm.move_trail_cursor(-1);
+                }
+                (KeyCode::Down, _) => {
+                    let _ = fm.move_trail_cursor(1);
+                }
+                (KeyCode::Char(c), modifiers)
+                    if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT =>
+                {
+                    fm.push_trail_filter_char(c);
+                }
+                _ => {}
+            }
+        }
+        return FileManagerKeyDispatch::Consumed;
+    }
+    match (key.code, key.modifiers) {
+        // Esc and q no longer close the file manager (the older close-on-esc
+        // contract was retired on explicit request: pressing Esc to close an
+        // editor popup was landing here a beat later and silently killing the
+        // whole surface — see TP-A3.8 in behaviors/). Esc
+        // keeps a local job — dropping the explicit multi-selection — and q
+        // is swallowed so it cannot fall through to anything destructive.
+        // The surface closes from the tab/sidebar, never from a stray key.
+        // TP-FM-FILTER-03: an accepted filter is the nearest thing to
+        // dismiss — Esc clears it first; the selection goes on the next
+        // press. `q` stays a swallowed key, never a filter verb.
+        (KeyCode::Esc, _)
+            if state
+                .file_manager
+                .as_ref()
+                .is_some_and(|fm| fm.trail_filter().is_some()) =>
+        {
+            if let Some(fm) = state.file_manager.as_mut() {
+                fm.clear_trail_filter();
+            }
+        }
+        (KeyCode::Char('/'), KeyModifiers::NONE) => {
+            if let Some(fm) = state.file_manager.as_mut() {
+                fm.begin_trail_filter();
+            }
+        }
+        (KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q'), _) => {
+            if let Some(fm) = state.file_manager.as_mut() {
+                fm.clear_multi_selection();
+            }
+        }
+        (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
+            if let Some(fm) = state.file_manager.as_mut() {
+                fm.select_all();
+            }
+        }
+        (KeyCode::Char('a') | KeyCode::Char('A'), modifiers)
+            if modifiers == KeyModifiers::CONTROL | KeyModifiers::SHIFT =>
+        {
+            if let Some(fm) = state.file_manager.as_mut() {
+                fm.clear_multi_selection();
+            }
+        }
+        (KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J'), KeyModifiers::SHIFT) => {
+            let Some(fm) = state.file_manager.as_mut() else {
+                return FileManagerKeyDispatch::Inert;
+            };
+            let before = fm.clone();
+            let outcome = fm.move_trail_cursor(1);
+            if outcome.is_rejected() || !fm.extend_selection(fm.cursor) {
+                *fm = before;
+                return FileManagerKeyDispatch::Inert;
+            }
+            if !outcome.changed() && fm.multi_selection_paths() == before.multi_selection_paths() {
+                return FileManagerKeyDispatch::Inert;
+            }
+        }
+        (KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K'), KeyModifiers::SHIFT) => {
+            let Some(fm) = state.file_manager.as_mut() else {
+                return FileManagerKeyDispatch::Inert;
+            };
+            let before = fm.clone();
+            let outcome = fm.move_trail_cursor(-1);
+            if outcome.is_rejected() || !fm.extend_selection(fm.cursor) {
+                *fm = before;
+                return FileManagerKeyDispatch::Inert;
+            }
+            if !outcome.changed() && fm.multi_selection_paths() == before.multi_selection_paths() {
+                return FileManagerKeyDispatch::Inert;
+            }
+        }
+        (KeyCode::Char(' '), KeyModifiers::NONE) => {
+            if let Some(fm) = state.file_manager.as_mut() {
+                if fm.activate_selected_trail_entry()
+                    != crate::fm::trail_snapshots::TrailActivateOutcome::Rejected
+                {
+                    let _ = fm.toggle_selection(fm.cursor);
+                }
+            }
+        }
+        (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE) => {
+            if let Some(fm) = state.file_manager.as_mut() {
+                let outcome = fm.move_trail_cursor(1);
+                if outcome.changed() && outcome.is_directory() {
+                    if let Some(dispatch) = active_directory_dispatch(fm, false) {
+                        return dispatch;
+                    }
+                }
+                if !outcome.changed() {
+                    return FileManagerKeyDispatch::Inert;
+                }
+            } else {
+                return FileManagerKeyDispatch::Inert;
+            }
+        }
+        (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) => {
+            if let Some(fm) = state.file_manager.as_mut() {
+                let outcome = fm.move_trail_cursor(-1);
+                if outcome.changed() && outcome.is_directory() {
+                    if let Some(dispatch) = active_directory_dispatch(fm, false) {
+                        return dispatch;
+                    }
+                }
+                if !outcome.changed() {
+                    return FileManagerKeyDispatch::Inert;
+                }
+            } else {
+                return FileManagerKeyDispatch::Inert;
+            }
+        }
+        (KeyCode::Enter, KeyModifiers::NONE) => {
+            // A picture is the one selection Enter had nothing to do with, so
+            // it becomes the way to enlarge one. Directories keep their meaning.
+            if open_preview_viewer(state) {
+                return FileManagerKeyDispatch::Consumed;
+            }
+            if let Some(fm) = state.file_manager.as_mut() {
+                if let Some(dispatch) = active_directory_dispatch(fm, true) {
+                    return dispatch;
+                }
+                if fm.activate_selected_trail_entry()
+                    == crate::fm::trail_snapshots::TrailActivateOutcome::Rejected
+                {
+                    return FileManagerKeyDispatch::Inert;
+                }
+            } else {
+                return FileManagerKeyDispatch::Inert;
+            }
+        }
+        (KeyCode::Right | KeyCode::Char('l'), KeyModifiers::NONE) => {
+            if let Some(fm) = state.file_manager.as_mut() {
+                if fm.trail.cursor_override().is_some() {
+                    if let Some(dispatch) = active_directory_dispatch(fm, true) {
+                        return dispatch;
+                    }
+                    return FileManagerKeyDispatch::Inert;
+                } else {
+                    if !fm.trail.move_active_right() {
+                        return FileManagerKeyDispatch::Inert;
+                    }
+                    if !fm.focus_first_active_trail_entry() {
+                        debug_assert!(false, "resident child focus must have an aligned snapshot");
+                        return FileManagerKeyDispatch::Inert;
+                    }
+                }
+            } else {
+                return FileManagerKeyDispatch::Inert;
+            }
+        }
+        (KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h'), KeyModifiers::NONE) => {
+            let Some(moved) = state.file_manager.as_mut().map(|fm| {
+                // TP-TRAIL-REVEAL-01: backing out is the reader leaving the
+                // child — the window must not snap forward to it again.
+                fm.miller.horizontal.reveal_child = false;
+                fm.trail.move_active_left()
+            }) else {
+                return FileManagerKeyDispatch::Inert;
+            };
+            if !moved && !focus_locations_from_trail_root(state) {
+                return FileManagerKeyDispatch::Inert;
+            }
+        }
+        // PageDown/PageUp rather than the arrows: Left/Right already move
+        // between Trail columns, so taking them would mean selecting a PDF
+        // stops the file manager from navigating directories. Over any other
+        // preview these keys stay inert.
+        (KeyCode::PageDown, KeyModifiers::NONE) => {
+            if !turn_previewed_pdf_page(state, PdfPageStep::Next) {
+                return FileManagerKeyDispatch::Inert;
+            }
+        }
+        (KeyCode::PageUp, KeyModifiers::NONE) => {
+            if !turn_previewed_pdf_page(state, PdfPageStep::Previous) {
+                return FileManagerKeyDispatch::Inert;
+            }
+        }
+        (KeyCode::Char('.'), KeyModifiers::NONE) => {
+            // TP-SBS-FILES-03: the surface this screen is showing, so the
+            // toggle is not silently dead beside a terminal.
+            let files_generation = state.on_screen_files_generation();
+            if let Some(request) = state.file_manager.as_ref().and_then(|file_manager| {
+                files_generation.map(|generation| file_manager.request_hidden_toggle(generation))
+            }) {
+                return FileManagerKeyDispatch::Refresh(Box::new(request));
+            }
+        }
+        _ => {}
+    }
+    FileManagerKeyDispatch::Consumed
+}
+
+pub(crate) fn handle_agent_attachment_picker_key(
+    state: &mut AppState,
+    key: KeyEvent,
+) -> AttachmentPickerKeyDispatch {
+    match (key.code, key.modifiers) {
+        (KeyCode::Esc | KeyCode::Char('q'), _) => {
+            state.close_agent_attachment_picker();
+            AttachmentPickerKeyDispatch::Consumed
+        }
+        (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE) => {
+            if let Some(picker) = state.agent_attachment_picker.as_mut() {
+                picker.file_manager.move_down();
+            }
+            AttachmentPickerKeyDispatch::Consumed
+        }
+        (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) => {
+            if let Some(picker) = state.agent_attachment_picker.as_mut() {
+                picker.file_manager.move_up();
+            }
+            AttachmentPickerKeyDispatch::Consumed
+        }
+        // TP-MOD-35: choosing a directory is what this popup is FOR when it was
+        // opened for a module, so Enter commits and the arrow keys walk. The
+        // attachment purpose keeps Enter as "attach or descend" — the two jobs
+        // want opposite things from one key, and the purpose is the only thing
+        // that can tell them apart.
+        (KeyCode::Enter, KeyModifiers::NONE)
+            if state
+                .agent_attachment_picker
+                .as_ref()
+                .is_some_and(|picker| picker.module_key().is_some()) =>
+        {
+            state.submit_module_dir_from_picker();
+            AttachmentPickerKeyDispatch::Consumed
+        }
+        (KeyCode::Enter, KeyModifiers::NONE) => {
+            if let Some(path) = state.agent_attachment_selected_file() {
+                if let Some(target) = state
+                    .agent_attachment_picker
+                    .as_ref()
+                    .and_then(|picker| picker.attachment_target().cloned())
+                {
+                    state.request_agent_attachment_delivery =
+                        Some(crate::app::state::AgentAttachmentDeliveryRequest { path, target });
+                }
+                AttachmentPickerKeyDispatch::Consumed
+            } else {
+                state
+                    .agent_attachment_picker
+                    .as_ref()
+                    .and_then(|picker| picker.file_manager.request_enter_navigation())
+                    .map_or(
+                        AttachmentPickerKeyDispatch::Consumed,
+                        AttachmentPickerKeyDispatch::Navigate,
+                    )
+            }
+        }
+        (KeyCode::Right | KeyCode::Char('l'), KeyModifiers::NONE) => {
+            if state.agent_attachment_selected_file().is_some() {
+                AttachmentPickerKeyDispatch::Consumed
+            } else {
+                state
+                    .agent_attachment_picker
+                    .as_ref()
+                    .and_then(|picker| picker.file_manager.request_enter_navigation())
+                    .map_or(
+                        AttachmentPickerKeyDispatch::Consumed,
+                        AttachmentPickerKeyDispatch::Navigate,
+                    )
+            }
+        }
+        (KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h'), KeyModifiers::NONE) => state
+            .agent_attachment_picker
+            .as_ref()
+            .and_then(|picker| picker.file_manager.request_leave_navigation())
+            .map_or(
+                AttachmentPickerKeyDispatch::Consumed,
+                AttachmentPickerKeyDispatch::Navigate,
+            ),
+        (KeyCode::Char('.'), KeyModifiers::NONE) => state
+            .agent_attachment_picker
+            .as_ref()
+            .map(|picker| picker.file_manager.request_hidden_toggle(0))
+            .map_or(
+                AttachmentPickerKeyDispatch::Consumed,
+                AttachmentPickerKeyDispatch::Refresh,
+            ),
+        _ => AttachmentPickerKeyDispatch::Consumed,
+    }
+}
+
+impl App {
+    pub(in crate::app) fn route_agent_attachment_picker_key(&mut self, key: KeyEvent) {
+        match handle_agent_attachment_picker_key(&mut self.state, key) {
+            AttachmentPickerKeyDispatch::Navigate(request) => {
+                let Some(prepared) = crate::fm::prepare_navigation_io(request) else {
+                    return;
+                };
+                let _ = self
+                    .state
+                    .agent_attachment_picker
+                    .as_mut()
+                    .is_some_and(|picker| picker.file_manager.apply_prepared_navigation(prepared));
+            }
+            AttachmentPickerKeyDispatch::Refresh(request) => {
+                let prepared = crate::fm::prepare_current_refresh_io(request);
+                let _ = self
+                    .state
+                    .agent_attachment_picker
+                    .as_mut()
+                    .is_some_and(|picker| {
+                        picker
+                            .file_manager
+                            .apply_prepared_current_refresh(prepared, 0)
+                    });
+            }
+            AttachmentPickerKeyDispatch::Consumed => {}
+        }
+    }
+
+    /// Convert one stable row hit target into the same typed intent consumed by
+    /// header/context actions. A cloned projection proves the anchored row is
+    /// currently eligible before the real selection changes, so rejected
+    /// stale, bulk, read-only, or in-flight actions cannot corrupt focus.
+    pub(super) fn dispatch_file_manager_row_action(
+        &mut self,
+        action: FileManagerRowAction,
+        entry_path: std::path::PathBuf,
+    ) -> bool {
+        let context_action = match action {
+            FileManagerRowAction::SendAgent => {
+                crate::app::state::FileManagerContextMenuAction::SendAgent
+            }
+            FileManagerRowAction::Rename => crate::app::state::FileManagerContextMenuAction::Rename,
+            FileManagerRowAction::Delete => crate::app::state::FileManagerContextMenuAction::Delete,
+        };
+        let Some((trail_col, trail_entry, mut projected)) =
+            self.state.file_manager.as_ref().and_then(|fm| {
+                (fm.multi_selection_paths().len() <= 1).then_some(())?;
+                let (trail_col, trail_entry) = fm.trail_entry_identity(&entry_path)?;
+                Some((trail_col, trail_entry, fm.clone()))
+            })
+        else {
+            return false;
+        };
+        if projected.activate_trail_entry(trail_col, trail_entry, &entry_path)
+            == crate::fm::trail_snapshots::TrailActivateOutcome::Rejected
+        {
+            return false;
+        }
+        let entry_idx = projected.cursor;
+        if !projected.replace_selection(entry_idx) {
+            return false;
+        }
+        let action_bar = crate::ui::compute_file_manager_action_bar_model(
+            &projected,
+            &self.state.file_manager_clipboard,
+            self.state
+                .file_manager_operation
+                .as_ref()
+                .is_some_and(crate::app::state::FileManagerOperationState::is_running),
+            self.state.file_manager_locations.focus,
+        );
+        let Some(model) =
+            FileManagerContextMenuModel::from_action_bar_with_plugins(&action_bar, &[])
+        else {
+            return false;
+        };
+        if model.paths != [entry_path.clone()]
+            || !model
+                .items
+                .iter()
+                .any(|item| item.action == context_action && item.enabled)
+        {
+            return false;
+        }
+        let live_selection_ready = self.state.file_manager.as_mut().is_some_and(|fm| {
+            fm.activate_trail_entry(trail_col, trail_entry, &entry_path)
+                != crate::fm::trail_snapshots::TrailActivateOutcome::Rejected
+                && fm.replace_selection(fm.cursor)
+        });
+        if !live_selection_ready {
+            return false;
+        }
+        self.state.request_file_manager_context_action =
+            Some(crate::app::state::FileManagerContextActionIntent {
+                action: context_action,
+                paths: vec![entry_path],
+            });
+        true
+    }
+
+    fn handle_active_miller_resize_mouse(&mut self, mouse: &MouseEvent) -> bool {
+        if !self.state.shell_interaction.miller_resize_active() {
+            return false;
+        }
+        match mouse.kind {
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let trailing_min = self.state.shell_interaction.miller_resize_preview().map_or(
+                    crate::fm::miller::MILLER_COLUMN_MIN_WIDTH,
+                    |(divider, _)| match divider.trailing() {
+                        crate::ui::shell::MillerResizeColumnId::Directory { .. } => {
+                            crate::fm::miller::MILLER_COLUMN_MIN_WIDTH
+                        }
+                        crate::ui::shell::MillerResizeColumnId::Preview { .. } => {
+                            crate::fm::miller::MILLER_DETAIL_MIN_WIDTH
+                        }
+                    },
+                );
+                if let Some(bounds) = crate::ui::shell::ResizeBounds::new(
+                    crate::fm::miller::MILLER_COLUMN_MIN_WIDTH,
+                    crate::fm::miller::MILLER_COLUMN_MAX_WIDTH,
+                    trailing_min,
+                    crate::fm::miller::MILLER_COLUMN_MAX_WIDTH,
+                ) {
+                    let tracks_before = self.state.shell_interaction.resize_preview_tracks();
+                    let accepted = self.state.shell_interaction.preview_resize(
+                        ratatui::layout::Position::new(mouse.column, mouse.row),
+                        bounds,
+                    );
+                    if accepted
+                        && self.state.shell_interaction.resize_preview_tracks() != tracks_before
+                    {
+                        crate::render_prof::event("fm.miller_resize.preview_changed");
+                    }
+                }
+                true
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let _ = self.commit_miller_resize();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn handle_file_manager_right_click(
+        &mut self,
+        mouse: &MouseEvent,
+        entry_target: Option<&(usize, std::path::PathBuf)>,
+    ) -> bool {
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) {
+            return false;
+        }
+        if !mouse.modifiers.is_empty() {
+            return true;
+        }
+
+        let context_entry_target = entry_target.cloned().or_else(|| {
+            self.state
+                .view
+                .file_manager_row_action_areas
+                .iter()
+                .find(|area| rect_contains(area.rect, mouse.column, mouse.row))
+                .and_then(|area| {
+                    let entry = self
+                        .state
+                        .file_manager
+                        .as_ref()
+                        .and_then(|file_manager| file_manager.entries.get(area.entry_idx))?;
+                    (entry.path == area.entry_path)
+                        .then(|| (area.entry_idx, area.entry_path.clone()))
+                })
+        });
+        let Some((entry_idx, entry_path)) = context_entry_target else {
+            return true;
+        };
+        let selection_ready = self
+            .state
+            .file_manager
+            .as_mut()
+            .is_some_and(|file_manager| {
+                if file_manager.multi_selection_paths().contains(&entry_path) {
+                    file_manager.select(entry_idx)
+                } else {
+                    file_manager.replace_selection(entry_idx)
+                }
+            });
+        if !selection_ready {
+            return true;
+        }
+
+        let action_bar = self.state.file_manager.as_ref().map(|file_manager| {
+            crate::ui::compute_file_manager_action_bar_model(
+                file_manager,
+                &self.state.file_manager_clipboard,
+                self.state
+                    .file_manager_operation
+                    .as_ref()
+                    .is_some_and(|operation| operation.is_running()),
+                self.state.file_manager_locations.focus,
+            )
+        });
+        let plugin_actions =
+            crate::app::api::plugins::file_manifest_actions(&self.state.installed_plugins);
+        if let Some((action_bar, model)) = action_bar.and_then(|action_bar| {
+            FileManagerContextMenuModel::from_action_bar_with_plugins(&action_bar, &plugin_actions)
+                .map(|model| (action_bar, model))
+        }) {
+            self.state.view.file_manager_action_bar = Some(action_bar);
+            self.state.context_menu = Some(ContextMenuState {
+                kind: ContextMenuKind::File { model },
+                x: mouse.column,
+                y: mouse.row,
+                list: MenuListState::new(0),
+            });
+            self.state.enter_overlay_mode(Mode::ContextMenu);
+        }
+        true
+    }
+
+    fn handle_file_manager_row_mouse(
+        &mut self,
+        mouse: &MouseEvent,
+        trail_row_target: Option<&crate::ui::TrailRowView>,
+        now: std::time::Instant,
+    ) {
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) if mouse.modifiers == KeyModifiers::CONTROL => {
+                if let Some((entry_idx, _entry_path, _outcome)) =
+                    trail_row_target.and_then(|row| self.activate_trail_row(row))
+                {
+                    if let Some(file_manager) = self.state.file_manager.as_mut() {
+                        let _ = file_manager.toggle_selection(entry_idx);
+                    }
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) if mouse.modifiers == KeyModifiers::SHIFT => {
+                if let Some((entry_idx, _entry_path, _outcome)) =
+                    trail_row_target.and_then(|row| self.activate_trail_row(row))
+                {
+                    if let Some(file_manager) = self.state.file_manager.as_mut() {
+                        let _ = file_manager.extend_selection(entry_idx);
+                    }
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) if mouse.modifiers.is_empty() => {
+                let Some(row) = trail_row_target else {
+                    return;
+                };
+                if let Some((entry_idx, entry_path, outcome)) = self.focus_trail_row(row) {
+                    if let Some(file_manager) = self.state.file_manager.as_mut() {
+                        if outcome.is_directory() {
+                            file_manager.clear_multi_selection();
+                        } else {
+                            let _ = file_manager.replace_selection(entry_idx);
+                        }
+                    }
+                    if outcome.is_directory() {
+                        let _ = self.queue_file_manager_trail_directory_preview_identity(
+                            row.trail_index,
+                            row.entry_index,
+                            &entry_path,
+                        );
+                    }
+                }
+            }
+            MouseEventKind::ScrollUp if mouse.modifiers.is_empty() => {
+                if let Some(row) = trail_row_target {
+                    let _ =
+                        self.handle_file_manager_vertical_wheel(mouse, row.trail_index, -1, now);
+                }
+            }
+            MouseEventKind::ScrollDown if mouse.modifiers.is_empty() => {
+                if let Some(row) = trail_row_target {
+                    let _ = self.handle_file_manager_vertical_wheel(mouse, row.trail_index, 1, now);
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {}
+            _ => {}
+        }
+    }
+
+    /// TP-TRAIL-VSCROLL-02: the wheel scrolls the CONTENT of the column under
+    /// the pointer, the way a file manager does — the selection stays where
+    /// the reader put it.
+    ///
+    /// Returns false for a column with nothing to scroll (its listing already
+    /// fits). That is not a silent drop: a column with no vertical content to
+    /// move is exactly where the horizontal fallback still has to mean
+    /// something, and it is the only horizontal road on hosts that report a
+    /// sideways gesture as a plain vertical wheel (TP-TRAIL-WHEEL-FALLBACK-01).
+    fn handle_file_manager_hover_column_scroll(
+        &mut self,
+        mouse: &MouseEvent,
+        delta: isize,
+        now: std::time::Instant,
+    ) -> bool {
+        let Some((trail_col, directory, line_start, max_start)) = self
+            .state
+            .view
+            .file_manager_trail
+            .columns
+            .iter()
+            .find(|column| rect_contains(column.rect, mouse.column, mouse.row))
+            .map(|column| {
+                (
+                    column.trail_index,
+                    column.directory.clone(),
+                    column.line_start,
+                    column.line_total.saturating_sub(column.line_height),
+                )
+            })
+        else {
+            return false;
+        };
+        if max_start == 0 {
+            return false;
+        }
+        let Some(files_generation) = self.state.on_screen_files_generation() else {
+            return false;
+        };
+        // The same detent filter the cursor road uses: this host reports one
+        // physical notch as three packets, and one notch is one step whatever
+        // the wheel is moving (TP-FMN-WHEEL-01/02). Coalesced events are still
+        // CONSUMED — falling through would flip the axis mid-gesture.
+        let direction = if delta < 0 { -1 } else { 1 };
+        if !self.file_manager_vertical_wheel_gate.accept_at(
+            files_generation,
+            trail_col,
+            direction,
+            mouse.column,
+            mouse.row,
+            now,
+        ) {
+            self.file_manager_mouse_render_override = Some(false);
+            crate::render_prof::event("fm.vertical_wheel.coalesced");
+            return true;
+        }
+        crate::render_prof::event("fm.vertical_wheel.accepted");
+        let Some(file_manager) = self.state.file_manager.as_mut() else {
+            return false;
+        };
+        // The register, not the projection: the view is only rebuilt on the
+        // next render, so reading `line_start` for every event of a burst
+        // would compute each step from the same stale start and the gesture
+        // would never accumulate. Where no register exists yet, the projected
+        // window IS the truth — it is where the selection-follow rule put it.
+        let current = file_manager
+            .miller
+            .vertical
+            .start_for(&directory)
+            .unwrap_or(line_start);
+        let next = if delta < 0 {
+            current.saturating_sub(1)
+        } else {
+            current.saturating_add(1).min(max_start)
+        };
+        file_manager.miller.vertical.set_start(&directory, next);
+        // At either end the gesture is still this column's — consuming it
+        // keeps the axis from flipping under the reader at the boundary — but
+        // an unchanged window is not worth a frame.
+        self.file_manager_mouse_render_override = Some(next != current);
+        true
+    }
+
+    fn handle_file_manager_vertical_wheel(
+        &mut self,
+        mouse: &MouseEvent,
+        trail_col: usize,
+        delta: isize,
+        now: std::time::Instant,
+    ) -> bool {
+        let Some(files_generation) = self.state.on_screen_files_generation() else {
+            return false;
+        };
+        let direction = if delta < 0 { -1 } else { 1 };
+        if !self.file_manager_vertical_wheel_gate.accept_at(
+            files_generation,
+            trail_col,
+            direction,
+            mouse.column,
+            mouse.row,
+            now,
+        ) {
+            self.file_manager_mouse_render_override = Some(false);
+            crate::render_prof::event("fm.vertical_wheel.coalesced");
+            return false;
+        }
+        crate::render_prof::event("fm.vertical_wheel.accepted");
+
+        let (trail_changed, directory_preview) = {
+            let Some(file_manager) = self.state.file_manager.as_mut() else {
+                return false;
+            };
+            let focus_changed = file_manager.trail.active_col() != trail_col;
+            if !file_manager.focus_trail_col(trail_col) {
+                return false;
+            }
+            let outcome = file_manager.move_trail_cursor_in_column(trail_col, delta);
+            let directory_preview = (outcome.changed() && outcome.is_directory())
+                .then(|| file_manager.active_trail_entry_identity())
+                .flatten();
+            (focus_changed || outcome.changed(), directory_preview)
+        };
+        let owner_changed = focus_file_manager_trail(&mut self.state);
+        let changed = trail_changed || owner_changed;
+        self.file_manager_mouse_render_override = Some(changed);
+
+        if let Some((intent_col, entry_index, expected_path, true)) = directory_preview {
+            let _ = self.queue_file_manager_trail_directory_preview_identity(
+                intent_col,
+                entry_index,
+                &expected_path,
+            );
+        }
+        changed
+    }
+
+    fn activate_trail_row(
+        &mut self,
+        row: &crate::ui::TrailRowView,
+    ) -> Option<(
+        usize,
+        std::path::PathBuf,
+        crate::fm::trail_snapshots::TrailActivateOutcome,
+    )> {
+        let activated = {
+            let file_manager = self.state.file_manager.as_mut()?;
+            let outcome = file_manager.activate_trail_entry(
+                row.trail_index,
+                row.entry_index,
+                &row.entry_path,
+            );
+            if outcome == crate::fm::trail_snapshots::TrailActivateOutcome::Rejected {
+                return None;
+            }
+            let entry_idx = file_manager
+                .entries
+                .iter()
+                .position(|entry| entry.path == row.entry_path)?;
+            (file_manager.cursor == entry_idx).then(|| (entry_idx, row.entry_path.clone(), outcome))
+        };
+        if activated.is_some() {
+            let _ = focus_file_manager_trail(&mut self.state);
+        }
+        activated
+    }
+
+    fn focus_trail_row(
+        &mut self,
+        row: &crate::ui::TrailRowView,
+    ) -> Option<(
+        usize,
+        std::path::PathBuf,
+        crate::fm::trail_snapshots::TrailCursorMoveOutcome,
+    )> {
+        let focused = {
+            let file_manager = self.state.file_manager.as_mut()?;
+            let outcome =
+                file_manager.focus_trail_entry(row.trail_index, row.entry_index, &row.entry_path);
+            if outcome.is_rejected() {
+                return None;
+            }
+            let entry_idx = file_manager
+                .entries
+                .iter()
+                .position(|entry| entry.path == row.entry_path)?;
+            (file_manager.cursor == entry_idx).then(|| (entry_idx, row.entry_path.clone(), outcome))
+        };
+        if focused.is_some() {
+            let _ = focus_file_manager_trail(&mut self.state);
+        }
+        focused
+    }
+
+    /// Which page-turn a press at this cell lands on, if any.
+    ///
+    /// Both the arrow positions and the question of whether an indicator is on
+    /// screen at all come from `pdf_page_indicator_for`, the same call the
+    /// renderer draws from. Deriving them here instead is how a click keeps
+    /// turning pages after the indicator has stopped being drawn.
+    fn pdf_page_indicator_step_at(&self, column: u16, row: u16) -> Option<PdfPageStep> {
+        let file_manager = self.state.file_manager.as_ref()?;
+        let content_area = crate::kitty_graphics::file_manager_trail_image_content_area(
+            &self.state.view.file_manager_trail,
+            file_manager,
+        )?;
+        let crate::fm::FmPreview::File(crate::fm::FmFilePreview::Pdf(preview)) =
+            &file_manager.preview
+        else {
+            return None;
+        };
+        let indicator = crate::ui::pdf_page_indicator_for(&self.state, content_area, preview)?;
+        if indicator
+            .previous
+            .is_some_and(|zone| rect_contains(zone, column, row))
+        {
+            return Some(PdfPageStep::Previous);
+        }
+        if indicator
+            .next
+            .is_some_and(|zone| rect_contains(zone, column, row))
+        {
+            return Some(PdfPageStep::Next);
+        }
+        None
+    }
+
+    /// TP-FM-MORE-01: open the header's `[more]` menu at the pointer. The
+    /// target is the selection when one exists, else the cursor entry — and
+    /// the plugin rows are resolved at open time from the same manifest road
+    /// the file context menu reads.
+    fn open_fm_more_menu(&mut self, x: u16, y: u16) {
+        let Some(file_manager) = self.state.file_manager.as_ref() else {
+            return;
+        };
+        let selected = file_manager.multi_selection_paths();
+        let paths: Vec<_> = if selected.is_empty() {
+            file_manager
+                .entries
+                .get(file_manager.cursor)
+                .map(|entry| vec![entry.path.clone()])
+                .unwrap_or_default()
+        } else {
+            file_manager
+                .entries
+                .iter()
+                .filter(|entry| selected.contains(&entry.path))
+                .map(|entry| entry.path.clone())
+                .collect()
+        };
+        let actions =
+            crate::app::api::plugins::file_manifest_actions(&self.state.installed_plugins)
+                .into_iter()
+                .map(|action| crate::app::state::FmMoreEntry {
+                    plugin_id: action.plugin_id,
+                    action_id: action.action_id,
+                    title: action.title,
+                })
+                .collect();
+        self.state.context_menu = Some(ContextMenuState {
+            kind: ContextMenuKind::FmMore { actions, paths },
+            x,
+            y,
+            list: MenuListState::new(0),
+        });
+        self.state.enter_overlay_mode(Mode::ContextMenu);
+    }
+
+    /// Route native-FM center-content mouse input before the hidden terminal
+    /// pane path. Row actions carry stable path identity but remain side-effect
+    /// free until their operation modules provide explicit execution authority.
+    pub(super) fn handle_file_manager_mouse(
+        &mut self,
+        mouse: MouseEvent,
+    ) -> FileManagerMouseDispatch {
+        self.handle_file_manager_mouse_at(mouse, std::time::Instant::now())
+    }
+
+    fn handle_file_manager_mouse_at(
+        &mut self,
+        mouse: MouseEvent,
+        now: std::time::Instant,
+    ) -> FileManagerMouseDispatch {
+        self.file_manager_mouse_render_override = None;
+        // The TYPED stage authority owns Files mouse routing: a hidden Files
+        // surface (or a divergent legacy boolean) receives nothing.
+        // TP-SBS-FILES-01: riding the right half is a way of being on
+        // screen, so it receives clicks too.
+        let files_on_screen = self.state.stage.surface_view()
+            == crate::ui::surface_host::StageSurfaceView::NativeFiles
+            || self.state.files_beside_active();
+        if !files_on_screen || self.state.file_manager.is_none() {
+            return FileManagerMouseDispatch::NotHandled;
+        }
+        if self.state.mode == Mode::ContextMenu {
+            return FileManagerMouseDispatch::NotHandled;
+        }
+        // While the enlarged viewer is up it covers the file manager, so a
+        // press belongs to it rather than to whatever row is underneath.
+        if self.state.preview_viewer.is_some() {
+            return FileManagerMouseDispatch::Consumed;
+        }
+
+        // The one typed Miller capture owns drag/up everywhere, including
+        // outside the Files Stage, so fast pointer movement cannot escape the
+        // transaction or fall through to a retired geometry authority.
+        if self.handle_active_miller_resize_mouse(&mouse) {
+            return FileManagerMouseDispatch::Consumed;
+        }
+
+        // TP-SBS-FILES-01: riding the right half moves every Files hit into
+        // the right rectangle, so the center gate follows the projected right
+        // surface — the shrunken terminal half holds no Files geometry there.
+        let center = if self.state.files_beside_active() {
+            self.state
+                .view
+                .right_surface
+                .as_ref()
+                .map(|right| right.area)
+                .unwrap_or(self.state.view.terminal_area)
+        } else {
+            self.state.view.terminal_area
+        };
+        let in_center = rect_contains(center, mouse.column, mouse.row);
+        if !in_center {
+            return FileManagerMouseDispatch::NotHandled;
+        }
+        // TP-SBS-FOCUS-01: a press inside the Files half claims the keyboard
+        // for it — mouse-first: the half you click is the half you type into.
+        if self.state.files_beside_active() && matches!(mouse.kind, MouseEventKind::Down(_)) {
+            if let Some(sbs) = self.state.side_by_side.as_mut() {
+                sbs.focus = crate::app::state::SideBySideFocus::Right;
+            }
+        }
+
+        // TP-SBS-FILES-02: the generation the SCREEN is showing, not the
+        // stage's own — while Files rides the right half the stage belongs to
+        // the terminal, and comparing against it dropped every press.
+        let active_files_generation = self.state.on_screen_files_generation();
+        let locations = self.state.view.file_manager_locations.clone();
+        let locations_frame_is_live = locations.files_generation == active_files_generation
+            && locations.model_revision == self.state.file_manager_locations_model.revision();
+        let in_locations_action = locations
+            .locations_action_area
+            .is_some_and(|action| rect_contains(action, mouse.column, mouse.row));
+        if in_locations_action {
+            if locations_frame_is_live
+                && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                && mouse.modifiers.is_empty()
+            {
+                if self.state.file_manager_locations.drawer_is_open() {
+                    invalidate_deferred_location_navigation(&mut self.state);
+                    let _ = self.state.file_manager_locations.close_drawer();
+                } else {
+                    let _ = self.state.file_manager_locations.open_drawer();
+                    let _ = self
+                        .state
+                        .file_manager_locations
+                        .normalize_cursor_for_rail(&self.state.file_manager_locations_model);
+                    let viewport_height = location_navigation_viewport_height(&self.state);
+                    let _ = self.state.file_manager_locations.ensure_cursor_visible(
+                        &self.state.file_manager_locations_model,
+                        viewport_height,
+                    );
+                }
+            }
+            return FileManagerMouseDispatch::Consumed;
+        }
+        if let Some(drawer) = locations.drawer_area {
+            if locations_frame_is_live && rect_contains(drawer, mouse.column, mouse.row) {
+                match mouse.kind {
+                    MouseEventKind::Down(MouseButton::Left) if mouse.modifiers.is_empty() => {
+                        let target = locations
+                            .rows
+                            .iter()
+                            .find(|row| rect_contains(row.rect, mouse.column, mouse.row))
+                            .filter(|row| {
+                                Some(row.files_generation) == active_files_generation
+                                    && row.model_revision == locations.model_revision
+                            })
+                            .and_then(|row| {
+                                self.state
+                                    .file_manager_locations_model
+                                    .item_for_path(&row.path)
+                                    .filter(|item| item.accessible)
+                                    .map(|_| row.path.clone())
+                            });
+                        if let Some(path) = target {
+                            let _ = stage_location_navigation(
+                                &mut self.state,
+                                path,
+                                FileManagerLocationNavigationIntent::EnterTrail,
+                            );
+                        }
+                    }
+                    MouseEventKind::ScrollUp if mouse.modifiers.is_empty() => {
+                        let content = crate::ui::locations_drawer_content_area(drawer);
+                        let _ = self.state.file_manager_locations.scroll_rail(
+                            -1,
+                            locations.content_line_count,
+                            content.height,
+                        );
+                    }
+                    MouseEventKind::ScrollDown if mouse.modifiers.is_empty() => {
+                        let content = crate::ui::locations_drawer_content_area(drawer);
+                        let _ = self.state.file_manager_locations.scroll_rail(
+                            1,
+                            locations.content_line_count,
+                            content.height,
+                        );
+                    }
+                    _ => {}
+                }
+                return FileManagerMouseDispatch::Consumed;
+            }
+            if locations_frame_is_live
+                && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                && mouse.modifiers.is_empty()
+            {
+                invalidate_deferred_location_navigation(&mut self.state);
+                let _ = self.state.file_manager_locations.close_drawer();
+            }
+            return FileManagerMouseDispatch::Consumed;
+        }
+        let in_locations_rail = locations
+            .layout
+            .rail
+            .is_some_and(|rail| rect_contains(rail, mouse.column, mouse.row));
+        if in_locations_rail {
+            if locations_frame_is_live {
+                match mouse.kind {
+                    MouseEventKind::Down(MouseButton::Left) if mouse.modifiers.is_empty() => {
+                        let target = locations
+                            .rows
+                            .iter()
+                            .find(|row| rect_contains(row.rect, mouse.column, mouse.row))
+                            .filter(|row| {
+                                Some(row.files_generation) == active_files_generation
+                                    && row.model_revision == locations.model_revision
+                            })
+                            .and_then(|row| {
+                                self.state
+                                    .file_manager_locations_model
+                                    .item_for_path(&row.path)
+                                    .filter(|item| item.accessible)
+                                    .map(|_| row.path.clone())
+                            });
+                        if let Some(path) = target {
+                            let _ = stage_location_navigation(
+                                &mut self.state,
+                                path,
+                                FileManagerLocationNavigationIntent::FollowPreview,
+                            );
+                        }
+                    }
+                    MouseEventKind::ScrollUp if mouse.modifiers.is_empty() => {
+                        if let Some(rail) = locations.layout.rail {
+                            let _ = self.state.file_manager_locations.scroll_rail(
+                                -1,
+                                locations.content_line_count,
+                                rail.height,
+                            );
+                        }
+                    }
+                    MouseEventKind::ScrollDown if mouse.modifiers.is_empty() => {
+                        if let Some(rail) = locations.layout.rail {
+                            let _ = self.state.file_manager_locations.scroll_rail(
+                                1,
+                                locations.content_line_count,
+                                rail.height,
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            return FileManagerMouseDispatch::Consumed;
+        }
+        if locations
+            .layout
+            .separator
+            .is_some_and(|separator| rect_contains(separator, mouse.column, mouse.row))
+        {
+            return FileManagerMouseDispatch::Consumed;
+        }
+        let in_trail = rect_contains(locations.layout.trail, mouse.column, mouse.row);
+
+        let header_action = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            .then_some(())
+            .filter(|_| mouse.modifiers.is_empty())
+            .and_then(|()| {
+                self.state
+                    .view
+                    .file_manager_header_action_areas
+                    .iter()
+                    .find(|area| rect_contains(area.rect, mouse.column, mouse.row))
+                    .map(|area| area.action)
+            });
+
+        let trail_frame_is_live =
+            self.state.view.file_manager_trail.files_generation == active_files_generation;
+        let trail_row_target = trail_frame_is_live
+            .then(|| {
+                crate::ui::trail_row_at(
+                    &self.state.view.file_manager_trail,
+                    mouse.column,
+                    mouse.row,
+                )
+                .cloned()
+            })
+            .flatten();
+        let trail_section_header_target = trail_frame_is_live
+            .then(|| {
+                crate::ui::trail_section_header_at(
+                    &self.state.view.file_manager_trail,
+                    mouse.column,
+                    mouse.row,
+                )
+                .cloned()
+            })
+            .flatten();
+        let projected_row_action = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            .then_some(())
+            .filter(|_| mouse.modifiers.is_empty())
+            .and(trail_row_target.as_ref())
+            .and_then(|row| {
+                row.actions
+                    .iter()
+                    .find(|area| rect_contains(area.rect, mouse.column, mouse.row))
+            });
+        let row_action_hit = projected_row_action.is_some();
+        let row_action = projected_row_action
+            .filter(|area| {
+                trail_row_target.as_ref().is_some_and(|row| {
+                    area.entry_idx == row.entry_index && area.entry_path == row.entry_path
+                })
+            })
+            .filter(|area| {
+                self.state
+                    .file_manager
+                    .as_ref()
+                    .and_then(|file_manager| file_manager.trail_entry_identity(&area.entry_path))
+                    .is_some_and(|(trail_col, entry_index)| {
+                        trail_row_target.as_ref().is_some_and(|row| {
+                            trail_col == row.trail_index && entry_index == row.entry_index
+                        })
+                    })
+            })
+            .map(|area| FileManagerMouseDispatch::RowAction {
+                action: area.action,
+                entry_path: area.entry_path.clone(),
+            });
+
+        // TP-TRAIL-VSCROLL-02: one rule for the whole column body — rows,
+        // headers and empty space alike. A column that can scroll scrolls;
+        // one that cannot leaves the event to the horizontal fallback below.
+        if trail_frame_is_live
+            && mouse.modifiers.is_empty()
+            && matches!(
+                mouse.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            )
+        {
+            let delta = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                -1
+            } else {
+                1
+            };
+            if self.handle_file_manager_hover_column_scroll(&mouse, delta, now) {
+                return FileManagerMouseDispatch::Consumed;
+            }
+        }
+
+        if let Some(header) = trail_section_header_target.as_ref() {
+            if mouse.modifiers.is_empty()
+                && matches!(
+                    mouse.kind,
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                )
+            {
+                let delta = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                    -1
+                } else {
+                    1
+                };
+                let _ =
+                    self.handle_file_manager_vertical_wheel(&mouse, header.trail_index, delta, now);
+            }
+            return FileManagerMouseDispatch::Consumed;
+        }
+
+        // Some terminal hosts report a horizontal trackpad/wheel gesture as
+        // an unmodified vertical wheel event. Preserve visible-row vertical
+        // navigation, but normalize the same event over empty live Trail
+        // column body into the existing fractional horizontal reducer.
+        let plain_wheel_over_empty_trail = trail_frame_is_live
+            && trail_row_target.is_none()
+            && trail_section_header_target.is_none()
+            && mouse.modifiers.is_empty()
+            && matches!(
+                mouse.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            )
+            && self
+                .state
+                .view
+                .file_manager_trail
+                .columns
+                .iter()
+                .any(|column| rect_contains(column.rect, mouse.column, mouse.row));
+        let horizontal_kind = match (mouse.kind, plain_wheel_over_empty_trail) {
+            (MouseEventKind::ScrollUp, true) => MouseEventKind::ScrollLeft,
+            (MouseEventKind::ScrollDown, true) => MouseEventKind::ScrollRight,
+            (kind, _) => kind,
+        };
+
+        // Horizontal preference and divider transactions never override a
+        // live Trail row identity.
+        if in_trail && self.handle_miller_horizontal_scroll(horizontal_kind, mouse.modifiers) {
+            let _ = focus_file_manager_trail(&mut self.state);
+            return FileManagerMouseDispatch::Consumed;
+        }
+        // The page indicator sits inside the detail panel, where no Trail row
+        // or divider can be, so it is answered before the resize capture that
+        // otherwise claims every rowless left press.
+        if trail_frame_is_live
+            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && mouse.modifiers.is_empty()
+        {
+            // TP-FM-FOCUS-01: the preview panel is part of the Trail, so a
+            // press inside it claims ownership the way a row press does —
+            // before anything is queued. Without this a press arriving from
+            // the locations rail queues an intent the scheduled boundary then
+            // refuses as `InactiveFocusOwner`: consumed, silent, no editor.
+            // Claimed for the whole panel rather than only the paths that
+            // queue something, because the press is an interaction with this
+            // side of the file manager either way.
+            let in_preview = crate::kitty_graphics::file_manager_raster_content_area(&self.state)
+                .is_some_and(|area| rect_contains(area, mouse.column, mouse.row))
+                || self
+                    .state
+                    .view
+                    .file_manager_trail
+                    .detail_panel
+                    .as_ref()
+                    .is_some_and(|panel| {
+                        rect_contains(panel.content_rect, mouse.column, mouse.row)
+                    });
+            if in_preview && focus_file_manager_trail(&mut self.state) {
+                self.file_manager_mouse_render_override = Some(true);
+            }
+            if let Some(step) = self.pdf_page_indicator_step_at(mouse.column, mouse.row) {
+                let turned = turn_previewed_pdf_page(&mut self.state, step);
+                self.file_manager_mouse_render_override = Some(turned);
+                return FileManagerMouseDispatch::Consumed;
+            }
+            // Clicking the picture opens it where the plugin says — a popup
+            // viewer when one is installed — and falls back to the built-in
+            // enlarge overlay when nothing matches, so every raster click
+            // still answers. The indicator is answered first because its
+            // arrows sit inside the same rect.
+            if crate::kitty_graphics::file_manager_raster_content_area(&self.state)
+                .is_some_and(|area| rect_contains(area, mouse.column, mouse.row))
+                && (queue_text_preview_editor(&mut self.state)
+                    || open_preview_viewer(&mut self.state))
+            {
+                return FileManagerMouseDispatch::Consumed;
+            }
+            // Clicking a text preview opens the file in the editor tab — the
+            // panel counterpart of the picture click above. Queued as the same
+            // plugin intent the context menu emits; consumed only when it
+            // actually queued, so a click on a preview with no editor still
+            // falls through to the resize capture below.
+            if self
+                .state
+                .view
+                .file_manager_trail
+                .detail_panel
+                .as_ref()
+                .is_some_and(|panel| rect_contains(panel.content_rect, mouse.column, mouse.row))
+                && queue_text_preview_editor(&mut self.state)
+            {
+                return FileManagerMouseDispatch::Consumed;
+            }
+        }
+
+        if trail_row_target.is_none()
+            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && mouse.modifiers.is_empty()
+            && self.begin_miller_resize_capture(mouse.column, mouse.row)
+        {
+            return FileManagerMouseDispatch::Consumed;
+        }
+
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && mouse.modifiers.is_empty()
+        {
+            if let Some(header_action) = header_action {
+                // TP-FM-FOCUS-02: the action bar belongs to the Trail, so a
+                // press on it while another region owns focus claims
+                // ownership — and does nothing else. Arriving from the
+                // locations rail every verb is drawn disabled; this press
+                // lights the bar and the next one acts. It returns before the
+                // enabled check on purpose: a rectangle painted enabled before
+                // the rail took focus is paint history (TP-FFO-ACTION-02),
+                // and re-evaluating it now, with ownership freshly claimed,
+                // would fire a verb the reader was looking at greyed out —
+                // Delete included.
+                let owner_was_elsewhere = self.state.file_manager_locations.focus
+                    != crate::app::FileManagerLocationsFocus::Trail;
+                if focus_file_manager_trail(&mut self.state) {
+                    self.file_manager_mouse_render_override = Some(true);
+                }
+                if owner_was_elsewhere {
+                    return FileManagerMouseDispatch::Consumed;
+                }
+                // TP-FM-MORE-01: [more] opens its menu right here, where the
+                // pointer is — the one header verb that needs an anchor.
+                if header_action == crate::app::state::FileManagerHeaderAction::More {
+                    self.open_fm_more_menu(mouse.column, mouse.row);
+                    return FileManagerMouseDispatch::Consumed;
+                }
+                let prepared_enabled = self
+                    .state
+                    .view
+                    .file_manager_action_bar
+                    .as_ref()
+                    .and_then(|model| model.action_state(header_action))
+                    .is_some_and(|state| state.enabled);
+                let currently_enabled = prepared_enabled
+                    && super::super::file_operation_worker::current_action_paths(
+                        &self.state,
+                        header_action,
+                    )
+                    .is_some();
+                return if currently_enabled {
+                    FileManagerMouseDispatch::HeaderAction(header_action)
+                } else {
+                    FileManagerMouseDispatch::Consumed
+                };
+            }
+            if let Some(row_action) = row_action {
+                let _ = focus_file_manager_trail(&mut self.state);
+                return row_action;
+            }
+            if row_action_hit {
+                return FileManagerMouseDispatch::Consumed;
+            }
+        }
+
+        if locations_frame_is_live
+            && trail_frame_is_live
+            && in_trail
+            && trail_row_target.is_none()
+            && trail_section_header_target.is_none()
+            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && mouse.modifiers.is_empty()
+        {
+            let owner_changed = focus_file_manager_trail(&mut self.state);
+            self.file_manager_mouse_render_override = Some(owner_changed);
+            return FileManagerMouseDispatch::Consumed;
+        }
+
+        let right_click_target = (matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right))
+            && mouse.modifiers.is_empty())
+        .then(|| {
+            trail_row_target
+                .as_ref()
+                .and_then(|row| self.activate_trail_row(row))
+                .map(|(entry_idx, entry_path, _outcome)| (entry_idx, entry_path))
+        })
+        .flatten();
+        if self.handle_file_manager_right_click(&mouse, right_click_target.as_ref()) {
+            return FileManagerMouseDispatch::Consumed;
+        }
+
+        self.handle_file_manager_row_mouse(&mouse, trail_row_target.as_ref(), now);
+
+        FileManagerMouseDispatch::Consumed
+    }
+}
+
+fn rect_contains(rect: ratatui::layout::Rect, column: u16, row: u16) -> bool {
+    column >= rect.x
+        && column < rect.x.saturating_add(rect.width)
+        && row >= rect.y
+        && row < rect.y.saturating_add(rect.height)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::state::{
+        ContextMenuKind, FileManagerActionBarModel, FileManagerActionDisabledReason,
+        FileManagerActionState, FileManagerContextMenuAction, FileManagerContextMenuTargetKind,
+        FileManagerHeaderAction, FileManagerHeaderActionArea, FileManagerLocationNavigationIntent,
+        FileManagerLocationNavigationRequest, FileManagerRowAction, FileManagerRowActionArea,
+        FileManagerRowArea,
+    };
+    use crate::app::test_wait::LoadAwareDeadline;
+    use crate::app::Mode;
+    use crate::fm::{FmState, MAX_MULTI_SELECTION_PATHS};
+    use crate::kitty_graphics::HostCellSize;
+    use crate::ui::compute_view;
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::layout::Rect;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
+    fn unique() -> u64 {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    }
+
+    struct TempDir {
+        root: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "herdr-fminput-{}-{}-{}",
+                std::process::id(),
+                tag,
+                unique()
+            ));
+            fs::create_dir_all(&root).expect("create temp root");
+            Self { root }
+        }
+        fn file(&self, name: &str) {
+            let path = self.root.join(name);
+            fs::write(&path, b"x").expect("write temp file");
+            Self::set_modified(&path);
+        }
+        fn dir(&self, name: &str) {
+            let path = self.root.join(name);
+            fs::create_dir_all(&path).expect("create temp dir");
+            Self::set_modified(&path);
+        }
+        fn set_modified(path: &std::path::Path) {
+            let modified = std::time::UNIX_EPOCH + Duration::from_secs(10);
+            let entry = fs::File::open(path).expect("open temp entry");
+            entry
+                .set_times(fs::FileTimes::new().set_modified(modified))
+                .expect("set temp entry mtime");
+        }
+        fn set_equal_modified(&self, names: &[&str]) {
+            for name in names {
+                Self::set_modified(&self.root.join(name));
+            }
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn image_preview_ready(app: &crate::app::App) -> bool {
+        matches!(
+            app.state
+                .file_manager
+                .as_ref()
+                .map(|file_manager| &file_manager.preview),
+            Some(crate::fm::FmPreview::File(crate::fm::FmFilePreview::Image(
+                crate::fm::FmImagePreview {
+                    state: crate::fm::FmImagePreviewState::Ready { .. },
+                    ..
+                }
+            )))
+        )
+    }
+
+    fn wait_for_image_preview_ready(app: &mut crate::app::App) {
+        let wait = LoadAwareDeadline::new(5, "the image preview worker");
+        loop {
+            let _ = app.sync_image_preview_worker();
+            if image_preview_ready(app) {
+                return;
+            }
+            wait.check();
+            std::thread::yield_now();
+        }
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn key_with_modifiers(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    fn state_with_attachment_picker(root: &std::path::Path, label: &str) -> AppState {
+        let mut state = AppState::test_new();
+        let mut workspace = crate::workspace::Workspace::test_new(label);
+        workspace.identity_cwd = root.to_path_buf();
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        state.workspaces = vec![workspace];
+        state.active = Some(0);
+        state.mode = Mode::Terminal;
+        state.ensure_test_terminals();
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("attachment target terminal")
+            .set_agent_name("codex".into());
+        state.view.terminal_area = Rect::new(0, 0, 80, 24);
+        state
+            .open_agent_attachment_picker()
+            .expect("open attachment picker");
+        state
+    }
+
+    // TP-FM4-APP-ADAPTER: attachment-picker input emits navigation intent but
+    // performs no filesystem-backed model transition before the App adapter.
+    #[test]
+    fn attachment_picker_directory_enter_is_pure_until_app_adapter() {
+        let td = TempDir::new("attachment-directory-intent");
+        td.dir("child");
+        let child = td.root.join("child");
+        let mut state = state_with_attachment_picker(&td.root, "attachment-directory-intent");
+        let picker = state
+            .agent_attachment_picker
+            .as_mut()
+            .expect("open attachment picker");
+        let entry_idx = picker
+            .file_manager
+            .entries
+            .iter()
+            .position(|entry| entry.path == child)
+            .expect("child directory");
+        picker.file_manager.select(entry_idx);
+        let before = picker.file_manager.clone();
+
+        let dispatch = handle_agent_attachment_picker_key(&mut state, key(KeyCode::Enter));
+        let AttachmentPickerKeyDispatch::Navigate(request) = dispatch else {
+            panic!("directory Enter must emit one typed navigation request");
+        };
+
+        let after = &state
+            .agent_attachment_picker
+            .as_ref()
+            .expect("picker remains open")
+            .file_manager;
+        assert_eq!(request.reason, crate::fm::FmNavigationReason::Enter);
+        assert_eq!(request.source_directory, before.cwd);
+        assert_eq!(
+            request.source_directory_generation,
+            before.directory_generation
+        );
+        assert_eq!(request.source_preview_generation, before.preview_generation);
+        assert_eq!(request.source_miller_revision, before.miller.revision);
+        assert_eq!(request.target_directory, child);
+        assert_eq!(request.focus_path, None);
+        assert_eq!(request.fallback_cursor, 0);
+        assert_eq!(request.show_hidden, before.show_hidden);
+        assert_eq!(after.cwd, before.cwd);
+        assert_eq!(after.directory_generation, before.directory_generation);
+        assert_eq!(after.preview_generation, before.preview_generation);
+        assert_eq!(after.miller, before.miller);
+        assert!(state.request_agent_attachment_delivery.is_none());
+    }
+
+    // P5 RED: the blocking attachment overlay owns the key but emits the same
+    // disk-free hidden-refresh intent instead of mutating its model directly.
+    #[test]
+    fn attachment_dot_emits_hidden_refresh_request_without_mutation() {
+        let td = TempDir::new("attachment-hidden-intent");
+        td.file("shown.txt");
+        td.file(".hidden.txt");
+        let mut state = state_with_attachment_picker(&td.root, "attachment-hidden-intent");
+        let before = state
+            .agent_attachment_picker
+            .as_ref()
+            .expect("open attachment picker")
+            .file_manager
+            .clone();
+
+        let dispatch = handle_agent_attachment_picker_key(&mut state, key(KeyCode::Char('.')));
+
+        let AttachmentPickerKeyDispatch::Refresh(request) = dispatch else {
+            panic!("attachment dot must emit one typed hidden-refresh request");
+        };
+        assert_eq!(
+            request.reason,
+            crate::fm::FmCurrentRefreshReason::ToggleHidden
+        );
+        assert_eq!(request.files_generation, 0);
+        assert_eq!(request.source_directory, td.root);
+        assert_eq!(request.source_show_hidden, before.show_hidden);
+        assert_eq!(request.target_show_hidden, !before.show_hidden);
+        let after = &state
+            .agent_attachment_picker
+            .as_ref()
+            .expect("attachment picker remains open")
+            .file_manager;
+        assert_eq!(after.entries, before.entries);
+        assert_eq!(after.show_hidden, before.show_hidden);
+        assert_eq!(after.directory_generation, before.directory_generation);
+        assert_eq!(after.preview_generation, before.preview_generation);
+        assert!(state.request_agent_attachment_delivery.is_none());
+    }
+
+    #[test]
+    fn attachment_app_route_applies_hidden_refresh_once() {
+        let td = TempDir::new("attachment-hidden-app");
+        td.file("shown.txt");
+        td.file(".hidden.txt");
+        let mut app = super::super::app_for_mouse_test();
+        app.state = state_with_attachment_picker(&td.root, "attachment-hidden-app");
+        let before = app
+            .state
+            .agent_attachment_picker
+            .as_ref()
+            .expect("open attachment picker")
+            .file_manager
+            .clone();
+
+        app.route_agent_attachment_picker_key(key(KeyCode::Char('.')));
+
+        let after = &app
+            .state
+            .agent_attachment_picker
+            .as_ref()
+            .expect("attachment picker remains open")
+            .file_manager;
+        assert!(after.show_hidden);
+        assert_eq!(after.entries.len(), 2);
+        assert_eq!(after.directory_generation, before.directory_generation + 1);
+        assert_eq!(after.preview_generation, before.preview_generation + 1);
+        assert!(app.state.request_agent_attachment_delivery.is_none());
+    }
+
+    // TP-FM4-APP-ADAPTER: parent navigation is also an intent-only input
+    // transition; stale preparation must be rejectable before model mutation.
+    #[test]
+    fn attachment_picker_leave_is_pure_until_app_adapter() {
+        let td = TempDir::new("attachment-leave-intent");
+        td.dir("child");
+        let child = td.root.join("child");
+        let mut state = state_with_attachment_picker(&child, "attachment-leave-intent");
+        let before = state
+            .agent_attachment_picker
+            .as_ref()
+            .expect("open attachment picker")
+            .file_manager
+            .clone();
+
+        let dispatch = handle_agent_attachment_picker_key(&mut state, key(KeyCode::Backspace));
+        let AttachmentPickerKeyDispatch::Navigate(request) = dispatch else {
+            panic!("Backspace must emit one typed parent navigation request");
+        };
+
+        let after = &state
+            .agent_attachment_picker
+            .as_ref()
+            .expect("picker remains open")
+            .file_manager;
+        assert_eq!(request.reason, crate::fm::FmNavigationReason::Leave);
+        assert_eq!(request.source_directory, child);
+        assert_eq!(
+            request.source_directory_generation,
+            before.directory_generation
+        );
+        assert_eq!(request.source_preview_generation, before.preview_generation);
+        assert_eq!(request.source_miller_revision, before.miller.revision);
+        assert_eq!(request.target_directory, td.root);
+        assert_eq!(request.focus_path, Some(before.cwd.clone()));
+        assert_eq!(request.fallback_cursor, 0);
+        assert_eq!(request.show_hidden, before.show_hidden);
+        assert_eq!(after.cwd, before.cwd);
+        assert_eq!(after.directory_generation, before.directory_generation);
+        assert_eq!(after.preview_generation, before.preview_generation);
+        assert_eq!(after.miller, before.miller);
+        assert!(state.request_agent_attachment_delivery.is_none());
+    }
+
+    // Characterization: the complete App route still enters the selected
+    // directory after the input-only handler is separated from filesystem I/O.
+    #[test]
+    fn attachment_picker_app_route_enters_directory_once() {
+        let td = TempDir::new("attachment-app-navigation");
+        td.dir("child");
+        let child = td.root.join("child");
+        let mut app = super::super::app_for_mouse_test();
+        app.state = state_with_attachment_picker(&td.root, "attachment-app-navigation");
+        let picker = app
+            .state
+            .agent_attachment_picker
+            .as_mut()
+            .expect("open attachment picker");
+        let entry_idx = picker
+            .file_manager
+            .entries
+            .iter()
+            .position(|entry| entry.path == child)
+            .expect("child directory");
+        picker.file_manager.select(entry_idx);
+        let before_generation = picker.file_manager.directory_generation;
+
+        app.handle_non_terminal_key_headless(crate::input::TerminalKey::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ));
+
+        let after = &app
+            .state
+            .agent_attachment_picker
+            .as_ref()
+            .expect("picker remains open")
+            .file_manager;
+        assert_eq!(after.cwd, child);
+        assert_eq!(
+            after.directory_generation,
+            before_generation.wrapping_add(1).max(1)
+        );
+        assert!(app.state.request_agent_attachment_delivery.is_none());
+    }
+
+    // Characterization: the async production key path must use the same App
+    // adapter as the headless path and apply the navigation exactly once.
+    #[tokio::test]
+    async fn attachment_picker_async_app_route_enters_directory_once() {
+        let td = TempDir::new("attachment-async-app-navigation");
+        td.dir("child");
+        let child = td.root.join("child");
+        let mut app = super::super::app_for_mouse_test();
+        app.state = state_with_attachment_picker(&td.root, "attachment-async-app-navigation");
+        let picker = app
+            .state
+            .agent_attachment_picker
+            .as_mut()
+            .expect("open attachment picker");
+        let entry_idx = picker
+            .file_manager
+            .entries
+            .iter()
+            .position(|entry| entry.path == child)
+            .expect("child directory");
+        picker.file_manager.select(entry_idx);
+        let before_generation = picker.file_manager.directory_generation;
+
+        app.handle_key(crate::input::TerminalKey::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))
+        .await;
+
+        let after = &app
+            .state
+            .agent_attachment_picker
+            .as_ref()
+            .expect("picker remains open")
+            .file_manager;
+        assert_eq!(after.cwd, child);
+        assert_eq!(
+            after.directory_generation,
+            before_generation.wrapping_add(1).max(1)
+        );
+        assert!(app.state.request_agent_attachment_delivery.is_none());
+    }
+
+    #[test]
+    fn attachment_picker_swallowing_unknown_key_preserves_background_terminal() {
+        let td = TempDir::new("attachment-key-block");
+        td.file("a.txt");
+        let mut state = AppState::test_new();
+        let mut workspace = crate::workspace::Workspace::test_new("attachment-key-block");
+        workspace.identity_cwd = td.root.clone();
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        state.workspaces = vec![workspace];
+        state.active = Some(0);
+        state.mode = Mode::Terminal;
+        state.ensure_test_terminals();
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_agent_name("codex".into());
+        state.view.terminal_area = Rect::new(0, 0, 80, 24);
+        state.open_agent_attachment_picker().unwrap();
+        let before = state
+            .agent_attachment_picker
+            .as_ref()
+            .unwrap()
+            .file_manager
+            .cursor;
+
+        let dispatch = handle_agent_attachment_picker_key(&mut state, key(KeyCode::Char('x')));
+
+        assert_eq!(dispatch, AttachmentPickerKeyDispatch::Consumed);
+        assert_eq!(state.mode, Mode::AttachFile);
+        assert_eq!(
+            state
+                .agent_attachment_picker
+                .as_ref()
+                .unwrap()
+                .file_manager
+                .cursor,
+            before
+        );
+        assert!(state.request_agent_attachment_delivery.is_none());
+    }
+
+    // TP-M1.3-PREPARE: Enter creates one typed request for the exact picker
+    // target. Input handling performs no runtime send and keeps the overlay.
+    #[test]
+    fn attachment_picker_enter_prepares_one_typed_request_without_delivery() {
+        let td = TempDir::new("attachment-enter-request");
+        let path = td.root.join("literal ünicode.txt");
+        td.file("literal ünicode.txt");
+        let mut state = AppState::test_new();
+        let mut workspace = crate::workspace::Workspace::test_new("attachment-enter-request");
+        workspace.identity_cwd = td.root.clone();
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        state.workspaces = vec![workspace];
+        state.active = Some(0);
+        state.mode = Mode::Terminal;
+        state.ensure_test_terminals();
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_agent_name("codex".into());
+        state.view.terminal_area = Rect::new(0, 0, 80, 24);
+        state.open_agent_attachment_picker().unwrap();
+        let picker = state.agent_attachment_picker.as_mut().unwrap();
+        let entry_idx = picker
+            .file_manager
+            .entries
+            .iter()
+            .position(|entry| entry.path == path)
+            .unwrap();
+        picker.file_manager.select(entry_idx);
+
+        let dispatch = handle_agent_attachment_picker_key(&mut state, key(KeyCode::Enter));
+
+        assert_eq!(dispatch, AttachmentPickerKeyDispatch::Consumed);
+        let request = state
+            .request_agent_attachment_delivery
+            .as_ref()
+            .expect("one typed delivery request");
+        assert_eq!(request.path, path);
+        assert_eq!(request.target.pane_id, pane_id);
+        assert_eq!(request.target.terminal_id, terminal_id);
+        assert_eq!(state.mode, Mode::AttachFile);
+        assert!(state.agent_attachment_picker.is_some());
+    }
+
+    #[test]
+    fn attachment_frame_click_revalidates_exact_target_before_opening_picker() {
+        let td = TempDir::new("attachment-frame-click");
+        let mut app = super::super::app_for_mouse_test();
+        let mut workspace = crate::workspace::Workspace::test_new("attachment-frame-click");
+        workspace.identity_cwd = td.root.clone();
+        let pane_id = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        let terminal_id = workspace.tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.ensure_test_terminals();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_agent_name("codex".into());
+        compute_view(&mut app.state, Rect::new(0, 0, 100, 24));
+        let action = app
+            .state
+            .view
+            .agent_attachment_action_area
+            .clone()
+            .expect("agent action");
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            action.rect.x + 1,
+            action.rect.y,
+        ));
+
+        assert_eq!(app.state.mode, Mode::AttachFile);
+        assert_eq!(
+            app.state
+                .agent_attachment_picker
+                .as_ref()
+                .and_then(|picker| picker.attachment_target())
+                .expect("an attachment purpose")
+                .terminal_id,
+            terminal_id
+        );
+    }
+
+    // TP-M2.1-INPUT: frame coordinates are presentation only; the exact
+    // workspace/pane/terminal and cached Git capability are revalidated.
+    #[test]
+    fn worktree_action_click_revalidates_exact_workspace_pane_and_terminal() {
+        let mut app = super::super::app_for_mouse_test();
+        let mut workspace = crate::workspace::Workspace::test_new("worktree-action-click");
+        workspace.cached_git_space = Some(crate::workspace::GitSpaceMetadata {
+            key: "repo".into(),
+            checkout_key: "/repo".into(),
+            repo_name: "repo".into(),
+            repo_root: "/repo".into(),
+            is_linked_worktree: false,
+        });
+        let pane_id = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        let terminal_id = workspace.tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.ensure_test_terminals();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_agent_name("codex".into());
+        compute_view(&mut app.state, Rect::new(0, 0, 100, 24));
+        let action = app
+            .state
+            .view
+            .agent_worktree_action_area
+            .clone()
+            .expect("worktree action");
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            action.rect.x + 1,
+            action.rect.y,
+        ));
+        assert_eq!(app.state.request_open_existing_worktree, Some(0));
+        assert!(app.state.request_new_linked_worktree.is_none());
+        assert!(app.state.request_remove_linked_worktree.is_none());
+
+        app.state.request_open_existing_worktree = None;
+        app.handle_mouse(mouse_with_modifiers(
+            MouseEventKind::Down(MouseButton::Left),
+            action.rect.x + 1,
+            action.rect.y,
+            KeyModifiers::CONTROL,
+        ));
+        assert!(app.state.request_open_existing_worktree.is_none());
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            action.rect.x.saturating_sub(1),
+            action.rect.y,
+        ));
+        assert!(app.state.request_open_existing_worktree.is_none());
+
+        let original_workspace_id = app.state.workspaces[0].id.clone();
+        app.state.workspaces[0].id = "replacement-workspace".into();
+        app.state.view.agent_worktree_action_area = Some(action.clone());
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            action.rect.x + 1,
+            action.rect.y,
+        ));
+        assert!(app.state.request_open_existing_worktree.is_none());
+
+        app.state.workspaces[0].id = original_workspace_id;
+        let root_pane = app.state.workspaces[0].tabs[0].root_pane;
+        app.state.workspaces[0].tabs[0].layout.focus_pane(root_pane);
+        app.state.view.agent_worktree_action_area = Some(action.clone());
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            action.rect.x + 1,
+            action.rect.y,
+        ));
+        assert!(app.state.request_open_existing_worktree.is_none());
+
+        app.state.workspaces[0].tabs[0].layout.focus_pane(pane_id);
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_agent_name(String::new());
+        app.state.view.agent_worktree_action_area = Some(action.clone());
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            action.rect.x + 1,
+            action.rect.y,
+        ));
+        assert!(app.state.request_open_existing_worktree.is_none());
+
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_agent_name("codex".into());
+        app.state.workspaces[0].cached_git_space = None;
+        app.state.view.agent_worktree_action_area = Some(action.clone());
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            action.rect.x + 1,
+            action.rect.y,
+        ));
+        assert!(app.state.request_open_existing_worktree.is_none());
+    }
+
+    // TP-M1.2-MOUSE: the blocking picker owns exact current-row hit targets;
+    // stale paths, modifiers, and coordinates outside those targets are inert.
+    #[test]
+    fn attachment_picker_mouse_selects_only_fresh_unmodified_current_row() {
+        let td = TempDir::new("attachment-picker-mouse");
+        let first = td.root.join("a.txt");
+        let second = td.root.join("b.txt");
+        td.file("a.txt");
+        td.file("b.txt");
+        let mut app = super::super::app_for_mouse_test();
+        let mut workspace = crate::workspace::Workspace::test_new("attachment-picker-mouse");
+        workspace.identity_cwd = td.root.clone();
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.ensure_test_terminals();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_agent_name("codex".into());
+        app.state.view.terminal_area = Rect::new(0, 0, 120, 30);
+        app.state.open_agent_attachment_picker().unwrap();
+        compute_view(&mut app.state, Rect::new(0, 0, 120, 30));
+
+        let second_row = app
+            .state
+            .view
+            .agent_attachment_picker_row_areas
+            .iter()
+            .find(|row| row.entry_path == second)
+            .cloned()
+            .expect("second picker row");
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            second_row.rect.x,
+            second_row.rect.y,
+        ));
+        assert_eq!(
+            app.state.agent_attachment_selected_file(),
+            Some(second.clone())
+        );
+
+        let first_idx = app
+            .state
+            .agent_attachment_picker
+            .as_ref()
+            .unwrap()
+            .file_manager
+            .entries
+            .iter()
+            .position(|entry| entry.path == first)
+            .unwrap();
+        app.state
+            .agent_attachment_picker
+            .as_mut()
+            .unwrap()
+            .file_manager
+            .select(first_idx);
+        let second_row_pos = app
+            .state
+            .view
+            .agent_attachment_picker_row_areas
+            .iter()
+            .position(|row| row.entry_idx == second_row.entry_idx)
+            .unwrap();
+        app.state.view.agent_attachment_picker_row_areas[second_row_pos].entry_path =
+            td.root.join("stale.txt");
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            second_row.rect.x,
+            second_row.rect.y,
+        ));
+        assert_eq!(
+            app.state.agent_attachment_selected_file(),
+            Some(first.clone())
+        );
+
+        app.state.view.agent_attachment_picker_row_areas[second_row_pos].entry_path =
+            second.clone();
+        let mut modified = mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            second_row.rect.x,
+            second_row.rect.y,
+        );
+        modified.modifiers = KeyModifiers::CONTROL;
+        app.handle_mouse(modified);
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0, 0));
+        assert_eq!(app.state.agent_attachment_selected_file(), Some(first));
+    }
+
+    fn app_with_fm(fm: FmState) -> AppState {
+        let mut app = AppState::test_new();
+        app.try_open_file_manager_with(|_| Some(fm))
+            .expect("Files activation");
+        app
+    }
+
+    // TP-FM-MORE-01: [more] opens the extensible menu at the pointer —
+    // installed plugins' File actions over the current target — and a row's
+    // Enter queues the SAME typed plugin intent the file context menu queues.
+    #[test]
+    fn the_more_menu_lists_plugin_actions_and_queues_their_intent() {
+        let td = TempDir::new("fm-more-menu");
+        td.file("00.txt");
+        let plugin_td = TempDir::new("fm-more-plugin-manifest");
+        let manifest = plugin_td.root.join("herdr-plugin.toml");
+        fs::write(
+            &manifest,
+            r#"
+id = "example.files"
+name = "Example Files"
+version = "0.1.0"
+min_herdr_version = "0.6.10"
+
+[[actions]]
+id = "inspect"
+title = "Inspect file"
+contexts = ["file"]
+command = ["inspect"]
+"#,
+        )
+        .expect("write plugin manifest");
+        let plugin =
+            crate::app::api::plugins::load_plugin_manifest(&manifest.display().to_string(), true)
+                .expect("valid plugin manifest");
+
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        app.state
+            .installed_plugins
+            .insert(plugin.plugin_id.clone(), plugin);
+        let target = td.root.join("00.txt");
+        {
+            let file_manager = app.state.file_manager.as_mut().expect("open FM");
+            let idx = file_manager
+                .entries
+                .iter()
+                .position(|entry| entry.path == target)
+                .expect("fixture entry");
+            file_manager.cursor = idx;
+        }
+
+        // Selection wins over the cursor when one exists…
+        {
+            let file_manager = app.state.file_manager.as_mut().expect("open FM");
+            let idx = file_manager
+                .entries
+                .iter()
+                .position(|entry| entry.path == target)
+                .expect("fixture entry");
+            assert!(file_manager.replace_selection(idx));
+        }
+        app.open_fm_more_menu(5, 5);
+        {
+            let menu = app.state.context_menu.as_ref().expect("the more menu");
+            let ContextMenuKind::FmMore { paths, .. } = &menu.kind else {
+                panic!("expected the more menu")
+            };
+            assert_eq!(paths, &vec![target.clone()], "the selection is the target");
+        }
+        app.state.context_menu = None;
+        app.state.mode = Mode::Terminal;
+        app.state
+            .file_manager
+            .as_mut()
+            .expect("open FM")
+            .clear_multi_selection();
+
+        // …and the cursor entry serves when nothing is selected.
+        app.open_fm_more_menu(5, 5);
+        let menu = app.state.context_menu.as_ref().expect("the more menu");
+        assert_eq!(menu.items(), vec!["Inspect file"]);
+        let ContextMenuKind::FmMore { paths, .. } = &menu.kind else {
+            panic!("expected the more menu")
+        };
+        assert_eq!(paths, &vec![target.clone()]);
+
+        app.route_client_input(b"\r".to_vec());
+        let intent = app
+            .state
+            .request_file_manager_context_action
+            .as_ref()
+            .expect("the plugin intent was queued");
+        assert_eq!(
+            intent.action,
+            FileManagerContextMenuAction::Plugin {
+                plugin_id: "example.files".into(),
+                action_id: "inspect".into(),
+            }
+        );
+        assert_eq!(intent.paths, vec![target]);
+        assert!(app.state.context_menu.is_none(), "the menu closed");
+    }
+
+    // TP-FM-MORE-01: the verb itself is mouse-road — a left press on the
+    // header's [more] rect opens the menu right there.
+    #[test]
+    fn clicking_the_more_verb_opens_the_menu_at_the_pointer() {
+        let td = TempDir::new("fm-more-click");
+        td.file("00.txt");
+        let mut app = super::super::app_for_mouse_test();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("left")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state
+            .try_open_file_manager_with(|_| Some(FmState::new(&td.root)))
+            .expect("Files activation");
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        compute_view(&mut app.state, Rect::new(0, 0, 140, 30));
+
+        let more = app
+            .state
+            .view
+            .file_manager_header_action_areas
+            .iter()
+            .find(|area| area.action == crate::app::state::FileManagerHeaderAction::More)
+            .expect("the [more] verb is projected")
+            .rect;
+        let dispatch = app.handle_file_manager_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            more.x,
+            more.y,
+        ));
+        assert_eq!(dispatch, FileManagerMouseDispatch::Consumed);
+        let menu = app
+            .state
+            .context_menu
+            .as_ref()
+            .expect("the more menu opened");
+        assert!(matches!(menu.kind, ContextMenuKind::FmMore { .. }));
+        assert_eq!(
+            (menu.x, menu.y),
+            (more.x, more.y),
+            "anchored at the pointer"
+        );
+    }
+
+    // TP-FM-MORE-01: an empty install answers with one honest inert row —
+    // Enter on it queues nothing and just closes the menu.
+    #[test]
+    fn an_empty_more_menu_is_honest_and_inert() {
+        let td = TempDir::new("fm-more-empty");
+        td.file("00.txt");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+
+        app.open_fm_more_menu(5, 5);
+        let menu = app.state.context_menu.as_ref().expect("the more menu");
+        assert_eq!(menu.items(), vec!["(no actions installed)"]);
+
+        app.route_client_input(b"\r".to_vec());
+        assert!(
+            app.state.request_file_manager_context_action.is_none(),
+            "the inert row queues nothing"
+        );
+        assert!(app.state.context_menu.is_none(), "the menu closed");
+    }
+
+    // TP-FM-OPENHERE-01: the queued "open agent here" intent lands as a
+    // ProjectChatTabRequest rooted at the clicked directory — the side
+    // panel's daily-chat road, aimed by right-click.
+    #[test]
+    fn open_agent_here_roots_a_project_chat_at_the_directory() {
+        let td = TempDir::new("open-agent-here");
+        td.dir("workdir");
+        let mut app = super::super::app_for_mouse_test();
+        app.state
+            .try_open_file_manager_with(|_| Some(FmState::new(&td.root)))
+            .expect("Files activation");
+        let target = td.root.join("workdir");
+        app.state.request_file_manager_context_action =
+            Some(crate::app::state::FileManagerContextActionIntent {
+                action: FileManagerContextMenuAction::OpenAgentHere,
+                paths: vec![target.clone()],
+            });
+
+        assert!(app.sync_file_manager_requests());
+        assert!(
+            app.state.request_file_manager_context_action.is_none(),
+            "the intent was consumed"
+        );
+        let request = app
+            .state
+            .request_project_chat_tab
+            .as_ref()
+            .expect("a project chat was requested");
+        assert_eq!(request.project_path, target);
+        assert_eq!(request.session_id, None);
+    }
+
+    // The reported doubt (S36): "rows only answer on the timestamp side".
+    // Pinned the other way round: on the full stage a click on the NAME half
+    // of a projected trail row moves the cursor there — the row's hit rect is
+    // the whole row, not its right edge.
+    #[test]
+    fn a_full_stage_click_on_the_name_half_moves_the_cursor() {
+        let td = TempDir::new("name-half-click");
+        td.file("00.txt");
+        td.file("01.txt");
+        td.file("02.txt");
+        let mut app = super::super::app_for_mouse_test();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("left")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state
+            .try_open_file_manager_with(|_| Some(FmState::new(&td.root)))
+            .expect("Files activation");
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        compute_view(&mut app.state, Rect::new(0, 0, 120, 30));
+
+        let cursor_before = app.state.file_manager.as_ref().expect("open FM").cursor;
+        let target = app
+            .state
+            .view
+            .file_manager_trail
+            .columns
+            .iter()
+            .flat_map(|column| column.rows.iter())
+            .find(|row| row.entry_index != cursor_before && row.name_rect.width > 0)
+            .expect("a projected row away from the cursor")
+            .clone();
+
+        let dispatch = app.handle_file_manager_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            target.name_rect.x,
+            target.name_rect.y,
+        ));
+        assert_eq!(
+            dispatch,
+            FileManagerMouseDispatch::Consumed,
+            "the name half receives the click"
+        );
+        let file_manager = app.state.file_manager.as_ref().expect("Files stays open");
+        assert_eq!(
+            file_manager.entries[file_manager.cursor].path, target.entry_path,
+            "the click on the name moved the cursor to that row"
+        );
+    }
+
+    // TP-FM-SEND-01: clicking the header's [send] queues the SAME context
+    // intent the right-click menu queues, and the sync road opens the
+    // Taildrop picker carrying exactly those paths.
+    #[test]
+    fn the_zip_header_verb_rides_the_context_road_to_the_compress_intent() {
+        let td = TempDir::new("zip-header-road");
+        td.file("beta.txt");
+        let mut app = super::super::app_for_mouse_test();
+        app.state
+            .try_open_file_manager_with(|_| Some(FmState::new(&td.root)))
+            .expect("Files activation");
+        let beta = td.root.join("beta.txt");
+        {
+            let file_manager = app.state.file_manager.as_mut().expect("open FM");
+            let idx = file_manager
+                .entries
+                .iter()
+                .position(|entry| entry.path == beta)
+                .expect("beta entry");
+            file_manager.cursor = idx;
+        }
+
+        assert!(app.dispatch_file_manager_header_action(
+            crate::app::state::FileManagerHeaderAction::Compress
+        ));
+        let intent = app
+            .state
+            .request_file_manager_context_action
+            .as_ref()
+            .expect("the compress intent was queued");
+        assert_eq!(intent.action, FileManagerContextMenuAction::Compress);
+        assert_eq!(intent.paths, vec![beta.clone()]);
+    }
+
+    #[test]
+    fn the_send_header_verb_rides_the_context_road_to_the_picker() {
+        let td = TempDir::new("send-header-road");
+        td.file("beta.txt");
+        let mut app = super::super::app_for_mouse_test();
+        app.state
+            .try_open_file_manager_with(|_| Some(FmState::new(&td.root)))
+            .expect("Files activation");
+        let beta = td.root.join("beta.txt");
+        {
+            let file_manager = app.state.file_manager.as_mut().expect("open FM");
+            let idx = file_manager
+                .entries
+                .iter()
+                .position(|entry| entry.path == beta)
+                .expect("beta entry");
+            file_manager.cursor = idx;
+        }
+
+        assert!(app.dispatch_file_manager_header_action(
+            crate::app::state::FileManagerHeaderAction::SendTailscale
+        ));
+        let intent = app
+            .state
+            .request_file_manager_context_action
+            .as_ref()
+            .expect("the send intent was queued");
+        assert_eq!(intent.action, FileManagerContextMenuAction::SendTailscale);
+        assert_eq!(intent.paths, vec![beta.clone()]);
+
+        assert!(app.sync_file_manager_requests());
+        let send = app
+            .state
+            .tailscale_send
+            .as_ref()
+            .expect("the Taildrop picker opened");
+        assert_eq!(send.paths, vec![beta]);
+        assert_eq!(app.state.mode, Mode::TailscaleSend);
+    }
+
+    // TP-SBS-FILES-01: riding the right half is a way of being on screen, so
+    // a left click on a Files row inside the right rectangle moves the Files
+    // cursor exactly as it does on the full-stage surface. The center gate
+    // has to follow the projected right surface — the shrunken terminal half
+    // no longer contains any Files geometry.
+    // TP-SBS-FOCUS-01: mouse-first focus — the half you click is the half
+    // you type into. A press in the Files half hands the keyboard to Files
+    // (the router resolves FocusedComponent and a j actually moves the
+    // cursor); a press back in the terminal half returns it, and the very
+    // same key goes back to being none of Files' business.
+    #[test]
+    fn clicking_a_half_moves_the_keyboard_with_it() {
+        let td = TempDir::new("fm-beside-key-focus");
+        td.file("00.txt");
+        td.file("01.txt");
+        td.file("02.txt");
+        let mut app = super::super::app_for_mouse_test();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("left")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state
+            .try_open_file_manager_with(|_| Some(FmState::new(&td.root)))
+            .expect("Files activation");
+        app.state.show_terminal_workspace();
+        app.state.enter_files_beside();
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        compute_view(&mut app.state, Rect::new(0, 0, 120, 30));
+
+        // Entering the split must not steal the keyboard from the terminal.
+        assert_eq!(
+            app.state.side_by_side.expect("split").focus,
+            crate::app::state::SideBySideFocus::Left
+        );
+        assert!(
+            !matches!(
+                app.state.shell_key_input_owner(),
+                crate::app::input::shell::ShellInputOwner::FocusedComponent
+            ),
+            "the terminal half keeps the keys until Files is clicked"
+        );
+
+        let target = app
+            .state
+            .view
+            .file_manager_row_areas
+            .first()
+            .expect("a projected Files row")
+            .clone();
+        app.handle_mouse(mouse(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            target.rect.x + 1,
+            target.rect.y,
+        ));
+        assert_eq!(
+            app.state.side_by_side.expect("split").focus,
+            crate::app::state::SideBySideFocus::Right,
+            "a press in the Files half claims the keyboard"
+        );
+        assert!(
+            matches!(
+                app.state.shell_key_input_owner(),
+                crate::app::input::shell::ShellInputOwner::FocusedComponent
+            ),
+            "the router hands keys to the focused Files half"
+        );
+
+        // And the keys actually work: the product byte road delivers a
+        // Down arrow and the Files cursor moves.
+        let before = app.state.file_manager.as_ref().expect("open FM").cursor;
+        app.route_client_input(b"\x1b[B".to_vec());
+        let after = app.state.file_manager.as_ref().expect("open FM").cursor;
+        assert_ne!(
+            before,
+            after,
+            "Down moves the Files cursor while focused (mode={:?} rail_focus={:?} owner={:?})",
+            app.state.mode,
+            app.state.file_manager_locations.focus,
+            app.state.shell_key_input_owner()
+        );
+
+        // Clicking back into the terminal half returns the keyboard.
+        let terminal = app.state.view.terminal_area;
+        app.handle_mouse(mouse(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            terminal.x + 2,
+            terminal.y + 2,
+        ));
+        assert_eq!(
+            app.state.side_by_side.expect("split").focus,
+            crate::app::state::SideBySideFocus::Left,
+            "a press in the terminal half takes the keyboard back"
+        );
+        assert!(!matches!(
+            app.state.shell_key_input_owner(),
+            crate::app::input::shell::ShellInputOwner::FocusedComponent
+        ));
+    }
+
+    #[test]
+    fn a_click_in_the_right_half_moves_the_files_cursor() {
+        let td = TempDir::new("fm3-beside-click");
+        td.file("00.txt");
+        td.file("01.txt");
+        td.file("02.txt");
+        let mut app = super::super::app_for_mouse_test();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("left")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state
+            .try_open_file_manager_with(|_| Some(FmState::new(&td.root)))
+            .expect("Files activation");
+        app.state.show_terminal_workspace();
+        app.state.enter_files_beside();
+        assert!(app.state.files_beside_active());
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        compute_view(&mut app.state, Rect::new(0, 0, 120, 30));
+
+        let right = app
+            .state
+            .view
+            .right_surface
+            .as_ref()
+            .expect("the right surface was computed")
+            .area;
+        let cursor_before = app.state.file_manager.as_ref().expect("open FM").cursor;
+        let target = app
+            .state
+            .view
+            .file_manager_row_areas
+            .iter()
+            .find(|row| row.entry_idx != cursor_before)
+            .expect("a projected row away from the cursor")
+            .clone();
+        assert!(
+            target.rect.x >= right.x,
+            "precondition: the clicked row lives in the right half ({:?} vs x={})",
+            target.rect,
+            right.x
+        );
+
+        let dispatch = app.handle_file_manager_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            target.rect.x,
+            target.rect.y,
+        ));
+        assert_eq!(
+            dispatch,
+            FileManagerMouseDispatch::Consumed,
+            "the right half receives the click instead of dropping it"
+        );
+        let file_manager = app.state.file_manager.as_ref().expect("Files stays open");
+        assert_eq!(
+            file_manager.cursor, target.entry_idx,
+            "the click moved the cursor to the clicked row"
+        );
+        assert_eq!(
+            file_manager.entries[file_manager.cursor].path,
+            target.entry_path
+        );
+    }
+
+    #[test]
+    fn miller_divider_down_starts_typed_capture() {
+        let td = TempDir::new("fm3-typed-divider-capture");
+        td.file("00.txt");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        install_focused_agent(&mut app);
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        compute_view(&mut app.state, Rect::new(0, 0, 86, 16));
+
+        let divider = app
+            .state
+            .view
+            .file_manager_miller
+            .dividers
+            .first()
+            .expect("current Files projection exposes a divider")
+            .rect;
+        let before_model = {
+            let file_manager = app.state.file_manager.as_ref().expect("open FM");
+            file_manager.miller.clone()
+        };
+
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                divider.x,
+                divider.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+        let after_model = {
+            let file_manager = app.state.file_manager.as_ref().expect("open FM");
+            file_manager.miller.clone()
+        };
+        assert_eq!(
+            after_model, before_model,
+            "divider down captures input without committing a model width"
+        );
+        assert!(
+            app.state.shell_interaction.resize_active(),
+            "Miller divider down starts the one shared typed resize transaction"
+        );
+    }
+
+    // TP-FMN-NAV-06: an explicit resize commit may change column widths, but
+    // the resize compatibility projection and the rendered Trail must keep
+    // following the same active owner. A resident child preview cannot shift
+    // a divider underneath a live row/header owned by the root column.
+    #[test]
+    fn miller_resize_projection_tracks_active_owner_after_commit() {
+        let td = TempDir::new("fm3-divider-restart-after-commit");
+        td.dir("alpha");
+        td.file("root.txt");
+        td.set_equal_modified(&["alpha", "root.txt"]);
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        install_focused_agent(&mut app);
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        let frame = Rect::new(0, 0, 90, 16);
+
+        compute_view(&mut app.state, frame);
+        let first = app
+            .state
+            .view
+            .file_manager_miller
+            .dividers
+            .first()
+            .expect("resident preview exposes a divider")
+            .rect;
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                first.x,
+                first.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                first.x.saturating_add(4),
+                first.y.saturating_add(1),
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                first.x.saturating_add(4),
+                first.y.saturating_add(1),
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+        let committed_revision = {
+            let file_manager = app.state.file_manager.as_mut().expect("Files remains open");
+            assert_eq!(file_manager.trail.active_col(), 0);
+            assert_eq!(file_manager.trail.deepest(), 1);
+            assert!(file_manager.miller.commit_column_width(0, 64));
+            file_manager.miller.horizontal.follow_active = true;
+            file_manager.miller.revision
+        };
+
+        compute_view(&mut app.state, frame);
+        assert_eq!(
+            app.state.view.file_manager_miller.focused_chain_index,
+            Some(0)
+        );
+        assert_eq!(
+            app.state.view.file_manager_miller.horizontal_offset_cells,
+            app.state.view.file_manager_trail.offset_cells,
+            "resize hit geometry and rendered Trail share active-owner auto-follow"
+        );
+        assert!(
+            app.state.view.file_manager_miller.dividers.is_empty(),
+            "the off-screen resident preview cannot publish a divider inside the active root"
+        );
+        assert_eq!(
+            app.state
+                .file_manager
+                .as_ref()
+                .expect("Files remains open")
+                .miller
+                .revision,
+            committed_revision,
+            "pure recompute cannot commit another resize"
+        );
+    }
+
+    #[test]
+    fn miller_resize_profile_counts_transaction_changes_and_commit() {
+        let td = TempDir::new("fm3-resize-profile");
+        td.dir("child");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        install_focused_agent(&mut app);
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        compute_view(&mut app.state, Rect::new(0, 0, 90, 16));
+
+        let divider = app
+            .state
+            .view
+            .file_manager_miller
+            .dividers
+            .first()
+            .expect("three-column projection exposes a divider")
+            .clone();
+        let revision_before = app
+            .state
+            .file_manager
+            .as_ref()
+            .expect("open FM")
+            .miller
+            .revision;
+
+        let (_, profile) = crate::render_prof::observe_for_test(|| {
+            assert_eq!(
+                app.handle_file_manager_mouse(mouse(
+                    MouseEventKind::Down(MouseButton::Left),
+                    divider.rect.x,
+                    divider.rect.y,
+                )),
+                FileManagerMouseDispatch::Consumed
+            );
+            for _ in 0..2 {
+                assert_eq!(
+                    app.handle_file_manager_mouse(mouse(
+                        MouseEventKind::Drag(MouseButton::Left),
+                        divider.rect.x.saturating_add(4),
+                        divider.rect.y,
+                    )),
+                    FileManagerMouseDispatch::Consumed
+                );
+            }
+            assert_eq!(
+                app.handle_file_manager_mouse(mouse(
+                    MouseEventKind::Up(MouseButton::Left),
+                    divider.rect.x.saturating_add(4),
+                    divider.rect.y,
+                )),
+                FileManagerMouseDispatch::Consumed
+            );
+        });
+
+        assert_eq!(profile.counter("fm.miller_resize.started"), 1);
+        assert_eq!(
+            profile.counter("fm.miller_resize.preview_changed"),
+            1,
+            "repeating the same pointer position is a no-op, not a second preview change"
+        );
+        assert_eq!(profile.counter("fm.miller_resize.committed"), 1);
+        assert_eq!(
+            profile.counter("shell.persistence_write"),
+            0,
+            "Miller resize is client-local and cannot request persistence"
+        );
+        assert_eq!(
+            profile.counter("shell.pty_resize_request"),
+            0,
+            "Miller resize cannot resize hidden terminal runtimes"
+        );
+        assert!(
+            !app.state.shell_interaction.miller_resize_active(),
+            "commit retires capture authority"
+        );
+        assert_eq!(
+            app.state
+                .file_manager
+                .as_ref()
+                .expect("Files remains open")
+                .miller
+                .revision,
+            revision_before + 1,
+            "the profiled gesture performs exactly one model write-back"
+        );
+    }
+
+    #[test]
+    fn miller_resize_profile_covers_keyboard_preview_and_commit() {
+        let td = TempDir::new("fm3-keyboard-resize-profile");
+        td.dir("child");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        install_focused_agent(&mut app);
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        compute_view(&mut app.state, Rect::new(0, 0, 90, 16));
+
+        let divider = app
+            .state
+            .view
+            .file_manager_miller
+            .dividers
+            .first()
+            .expect("three-column projection exposes a divider")
+            .clone();
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                divider.rect.x,
+                divider.rect.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+
+        let (_, profile) =
+            crate::render_prof::observe_for_test(|| {
+                assert!(app
+                    .handle_miller_resize_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE,)));
+                assert!(app
+                    .handle_miller_resize_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE,)));
+            });
+
+        assert_eq!(profile.counter("fm.miller_resize.preview_changed"), 1);
+        assert_eq!(profile.counter("fm.miller_resize.committed"), 1);
+        assert!(
+            !app.state.shell_interaction.miller_resize_active(),
+            "keyboard commit retires capture authority"
+        );
+    }
+
+    #[test]
+    fn miller_drag_preview_changes_geometry_not_model_preferences() {
+        let td = TempDir::new("fm3-divider-preview");
+        td.file("00.txt");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        install_focused_agent(&mut app);
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        let frame = Rect::new(0, 0, 86, 16);
+        compute_view(&mut app.state, frame);
+
+        let divider = app
+            .state
+            .view
+            .file_manager_miller
+            .dividers
+            .first()
+            .expect("current Files projection exposes a divider")
+            .clone();
+        let original_tracks = [
+            app.state.view.file_manager_miller.columns[divider.left_column]
+                .rect
+                .width,
+            app.state.view.file_manager_miller.columns[divider.right_column]
+                .rect
+                .width,
+        ];
+        let before_model = {
+            let file_manager = app.state.file_manager.as_ref().expect("open FM");
+            (
+                file_manager.miller.revision,
+                file_manager
+                    .miller
+                    .chain
+                    .iter()
+                    .map(|segment| segment.preferred_width)
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        app.handle_file_manager_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            divider.rect.x,
+            divider.rect.y,
+        ));
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                divider.rect.x + 4,
+                divider.rect.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+        assert_eq!(
+            app.state.shell_interaction.resize_preview_tracks(),
+            Some([original_tracks[0] + 4, original_tracks[1] - 4]),
+            "drag changes only the transient adjacent track pair"
+        );
+
+        compute_view(&mut app.state, frame);
+        let preview_tracks = [
+            app.state.view.file_manager_miller.columns[divider.left_column]
+                .rect
+                .width,
+            app.state.view.file_manager_miller.columns[divider.right_column]
+                .rect
+                .width,
+        ];
+        assert_eq!(
+            preview_tracks,
+            [original_tracks[0] + 4, original_tracks[1] - 4],
+            "fresh projection consumes the transient resize preview"
+        );
+        let after_model = {
+            let file_manager = app.state.file_manager.as_ref().expect("open FM");
+            (
+                file_manager.miller.revision,
+                file_manager
+                    .miller
+                    .chain
+                    .iter()
+                    .map(|segment| segment.preferred_width)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(
+            after_model, before_model,
+            "preview cannot commit a width or advance the Miller model"
+        );
+    }
+
+    #[test]
+    fn files_close_cancels_typed_miller_resize_capture() {
+        let td = TempDir::new("fm3-divider-close-cancel");
+        td.file("00.txt");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        install_focused_agent(&mut app);
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        compute_view(&mut app.state, Rect::new(0, 0, 86, 16));
+
+        let divider = app
+            .state
+            .view
+            .file_manager_miller
+            .dividers
+            .first()
+            .expect("current Files projection exposes a divider")
+            .rect;
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                divider.x,
+                divider.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                divider.x + 4,
+                divider.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+        assert!(
+            app.state.shell_interaction.miller_resize_active(),
+            "precondition: Files owns a typed Miller capture"
+        );
+
+        app.state.close_file_manager();
+
+        assert!(
+            !app.state.shell_interaction.resize_active(),
+            "closing Files must retire its transient resize authority"
+        );
+        assert!(
+            app.state.file_manager.is_none(),
+            "the closed Files model cannot receive a later commit"
+        );
+        assert!(
+            app.state.view.file_manager_miller.dividers.is_empty(),
+            "closing Files retires the divider hit generation atomically"
+        );
+    }
+
+    #[test]
+    fn miller_mouse_up_commits_once() {
+        let td = TempDir::new("fm3-divider-commit");
+        td.file("00.txt");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        install_focused_agent(&mut app);
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        let frame = Rect::new(0, 0, 86, 16);
+        compute_view(&mut app.state, frame);
+
+        let divider = app
+            .state
+            .view
+            .file_manager_miller
+            .dividers
+            .first()
+            .expect("current Files projection exposes a divider")
+            .clone();
+        let leading_chain_index = app.state.view.file_manager_miller.columns[divider.left_column]
+            .kind
+            .chain_index()
+            .expect("leading projected column belongs to the Miller chain");
+        let original_tracks = [
+            app.state.view.file_manager_miller.columns[divider.left_column]
+                .rect
+                .width,
+            app.state.view.file_manager_miller.columns[divider.right_column]
+                .rect
+                .width,
+        ];
+        let (before_revision, before_widths) = {
+            let file_manager = app.state.file_manager.as_ref().expect("open FM");
+            (
+                file_manager.miller.revision,
+                file_manager
+                    .miller
+                    .chain
+                    .iter()
+                    .map(|segment| segment.preferred_width)
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                divider.rect.x,
+                divider.rect.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+        for delta in [2, 4, 6] {
+            assert_eq!(
+                app.handle_file_manager_mouse(mouse(
+                    MouseEventKind::Drag(MouseButton::Left),
+                    divider.rect.x + delta,
+                    divider.rect.y,
+                )),
+                FileManagerMouseDispatch::Consumed
+            );
+        }
+        let expected_tracks = [original_tracks[0] + 6, original_tracks[1] - 6];
+        assert_eq!(
+            app.state.shell_interaction.resize_preview_tracks(),
+            Some(expected_tracks),
+            "the final preview, not an intermediate move, is the commit candidate"
+        );
+
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                divider.rect.x + 6,
+                divider.rect.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+        assert!(
+            !app.state.shell_interaction.miller_resize_active(),
+            "mouse-up must retire the typed Miller capture"
+        );
+
+        let (after_revision, after_widths) = {
+            let file_manager = app.state.file_manager.as_ref().expect("open FM");
+            (
+                file_manager.miller.revision,
+                file_manager
+                    .miller
+                    .chain
+                    .iter()
+                    .map(|segment| segment.preferred_width)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let mut expected_widths = before_widths;
+        expected_widths[leading_chain_index] = expected_tracks[0];
+        assert_eq!(
+            (after_revision, after_widths),
+            (before_revision + 1, expected_widths),
+            "mouse-up commits only the leading Miller preference and one revision"
+        );
+
+        let _ = app.handle_file_manager_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            divider.rect.x + 6,
+            divider.rect.y,
+        ));
+        assert_eq!(
+            app.state
+                .file_manager
+                .as_ref()
+                .expect("open FM")
+                .miller
+                .revision,
+            after_revision,
+            "a repeated mouse-up cannot duplicate the commit"
+        );
+    }
+
+    #[test]
+    fn miller_resize_1000_moves_has_bounded_side_effects() {
+        let td = TempDir::new("fm3-divider-bounded-effects");
+        let image_path = td.root.join("00.png");
+        image::RgbaImage::from_pixel(160, 80, image::Rgba([0x2a, 0x6f, 0xb0, 0xff]))
+            .save(&image_path)
+            .expect("write PNG fixture");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        install_focused_agent(&mut app);
+        app.image_preview_cell_size = HostCellSize {
+            width_px: 8,
+            height_px: 16,
+        };
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        let frame = Rect::new(0, 0, 90, 16);
+        compute_view(&mut app.state, frame);
+
+        assert!(
+            app.sync_image_preview_worker(),
+            "precondition: pending image preview starts one worker target"
+        );
+        wait_for_image_preview_ready(&mut app);
+        assert!(
+            !app.sync_image_preview_worker(),
+            "precondition: the ready image target is stable"
+        );
+        assert!(
+            !app.sync_file_preview_worker(),
+            "an image selection owns no text-highlight request"
+        );
+
+        let now = Instant::now();
+        assert!(
+            !app.sync_file_manager_watcher_at(now),
+            "binding an unchanged watcher must not refresh Files"
+        );
+        let watcher_before = app
+            .file_manager_watcher_reconcile_snapshot_for_test(&td.root)
+            .expect("current Files cwd has one watcher generation");
+        let image_worker_generation_before = app.image_preview_worker_generation_for_test();
+        let text_worker_generation_before = app.file_preview_worker_generation_for_test();
+        let model_before = app
+            .state
+            .file_manager
+            .as_ref()
+            .expect("open FM")
+            .miller
+            .clone();
+        let dirty_before = app.state.session_dirty;
+        assert!(
+            !dirty_before,
+            "fixture starts without a persistence request"
+        );
+
+        let divider = app
+            .state
+            .view
+            .file_manager_miller
+            .dividers
+            .last()
+            .expect("Trail image detail exposes its resize divider")
+            .clone();
+        assert!(
+            app.state.view.file_manager_miller.columns[divider.left_column]
+                .kind
+                .is_current()
+        );
+        assert!(
+            app.state.view.file_manager_miller.columns[divider.right_column]
+                .kind
+                .is_preview()
+        );
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                divider.rect.x,
+                divider.rect.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+
+        for step in 0..1_000 {
+            let drag_x = match step % 4 {
+                0 => divider.rect.x.saturating_add(4),
+                1 => u16::MAX,
+                2 => 0,
+                _ => divider.rect.x.saturating_add(8),
+            };
+            let drag_y = if step % 2 == 0 {
+                divider.rect.y
+            } else {
+                u16::MAX
+            };
+            assert_eq!(
+                app.handle_file_manager_mouse(mouse(
+                    MouseEventKind::Drag(MouseButton::Left),
+                    drag_x,
+                    drag_y,
+                )),
+                FileManagerMouseDispatch::Consumed,
+                "active capture owns bounded and out-of-area move {step}"
+            );
+            compute_view(&mut app.state, frame);
+            assert!(
+                !app.sync_file_manager_watcher_at(now),
+                "preview move {step} cannot reconcile or reload Files"
+            );
+            assert!(
+                !app.sync_file_preview_worker(),
+                "preview move {step} cannot submit text-highlight work"
+            );
+            assert!(
+                !app.sync_image_preview_worker(),
+                "preview move {step} cannot submit or replace image work"
+            );
+            assert_eq!(
+                app.image_preview_worker_generation_for_test(),
+                image_worker_generation_before,
+                "preview move {step} keeps the image target generation stable"
+            );
+            assert_eq!(
+                app.file_preview_worker_generation_for_test(),
+                text_worker_generation_before,
+                "preview move {step} keeps the text target generation stable"
+            );
+            assert_eq!(
+                app.state.file_manager.as_ref().expect("open FM").miller,
+                model_before,
+                "preview move {step} cannot mutate the Miller model"
+            );
+            assert_eq!(
+                app.state.session_dirty, dirty_before,
+                "preview move {step} cannot request persistence"
+            );
+            app.state
+                .file_manager
+                .as_ref()
+                .expect("open FM")
+                .miller
+                .assert_miller_invariants_for_test();
+        }
+
+        assert_eq!(
+            app.file_manager_watcher_reconcile_snapshot_for_test(&td.root),
+            Some(watcher_before),
+            "1,000 preview moves cannot rebind or reconcile the watcher"
+        );
+        let committed_x = divider.rect.x.saturating_add(8);
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                committed_x,
+                u16::MAX,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+        assert!(
+            !app.state.shell_interaction.miller_resize_active(),
+            "mouse-up retires the capture"
+        );
+        assert_eq!(
+            app.state
+                .file_manager
+                .as_ref()
+                .expect("open FM")
+                .miller
+                .revision,
+            model_before.revision + 1,
+            "mouse-up commits exactly one Miller revision"
+        );
+        assert_eq!(
+            app.state.session_dirty, dirty_before,
+            "client-local Miller width is not persisted"
+        );
+
+        assert!(
+            !app.sync_image_preview_worker(),
+            "the stale transient snapshot cannot start post-release image work"
+        );
+        assert_eq!(
+            app.image_preview_worker_generation_for_test(),
+            image_worker_generation_before,
+            "post-release worker refresh waits for committed geometry"
+        );
+
+        compute_view(&mut app.state, frame);
+        assert!(
+            app.sync_image_preview_worker(),
+            "committed Trail detail geometry starts exactly one resized image target"
+        );
+        assert_eq!(
+            app.image_preview_worker_generation_for_test(),
+            image_worker_generation_before + 1,
+            "the committed geometry advances the image worker once"
+        );
+        wait_for_image_preview_ready(&mut app);
+        assert!(
+            !app.sync_image_preview_worker(),
+            "the resized Trail detail image target stabilizes after delivery"
+        );
+        assert_eq!(
+            app.file_preview_worker_generation_for_test(),
+            text_worker_generation_before
+        );
+        assert!(
+            !app.sync_file_manager_watcher_at(now),
+            "commit cannot trigger a filesystem refresh"
+        );
+        assert_eq!(
+            app.file_manager_watcher_reconcile_snapshot_for_test(&td.root),
+            Some(watcher_before),
+            "commit cannot rebind or reconcile the watcher"
+        );
+        app.state
+            .file_manager
+            .as_ref()
+            .expect("open FM")
+            .miller
+            .assert_miller_invariants_for_test();
+    }
+
+    #[test]
+    fn ten_thousand_miller_actions_preserve_all_invariants() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        const SEED: u64 = 0x5eed_cafe_f00d_2026;
+        const ACTION_COUNT: usize = 14;
+        const ADAPTER_SAMPLE_QUOTA: usize = 16;
+
+        let td = TempDir::new("miller-ten-thousand-actions");
+        let root = td.root.join("workspace");
+        fs::create_dir_all(&root).expect("create isolated stress workspace");
+        for directory in ["alpha", "bravo", "charlie"] {
+            fs::create_dir_all(root.join(directory)).expect("create branch fixture");
+        }
+        fs::write(root.join("root.txt"), b"x").expect("write root preview fixture");
+
+        let mut app = runtime_app_with_fm(FmState::new(&root));
+        install_focused_agent(&mut app);
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        let mut pressure_current = root.join("pressure-root");
+        let mut pressure_miller = crate::fm::miller::MillerState::seed(pressure_current.clone());
+        let mut random = SEED;
+        let mut action_counts = [0usize; ACTION_COUNT];
+        let mut adapter_sample_counts = [0usize; ACTION_COUNT];
+        let frames = [
+            Rect::ZERO,
+            Rect::new(0, 0, 1, 1),
+            Rect::new(0, 0, 40, 8),
+            Rect::new(0, 0, 90, 16),
+            Rect::new(0, 0, 180, 32),
+        ];
+
+        for step in 0..10_000usize {
+            random = random
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let action_index = ((random >> 32) as usize) % ACTION_COUNT;
+            action_counts[action_index] += 1;
+            let action = match action_index {
+                0 => "select",
+                1 => "enter-or-leave",
+                2 => "sibling-branch",
+                3 => "horizontal-scroll",
+                4 => "divider-preview-commit",
+                5 => "divider-preview-cancel",
+                6 => "terminal-resize",
+                7 => "watcher-create-delete-rename",
+                8 => "overlay-open-close",
+                9 => "files-close-reopen",
+                10 => "stale-worker-target-churn",
+                11 => "stale-row-after-revision",
+                12 => "viewport-branch-clamp",
+                13 => "cache-pressure-eviction",
+                _ => unreachable!("action index is modulo ACTION_COUNT"),
+            };
+            let before = app
+                .state
+                .file_manager
+                .as_ref()
+                .map(|file_manager| {
+                    format!(
+                        "open cwd={:?} chain={} offset={} revision={} mode={:?} resize={}",
+                        file_manager.cwd,
+                        file_manager.miller.chain.len(),
+                        file_manager.miller.horizontal.offset_cells,
+                        file_manager.miller.revision,
+                        app.state.mode,
+                        app.state.shell_interaction.miller_resize_active(),
+                    )
+                })
+                .unwrap_or_else(|| {
+                    format!(
+                        "closed mode={:?} resize={}",
+                        app.state.mode,
+                        app.state.shell_interaction.miller_resize_active()
+                    )
+                });
+
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                let frame = frames[((random >> 8) as usize) % frames.len()];
+                let sample_cross_layer_route = matches!(action_index, 3..=11)
+                    && adapter_sample_counts[action_index] < ADAPTER_SAMPLE_QUOTA;
+                if sample_cross_layer_route {
+                    adapter_sample_counts[action_index] += 1;
+                }
+
+                match action_index {
+                    0 => {
+                        if let Some(file_manager) = app.state.file_manager.as_mut() {
+                            if random & 1 == 0 {
+                                file_manager.move_down();
+                            } else {
+                                file_manager.move_up();
+                            }
+                        }
+                    }
+                    1 => {
+                        if let Some(file_manager) = app.state.file_manager.as_mut() {
+                            if file_manager.selected().is_some_and(|entry| entry.is_dir()) {
+                                file_manager.enter();
+                            } else if file_manager.cwd != root {
+                                file_manager.leave();
+                            }
+                        }
+                    }
+                    2 => {
+                        if let Some(file_manager) = app.state.file_manager.as_mut() {
+                            if file_manager.cwd != root {
+                                file_manager.leave();
+                            }
+                            let branch =
+                                ["alpha", "bravo", "charlie"][((random >> 16) as usize) % 3];
+                            if let Some(index) = file_manager
+                                .entries
+                                .iter()
+                                .position(|entry| entry.path == root.join(branch))
+                            {
+                                assert!(file_manager.replace_selection(index));
+                                file_manager.enter();
+                            }
+                        }
+                    }
+                    3 => {
+                        if sample_cross_layer_route {
+                            compute_view(&mut app.state, frame);
+                            let kind = if random & 1 == 0 {
+                                MouseEventKind::ScrollLeft
+                            } else {
+                                MouseEventKind::ScrollRight
+                            };
+                            let _ = app.handle_miller_horizontal_scroll(kind, KeyModifiers::NONE);
+                        } else if let Some(file_manager) = app.state.file_manager.as_mut() {
+                            let columns_width =
+                                file_manager
+                                    .miller
+                                    .chain
+                                    .iter()
+                                    .fold(0_u32, |width, segment| {
+                                        width.saturating_add(u32::from(segment.preferred_width))
+                                    });
+                            let maximum_offset = columns_width.saturating_add(
+                                file_manager.miller.chain.len().saturating_sub(1) as u32,
+                            );
+                            file_manager.miller.horizontal.offset_cells = if random & 1 == 0 {
+                                file_manager
+                                    .miller
+                                    .horizontal
+                                    .offset_cells
+                                    .saturating_sub(1)
+                            } else {
+                                file_manager
+                                    .miller
+                                    .horizontal
+                                    .offset_cells
+                                    .saturating_add(1)
+                                    .min(maximum_offset)
+                            };
+                        }
+                    }
+                    4 | 5 => {
+                        if sample_cross_layer_route {
+                            compute_view(&mut app.state, frame);
+                            let divider =
+                                app.state.view.file_manager_miller.dividers.first().cloned();
+                            if let Some(divider) = divider {
+                                let overlapping_row = crate::ui::trail_row_at(
+                                    &app.state.view.file_manager_trail,
+                                    divider.rect.x,
+                                    divider.rect.y,
+                                )
+                                .map(|row| {
+                                    (
+                                        row.trail_index,
+                                        row.entry_index,
+                                        row.rect,
+                                        row.entry_path.clone(),
+                                    )
+                                });
+                                let snapshot_identity = (
+                                    app.state.view.file_manager_miller.files_generation,
+                                    app.state.view.file_manager_miller.model_revision,
+                                    app.state.stage.active_instance_generation(),
+                                    app.state
+                                        .file_manager
+                                        .as_ref()
+                                        .map(|file_manager| file_manager.miller.revision),
+                                );
+                                let snapshot_columns =
+                                    app.state.view.file_manager_miller.columns.clone();
+                                let down = app.handle_file_manager_mouse(mouse(
+                                    MouseEventKind::Down(MouseButton::Left),
+                                    divider.rect.x,
+                                    divider.rect.y,
+                                ));
+                                assert_eq!(down, FileManagerMouseDispatch::Consumed);
+                                assert!(
+                                    app.state.shell_interaction.miller_resize_active(),
+                                    "fresh divider must start capture: frame={frame:?} divider={divider:?} \
+                                     overlap={overlapping_row:?} identities={snapshot_identity:?} \
+                                     stage={:?} columns={snapshot_columns:?}",
+                                    app.state.view.terminal_area,
+                                );
+                                let _ = app.handle_file_manager_mouse(mouse(
+                                    MouseEventKind::Drag(MouseButton::Left),
+                                    divider.rect.x.saturating_add(((random >> 24) as u16) % 12),
+                                    divider.rect.y.saturating_add(1),
+                                ));
+                                if action_index == 4 {
+                                    let _ = app.handle_file_manager_mouse(mouse(
+                                        MouseEventKind::Up(MouseButton::Left),
+                                        divider.rect.x.saturating_add(((random >> 24) as u16) % 12),
+                                        divider.rect.y.saturating_add(1),
+                                    ));
+                                } else {
+                                    assert!(app.handle_miller_resize_key(key(KeyCode::Esc)));
+                                }
+                            }
+                        } else if action_index == 4 {
+                            if let Some(file_manager) = app.state.file_manager.as_mut() {
+                                let _ = file_manager
+                                    .miller
+                                    .commit_column_width(0, ((random >> 24) as u16) % 96);
+                            }
+                        }
+                    }
+                    6 => {
+                        if sample_cross_layer_route {
+                            let resized =
+                                frames[((random >> 40) as usize).wrapping_add(step) % frames.len()];
+                            compute_view(&mut app.state, resized);
+                        }
+                    }
+                    7 => {
+                        let first = root.join(format!("dynamic-{}.txt", (random >> 20) % 8));
+                        let second = root.join(format!("dynamic-{}.txt", (random >> 28) % 8));
+                        match (random >> 48) % 3 {
+                            0 => {
+                                fs::write(&first, format!("{step}\n"))
+                                    .expect("create watcher stress entry");
+                            }
+                            1 => {
+                                let _ = fs::remove_file(&first);
+                            }
+                            _ => {
+                                fs::write(&first, format!("{step}\n"))
+                                    .expect("prepare watcher rename source");
+                                if first != second {
+                                    let _ = fs::remove_file(&second);
+                                    fs::rename(&first, &second)
+                                        .expect("rename watcher stress entry");
+                                }
+                            }
+                        }
+                        if let Some(file_manager) = app.state.file_manager.as_mut() {
+                            if file_manager.cwd == root {
+                                file_manager.reload();
+                            }
+                        }
+                        if sample_cross_layer_route {
+                            let now = Instant::now() + Duration::from_millis(step as u64);
+                            let _ = app.sync_file_manager_watcher_at(now);
+                        }
+                    }
+                    8 => {
+                        if sample_cross_layer_route {
+                            compute_view(&mut app.state, frame);
+                            let row = app
+                                .state
+                                .view
+                                .file_manager_miller
+                                .columns
+                                .iter()
+                                .flat_map(|column| column.rows.iter())
+                                .next()
+                                .cloned();
+                            if let Some(row) = row {
+                                let _ = app.handle_file_manager_mouse(mouse(
+                                    MouseEventKind::Down(MouseButton::Right),
+                                    row.rect.x,
+                                    row.rect.y,
+                                ));
+                                if app.state.context_menu.is_some() {
+                                    app.handle_context_menu_key_via_api(key(KeyCode::Esc));
+                                }
+                            }
+                        }
+                    }
+                    9 => {
+                        app.state.close_file_manager();
+                        if sample_cross_layer_route {
+                            let _ = app.sync_file_preview_worker();
+                            let _ = app.sync_image_preview_worker();
+                            let _ = app.sync_file_manager_watcher_at(Instant::now());
+                        }
+                        app.state
+                            .try_open_file_manager_with(|_| Some(FmState::new(&root)))
+                            .expect("stress Files reopen");
+                    }
+                    10 => {
+                        if sample_cross_layer_route {
+                            if let Some(file_manager) = app.state.file_manager.as_mut() {
+                                if file_manager.cwd != root {
+                                    file_manager.leave();
+                                }
+                                let root_file = root.join("root.txt");
+                                let root_file_index = file_manager
+                                    .entries
+                                    .iter()
+                                    .position(|entry| entry.path == root_file)
+                                    .expect("root preview fixture remains visible");
+                                assert!(file_manager.replace_selection(root_file_index));
+                            }
+                            let _ = app.sync_file_preview_worker();
+                            let _ = app.sync_image_preview_worker();
+                            if let Some(file_manager) = app.state.file_manager.as_mut() {
+                                file_manager.move_up();
+                            }
+                            let _ = app.sync_file_preview_worker();
+                            let _ = app.sync_image_preview_worker();
+                        } else if let Some(file_manager) = app.state.file_manager.as_mut() {
+                            file_manager.move_down();
+                            file_manager.move_up();
+                        }
+                    }
+                    11 => {
+                        let stale_row = sample_cross_layer_route.then(|| {
+                            compute_view(&mut app.state, frame);
+                            app.state
+                                .view
+                                .file_manager_miller
+                                .columns
+                                .iter()
+                                .flat_map(|column| column.rows.iter())
+                                .next()
+                                .cloned()
+                        });
+                        if let Some(file_manager) = app.state.file_manager.as_mut() {
+                            let _ = file_manager
+                                .miller
+                                .commit_column_width(0, ((random >> 24) as u16) % 96);
+                        }
+                        if let Some(Some(row)) = stale_row {
+                            let _ = app.handle_file_manager_mouse(mouse(
+                                MouseEventKind::Down(MouseButton::Left),
+                                row.rect.x,
+                                row.rect.y,
+                            ));
+                        }
+                    }
+                    12 => {
+                        if let Some(file_manager) = app.state.file_manager.as_mut() {
+                            let columns_width =
+                                file_manager
+                                    .miller
+                                    .chain
+                                    .iter()
+                                    .fold(0_u32, |width, segment| {
+                                        width.saturating_add(u32::from(segment.preferred_width))
+                                    });
+                            file_manager.miller.horizontal.offset_cells = columns_width
+                                .saturating_add(
+                                    file_manager.miller.chain.len().saturating_sub(1) as u32
+                                );
+                            if file_manager.cwd != root {
+                                file_manager.leave();
+                            }
+                        }
+                    }
+                    13 => {
+                        let next = root.join("pressure").join(step.to_string());
+                        pressure_miller.visit(next.clone());
+                        pressure_current = next;
+                    }
+                    _ => unreachable!("action index is modulo ACTION_COUNT"),
+                }
+
+                let file_manager = app
+                    .state
+                    .file_manager
+                    .as_ref()
+                    .expect("every stress action completes with Files open");
+                assert_eq!(
+                    app.state.stage.surface_view(),
+                    crate::ui::surface_host::StageSurfaceView::NativeFiles,
+                    "the Files model and Stage surface must converge"
+                );
+                assert!(
+                    app.state.stage.active_instance_generation().is_some(),
+                    "open Files must retain a live Stage generation"
+                );
+                assert!(
+                    app.state.context_menu.is_none(),
+                    "overlay actions must close before the next transition"
+                );
+                file_manager.miller.assert_miller_invariants_for_test();
+                assert_eq!(
+                    file_manager.trail.cols().len(),
+                    file_manager.trail_snapshots.cols().len(),
+                    "Trail state and immutable snapshots must retain one-to-one columns"
+                );
+                assert!(
+                    file_manager.trail.active_col() < file_manager.trail.cols().len(),
+                    "active Trail column must remain live"
+                );
+                for (column, snapshot) in file_manager
+                    .trail
+                    .cols()
+                    .iter()
+                    .zip(file_manager.trail_snapshots.cols())
+                {
+                    assert_eq!(
+                        column.directory,
+                        snapshot.directory(),
+                        "Trail column and snapshot owner must converge"
+                    );
+                }
+                pressure_miller.assert_miller_invariants_for_test();
+                if step % 256 == 0 {
+                    app.state.assert_invariants_for_test();
+                }
+            }));
+
+            assert!(
+                result.is_ok(),
+                "seed={SEED:#x} step={step} previous={before} action={action}"
+            );
+        }
+
+        assert!(
+            action_counts.iter().all(|count| *count > 0),
+            "seed={SEED:#x} must exercise every action category: {action_counts:?}"
+        );
+        for action_index in 3..=11 {
+            assert_eq!(
+                adapter_sample_counts[action_index], ADAPTER_SAMPLE_QUOTA,
+                "seed={SEED:#x} must exercise the bounded real adapter quota for action \
+                 {action_index}: {adapter_sample_counts:?}"
+            );
+        }
+        assert_eq!(
+            pressure_miller.chain.len(),
+            crate::fm::miller::MAX_MILLER_HISTORY_DEPTH,
+            "cache-pressure actions must fill and evict the bounded history"
+        );
+        assert_eq!(
+            pressure_miller
+                .chain
+                .back()
+                .map(|segment| &segment.directory),
+            Some(&pressure_current),
+            "layout pressure keeps the active Trail column as the chain tail"
+        );
+        app.state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn stale_miller_revision_mouse_up_retires_capture_without_commit() {
+        let td = TempDir::new("fm3-divider-stale-revision");
+        td.file("00.txt");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        install_focused_agent(&mut app);
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        compute_view(&mut app.state, Rect::new(0, 0, 86, 16));
+
+        let divider = app
+            .state
+            .view
+            .file_manager_miller
+            .dividers
+            .first()
+            .expect("current Files projection exposes a divider")
+            .clone();
+        let leading_chain_index = app.state.view.file_manager_miller.columns[divider.left_column]
+            .kind
+            .chain_index()
+            .expect("leading projected column belongs to the Miller chain");
+        let original_width = app
+            .state
+            .file_manager
+            .as_ref()
+            .expect("open FM")
+            .miller
+            .chain[leading_chain_index]
+            .preferred_width;
+
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                divider.rect.x,
+                divider.rect.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                divider.rect.x + 4,
+                divider.rect.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+
+        let authoritative_width = original_width + 1;
+        let file_manager = app.state.file_manager.as_mut().expect("open FM");
+        assert!(
+            file_manager
+                .miller
+                .commit_column_width(leading_chain_index, authoritative_width),
+            "precondition: another authority advances the Miller revision"
+        );
+        let authoritative_revision = file_manager.miller.revision;
+
+        compute_view(&mut app.state, Rect::new(0, 0, 86, 16));
+        assert!(
+            !app.state.view.file_manager_miller.resize_preview_active,
+            "a model-stale transaction cannot freeze background worker synchronization"
+        );
+
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                divider.rect.x + 4,
+                divider.rect.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+        assert!(
+            !app.state.shell_interaction.miller_resize_active(),
+            "stale mouse-up must retire capture authority"
+        );
+        let file_manager = app.state.file_manager.as_ref().expect("open FM");
+        assert_eq!(
+            (
+                file_manager.miller.revision,
+                file_manager.miller.chain[leading_chain_index].preferred_width,
+            ),
+            (authoritative_revision, authoritative_width),
+            "the stale preview cannot overwrite a newer model commit"
+        );
+    }
+
+    #[test]
+    fn reloaded_divider_generation_fails_closed_without_commit() {
+        let td = TempDir::new("fm3-divider-stale-directory-generation");
+        td.file("00.txt");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        install_focused_agent(&mut app);
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        let frame = Rect::new(0, 0, 86, 16);
+        compute_view(&mut app.state, frame);
+
+        let divider = app
+            .state
+            .view
+            .file_manager_miller
+            .dividers
+            .first()
+            .expect("current Files projection exposes a divider")
+            .clone();
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                divider.rect.x,
+                divider.rect.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                divider.rect.x.saturating_add(4),
+                divider.rect.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+
+        let (before_directory_generation, before_revision) = {
+            let file_manager = app.state.file_manager.as_ref().expect("open FM");
+            (
+                file_manager.directory_generation,
+                file_manager.miller.revision,
+            )
+        };
+        app.state.file_manager.as_mut().expect("open FM").reload();
+        let after_reload_model = {
+            let file_manager = app.state.file_manager.as_ref().expect("open FM");
+            assert!(
+                file_manager.directory_generation > before_directory_generation,
+                "reload retires the captured directory generation"
+            );
+            assert_eq!(
+                file_manager.miller.revision, before_revision,
+                "reload isolates source generation from Miller model revision"
+            );
+            file_manager.miller.clone()
+        };
+
+        compute_view(&mut app.state, frame);
+        assert!(
+            !app.state.view.file_manager_miller.resize_preview_active,
+            "a generation-stale divider cannot own transient geometry"
+        );
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                divider.rect.x.saturating_add(4),
+                divider.rect.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+        assert!(
+            !app.state.shell_interaction.miller_resize_active(),
+            "stale release retires the typed capture"
+        );
+        assert_eq!(
+            app.state.file_manager.as_ref().expect("open FM").miller,
+            after_reload_model,
+            "a retired directory generation cannot commit any Miller width"
+        );
+    }
+
+    #[test]
+    fn evicted_or_reordered_divider_fails_closed() {
+        let td = TempDir::new("fm3-divider-reordered-chain");
+        td.dir("child");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        install_focused_agent(&mut app);
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        let frame = Rect::new(0, 0, 90, 16);
+        compute_view(&mut app.state, frame);
+
+        let divider = app
+            .state
+            .view
+            .file_manager_miller
+            .dividers
+            .last()
+            .expect("selected child Trail divider is visible")
+            .clone();
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                divider.rect.x,
+                divider.rect.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                divider.rect.x.saturating_add(4),
+                u16::MAX,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+
+        let captured_revision = app
+            .state
+            .file_manager
+            .as_ref()
+            .expect("open FM")
+            .miller
+            .revision;
+        app.state.file_manager.as_mut().expect("open FM").enter();
+        {
+            let file_manager = app.state.file_manager.as_ref().expect("open FM");
+            assert_eq!(
+                file_manager.cwd,
+                td.root.join("child"),
+                "real navigation replaces the captured current/preview adjacency"
+            );
+            assert!(
+                file_manager.miller.revision > captured_revision,
+                "chain transition retires the captured model revision"
+            );
+        }
+
+        compute_view(&mut app.state, frame);
+        assert!(
+            !app.state.view.file_manager_miller.resize_preview_active,
+            "the reordered chain cannot project the retired divider"
+        );
+        let reordered_model = app
+            .state
+            .file_manager
+            .as_ref()
+            .expect("open FM")
+            .miller
+            .clone();
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                divider.rect.x.saturating_add(4),
+                u16::MAX,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+        assert!(
+            !app.state.shell_interaction.miller_resize_active(),
+            "stale release retires capture after chain replacement"
+        );
+        assert_eq!(
+            app.state.file_manager.as_ref().expect("open FM").miller,
+            reordered_model,
+            "the old divider cannot replay a width into the reordered chain"
+        );
+    }
+
+    #[test]
+    fn mouse_up_without_miller_capture_is_inert() {
+        let td = TempDir::new("fm3-divider-stray-mouse-up");
+        td.file("00.txt");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        install_focused_agent(&mut app);
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        compute_view(&mut app.state, Rect::new(0, 0, 86, 16));
+
+        let divider = app
+            .state
+            .view
+            .file_manager_miller
+            .dividers
+            .first()
+            .expect("current Files projection exposes a divider")
+            .rect;
+        let before_model = app
+            .state
+            .file_manager
+            .as_ref()
+            .expect("open FM")
+            .miller
+            .clone();
+        assert!(
+            !app.state.shell_interaction.miller_resize_active(),
+            "precondition: no transaction owns this release"
+        );
+
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                divider.x,
+                divider.y,
+            )),
+            FileManagerMouseDispatch::Consumed,
+            "Files consumes an in-surface stray release without inventing capture"
+        );
+        assert!(
+            !app.state.shell_interaction.miller_resize_active(),
+            "stray release cannot create transaction authority"
+        );
+        assert_eq!(
+            app.state.file_manager.as_ref().expect("open FM").miller,
+            before_model,
+            "stray release cannot mutate widths or revision"
+        );
+    }
+
+    #[test]
+    fn terminal_resize_cancels_stale_miller_transaction() {
+        let td = TempDir::new("fm3-divider-terminal-resize");
+        td.file("00.txt");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        install_focused_agent(&mut app);
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        let original_frame = Rect::new(0, 0, 86, 16);
+        compute_view(&mut app.state, original_frame);
+
+        let divider = app
+            .state
+            .view
+            .file_manager_miller
+            .dividers
+            .first()
+            .expect("current Files projection exposes a divider")
+            .rect;
+        let before_model = {
+            let file_manager = app.state.file_manager.as_ref().expect("open FM");
+            (
+                file_manager.miller.revision,
+                file_manager
+                    .miller
+                    .chain
+                    .iter()
+                    .map(|segment| segment.preferred_width)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                divider.x,
+                divider.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                divider.x + 4,
+                divider.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+        assert!(
+            app.state.shell_interaction.miller_resize_active(),
+            "precondition: old frame owns a Miller capture"
+        );
+
+        compute_view(&mut app.state, Rect::new(0, 0, 70, 16));
+
+        assert_eq!(
+            app.state.view.shell.area.width, 70,
+            "precondition: compute applies the terminal resize"
+        );
+        assert!(
+            !app.state.shell_interaction.miller_resize_active(),
+            "new terminal geometry must retire the old pointer transaction"
+        );
+        let file_manager = app.state.file_manager.as_ref().expect("open FM");
+        assert_eq!(
+            (
+                file_manager.miller.revision,
+                file_manager
+                    .miller
+                    .chain
+                    .iter()
+                    .map(|segment| segment.preferred_width)
+                    .collect::<Vec<_>>(),
+            ),
+            before_model,
+            "terminal resize cancellation cannot commit model widths"
+        );
+    }
+
+    #[tokio::test]
+    async fn miller_resize_escape_cancels_preview_without_closing_files() {
+        let td = TempDir::new("fm3-divider-escape-cancel");
+        td.file("00.txt");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        install_focused_agent(&mut app);
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        compute_view(&mut app.state, Rect::new(0, 0, 86, 16));
+
+        let divider = app
+            .state
+            .view
+            .file_manager_miller
+            .dividers
+            .first()
+            .expect("current Files projection exposes a divider")
+            .rect;
+        let before_model = {
+            let file_manager = app.state.file_manager.as_ref().expect("open FM");
+            (
+                file_manager.miller.revision,
+                file_manager
+                    .miller
+                    .chain
+                    .iter()
+                    .map(|segment| segment.preferred_width)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                divider.x,
+                divider.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                divider.x + 4,
+                divider.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+
+        app.handle_key(crate::input::TerminalKey::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        ))
+        .await;
+
+        assert!(
+            app.state.file_manager.is_some(),
+            "Escape cancels the gesture without closing Files"
+        );
+        assert!(
+            !app.state.shell_interaction.miller_resize_active(),
+            "Escape retires Miller capture authority"
+        );
+        let file_manager = app.state.file_manager.as_ref().expect("Files remains open");
+        assert_eq!(
+            (
+                file_manager.miller.revision,
+                file_manager
+                    .miller
+                    .chain
+                    .iter()
+                    .map(|segment| segment.preferred_width)
+                    .collect::<Vec<_>>(),
+            ),
+            before_model,
+            "Escape cancellation cannot commit model widths"
+        );
+    }
+
+    #[tokio::test]
+    async fn miller_resize_keyboard_preview_and_enter_commit_once() {
+        let td = TempDir::new("fm3-divider-keyboard-commit");
+        td.file("00.txt");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        install_focused_agent(&mut app);
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        compute_view(&mut app.state, Rect::new(0, 0, 86, 16));
+
+        let divider = app
+            .state
+            .view
+            .file_manager_miller
+            .dividers
+            .first()
+            .expect("current Files projection exposes a divider")
+            .clone();
+        let leading_chain_index = app.state.view.file_manager_miller.columns[divider.left_column]
+            .kind
+            .chain_index()
+            .expect("leading projected column belongs to the Miller chain");
+        let original_tracks = [
+            app.state.view.file_manager_miller.columns[divider.left_column]
+                .rect
+                .width,
+            app.state.view.file_manager_miller.columns[divider.right_column]
+                .rect
+                .width,
+        ];
+        let (before_revision, before_widths) = {
+            let file_manager = app.state.file_manager.as_ref().expect("open FM");
+            (
+                file_manager.miller.revision,
+                file_manager
+                    .miller
+                    .chain
+                    .iter()
+                    .map(|segment| segment.preferred_width)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                divider.rect.x,
+                divider.rect.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+
+        for code in [KeyCode::Right, KeyCode::Char('l')] {
+            app.handle_key(crate::input::TerminalKey::new(code, KeyModifiers::NONE))
+                .await;
+        }
+        assert_eq!(
+            app.state.shell_interaction.resize_preview_tracks(),
+            Some([original_tracks[0] + 2, original_tracks[1] - 2]),
+            "keyboard steps share the transient Miller preview reducer"
+        );
+        let file_manager = app.state.file_manager.as_ref().expect("open FM");
+        assert_eq!(
+            (
+                file_manager.miller.revision,
+                file_manager
+                    .miller
+                    .chain
+                    .iter()
+                    .map(|segment| segment.preferred_width)
+                    .collect::<Vec<_>>(),
+            ),
+            (before_revision, before_widths.clone()),
+            "keyboard preview cannot mutate committed model state"
+        );
+
+        app.handle_key(crate::input::TerminalKey::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))
+        .await;
+
+        assert!(
+            app.state.file_manager.is_some(),
+            "Enter commits the gesture without closing Files"
+        );
+        assert!(
+            !app.state.shell_interaction.miller_resize_active(),
+            "Enter retires Miller capture authority"
+        );
+        let file_manager = app.state.file_manager.as_ref().expect("Files remains open");
+        let mut expected_widths = before_widths;
+        expected_widths[leading_chain_index] = original_tracks[0] + 2;
+        assert_eq!(
+            (
+                file_manager.miller.revision,
+                file_manager
+                    .miller
+                    .chain
+                    .iter()
+                    .map(|segment| segment.preferred_width)
+                    .collect::<Vec<_>>(),
+            ),
+            (before_revision + 1, expected_widths),
+            "Enter performs exactly one final model commit"
+        );
+    }
+
+    #[test]
+    fn first_miller_divider_resizes_expected_pair() {
+        let td = TempDir::new("fm3-first-divider");
+        td.dir("child");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        install_focused_agent(&mut app);
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        let frame = Rect::new(0, 0, 90, 16);
+        compute_view(&mut app.state, frame);
+
+        let divider = app
+            .state
+            .view
+            .file_manager_miller
+            .dividers
+            .first()
+            .expect("three-column projection exposes the first divider")
+            .clone();
+        assert_eq!(
+            (divider.left_column, divider.right_column),
+            (0, 1),
+            "the first divider owns only the left/current pair"
+        );
+        let leading_chain_index = app.state.view.file_manager_miller.columns[divider.left_column]
+            .kind
+            .chain_index()
+            .expect("first leading column belongs to the Miller chain");
+        let trailing_chain_index = app.state.view.file_manager_miller.columns[divider.right_column]
+            .kind
+            .chain_index()
+            .expect("first trailing column belongs to the Miller chain");
+        let original_geometry = app
+            .state
+            .view
+            .file_manager_miller
+            .columns
+            .iter()
+            .map(|column| column.rect.width)
+            .collect::<Vec<_>>();
+        let (before_revision, before_widths) = {
+            let file_manager = app.state.file_manager.as_ref().expect("open FM");
+            (
+                file_manager.miller.revision,
+                file_manager
+                    .miller
+                    .chain
+                    .iter()
+                    .map(|segment| segment.preferred_width)
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                divider.rect.x,
+                divider.rect.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                divider.rect.x.saturating_add(4),
+                divider.rect.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+        compute_view(&mut app.state, frame);
+        let preview_geometry = app
+            .state
+            .view
+            .file_manager_miller
+            .columns
+            .iter()
+            .map(|column| column.rect.width)
+            .collect::<Vec<_>>();
+        let mut expected_geometry = original_geometry.clone();
+        expected_geometry[divider.left_column] += 4;
+        expected_geometry[divider.right_column] -= 4;
+        assert_eq!(
+            preview_geometry, expected_geometry,
+            "preview changes only the first adjacent pair"
+        );
+
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                divider.rect.x.saturating_add(4),
+                divider.rect.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+        let file_manager = app.state.file_manager.as_ref().expect("open FM");
+        let mut expected_widths = before_widths;
+        expected_widths[leading_chain_index] = expected_geometry[divider.left_column];
+        expected_widths[trailing_chain_index] = expected_geometry[divider.right_column];
+        assert_eq!(
+            (
+                file_manager.miller.revision,
+                file_manager
+                    .miller
+                    .chain
+                    .iter()
+                    .map(|segment| segment.preferred_width)
+                    .collect::<Vec<_>>(),
+            ),
+            (before_revision + 1, expected_widths),
+            "commit updates only the first divider's exact adjacent preferences"
+        );
+
+        compute_view(&mut app.state, frame);
+        let committed_geometry = app
+            .state
+            .view
+            .file_manager_miller
+            .columns
+            .iter()
+            .map(|column| column.rect.width)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            committed_geometry, expected_geometry,
+            "fresh geometry keeps the committed first-divider result"
+        );
+    }
+
+    #[test]
+    fn miller_width_clamps_at_16_and_64_cells() {
+        let td = TempDir::new("fm3-divider-clamp");
+        td.file("00.txt");
+        let mut file_manager = FmState::new(&td.root);
+        let focused_directory = file_manager.miller.focused_directory.clone();
+        assert!(file_manager.miller.commit_adjacent_column_widths(
+            &focused_directory,
+            40,
+            crate::fm::miller::MillerAdjacentWidthTarget::Preview,
+            40,
+        ));
+        let mut app = runtime_app_with_fm(file_manager);
+        install_focused_agent(&mut app);
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        let frame = Rect::new(0, 0, 116, 16);
+        compute_view(&mut app.state, frame);
+        let focused_chain_index = app
+            .state
+            .file_manager
+            .as_ref()
+            .expect("open FM")
+            .miller
+            .chain
+            .len()
+            .saturating_sub(1);
+        let before_revision = app
+            .state
+            .file_manager
+            .as_ref()
+            .expect("open FM")
+            .miller
+            .revision;
+
+        let divider = app
+            .state
+            .view
+            .file_manager_miller
+            .dividers
+            .last()
+            .expect("Trail detail projection exposes its divider")
+            .clone();
+        assert_eq!(
+            [
+                app.state.view.file_manager_miller.columns[divider.left_column]
+                    .rect
+                    .width,
+                app.state.view.file_manager_miller.columns[divider.right_column]
+                    .rect
+                    .width,
+            ],
+            [40, 40],
+            "fixture starts with an 80-cell adjacent pair"
+        );
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                divider.rect.x,
+                divider.rect.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                u16::MAX,
+                divider.rect.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+        assert_eq!(
+            app.state.shell_interaction.resize_preview_tracks(),
+            Some([60, crate::fm::miller::MILLER_DETAIL_MIN_WIDTH,]),
+            "right overshoot clamps both sides of the fixed-total pair"
+        );
+        let _ = app.handle_file_manager_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            u16::MAX,
+            divider.rect.y,
+        ));
+        compute_view(&mut app.state, frame);
+
+        let divider = app
+            .state
+            .view
+            .file_manager_miller
+            .dividers
+            .last()
+            .expect("committed high clamp preserves the detail divider")
+            .clone();
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                divider.rect.x,
+                divider.rect.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                0,
+                divider.rect.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+        assert_eq!(
+            app.state.shell_interaction.resize_preview_tracks(),
+            Some([
+                crate::fm::miller::MILLER_COLUMN_MIN_WIDTH,
+                crate::fm::miller::MILLER_COLUMN_MAX_WIDTH,
+            ]),
+            "left overshoot clamps both sides of the fixed-total pair"
+        );
+        let _ = app.handle_file_manager_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            0,
+            divider.rect.y,
+        ));
+        compute_view(&mut app.state, frame);
+
+        let file_manager = app.state.file_manager.as_ref().expect("open FM");
+        assert_eq!(
+            (
+                file_manager.miller.chain[focused_chain_index].preferred_width,
+                file_manager.miller.preview_preferred_width,
+                file_manager.miller.revision,
+            ),
+            (
+                crate::fm::miller::MILLER_COLUMN_MIN_WIDTH,
+                crate::fm::miller::MILLER_COLUMN_MAX_WIDTH,
+                before_revision + 2,
+            ),
+            "two boundary commits stay typed, bounded, and one revision each"
+        );
+        let stage = app.state.view.terminal_area;
+        assert!(
+            app.state
+                .view
+                .file_manager_miller
+                .columns
+                .iter()
+                .all(|column| {
+                    column.rect.x >= stage.x
+                        && column.rect.right() <= stage.right()
+                        && column.rect.width >= crate::fm::miller::MILLER_COLUMN_MIN_WIDTH
+                        && column.rect.width <= crate::fm::miller::MILLER_COLUMN_MAX_WIDTH
+                }),
+            "every clamped column rect remains inside the Files Stage"
+        );
+    }
+
+    #[test]
+    fn stale_legacy_divider_geometry_cannot_start_resize_after_typed_cutover() {
+        let td = TempDir::new("fm3-no-legacy-divider-authority");
+        td.file("00.txt");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        install_focused_agent(&mut app);
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        compute_view(&mut app.state, Rect::new(0, 0, 60, 16));
+
+        let center = app.state.view.terminal_area;
+        let legacy_body = Rect::new(
+            center.x,
+            center.y.saturating_add(1),
+            center.width,
+            center.height.saturating_sub(2),
+        );
+        let [_parent, legacy_divider, _current, _second_divider, _preview] =
+            ratatui::layout::Layout::horizontal([
+                ratatui::layout::Constraint::Min(crate::fm::miller::MILLER_COLUMN_MIN_WIDTH),
+                ratatui::layout::Constraint::Length(1),
+                ratatui::layout::Constraint::Min(crate::fm::miller::MILLER_COLUMN_MIN_WIDTH),
+                ratatui::layout::Constraint::Length(1),
+                ratatui::layout::Constraint::Min(crate::fm::miller::MILLER_COLUMN_MIN_WIDTH),
+            ])
+            .areas(legacy_body);
+        app.state.view.file_manager_miller.dividers.clear();
+        let before_model = {
+            let file_manager = app.state.file_manager.as_ref().expect("open FM");
+            (
+                file_manager.miller.revision,
+                file_manager
+                    .miller
+                    .chain
+                    .iter()
+                    .map(|segment| segment.preferred_width)
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        let _ = app.handle_file_manager_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            legacy_divider.x,
+            legacy_divider.y + 2,
+        ));
+        let _ = app.handle_file_manager_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            legacy_divider.x + 4,
+            legacy_divider.y + 2,
+        ));
+        let _ = app.handle_file_manager_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            legacy_divider.x + 4,
+            legacy_divider.y + 2,
+        ));
+
+        assert!(
+            !app.state.shell_interaction.resize_active(),
+            "only a current typed divider may create capture authority"
+        );
+        let file_manager = app.state.file_manager.as_ref().expect("open FM");
+        assert_eq!(
+            (
+                file_manager.miller.revision,
+                file_manager
+                    .miller
+                    .chain
+                    .iter()
+                    .map(|segment| segment.preferred_width)
+                    .collect::<Vec<_>>(),
+            ),
+            before_model,
+            "retired legacy geometry cannot mutate the Miller model"
+        );
+    }
+
+    // SF6.2: Files input routes from the TYPED stage authority
+    // (`AppSurfaceRef::NativeFiles`), not the legacy `file_manager.is_some()`
+    // boolean. The adversarial divergent state (Files domain state present
+    // while the typed stage says TerminalWorkspace) pins which source owns
+    // keyboard and mouse routing.
+    #[test]
+    fn files_input_routes_from_typed_surface_authority() {
+        let td = TempDir::new("files-typed-input-authority");
+        td.file("00.txt");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        install_focused_agent(&mut app);
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        compute_view(&mut app.state, Rect::new(0, 0, 60, 16));
+
+        // Control: the aligned NativeFiles state owns the keyboard tier and
+        // consumes in-center mouse events.
+        assert_eq!(
+            app.state.stage.surface_view(),
+            crate::ui::surface_host::StageSurfaceView::NativeFiles,
+            "fixture: Files owns the stage"
+        );
+        assert_eq!(
+            app.state.shell_key_input_owner(),
+            crate::app::input::shell::ShellInputOwner::FocusedComponent
+        );
+        let center = app.state.view.terminal_area;
+        let probe = (
+            center.x + center.width.saturating_sub(2),
+            center.y + center.height.saturating_sub(2),
+        );
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                probe.0,
+                probe.1
+            )),
+            FileManagerMouseDispatch::Consumed,
+            "control: the aligned Files surface consumes in-center mouse input"
+        );
+
+        // Adversarial divergence: Files domain state present while the typed
+        // stage says TerminalWorkspace. The TYPED authority must own routing
+        // on BOTH input paths.
+        app.state.stage.close_files();
+        assert!(app.state.file_manager.is_some(), "divergent fixture holds");
+        assert_ne!(
+            app.state.shell_key_input_owner(),
+            crate::app::input::shell::ShellInputOwner::FocusedComponent,
+            "the typed stage authority must own keyboard routing"
+        );
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                probe.0,
+                probe.1
+            )),
+            FileManagerMouseDispatch::NotHandled,
+            "the typed stage authority must own mouse routing"
+        );
+    }
+
+    // SF4.2-08: with the Files surface covering the workspace stage, no
+    // mouse event inside the covered center may reach the hidden terminal —
+    // no selection anchor, no pane focus, no context/terminal side effect —
+    // and the keyboard tier belongs to the focused file manager. The control
+    // phase proves the SAME press reaches the live terminal once the Files
+    // surface closes, so the seal cannot pass vacuously.
+    #[test]
+    fn files_stage_blocks_hidden_terminal_input() {
+        let td = TempDir::new("files-stage-input-seal");
+        td.file("00.txt");
+        td.file("01.txt");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        install_focused_agent(&mut app);
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        compute_view(&mut app.state, Rect::new(0, 0, 60, 16));
+
+        let center = app.state.view.terminal_area;
+        let probe = (
+            center.x + center.width.saturating_sub(2),
+            center.y + center.height.saturating_sub(2),
+        );
+        let on_fm_control = app
+            .state
+            .view
+            .file_manager_row_areas
+            .iter()
+            .map(|row| row.rect)
+            .chain(
+                app.state
+                    .view
+                    .file_manager_header_action_areas
+                    .iter()
+                    .map(|area| area.rect),
+            )
+            .any(|rect| {
+                probe.0 >= rect.x
+                    && probe.0 < rect.x.saturating_add(rect.width)
+                    && probe.1 >= rect.y
+                    && probe.1 < rect.y.saturating_add(rect.height)
+            });
+        assert!(
+            !on_fm_control,
+            "fixture: the probe must target covered terrain, not an FM control"
+        );
+
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Moved,
+            MouseEventKind::ScrollUp,
+            MouseEventKind::ScrollDown,
+            MouseEventKind::Down(MouseButton::Middle),
+            MouseEventKind::Down(MouseButton::Right),
+        ] {
+            app.handle_mouse(mouse(kind, probe.0, probe.1));
+            assert!(
+                app.state.selection.is_none(),
+                "{kind:?} must not anchor a hidden terminal selection"
+            );
+            assert!(
+                app.state.file_manager.is_some(),
+                "{kind:?} must not close the Files surface"
+            );
+            assert_eq!(
+                app.state.mode,
+                Mode::Terminal,
+                "{kind:?} must not change the mode"
+            );
+        }
+        assert!(
+            app.state.context_menu.is_none(),
+            "a non-row right-click must not open a menu"
+        );
+        assert_eq!(
+            app.state.shell_key_input_owner(),
+            super::super::shell::ShellInputOwner::FocusedComponent,
+            "the open Files surface owns the keyboard tier"
+        );
+
+        // Control: once the Files surface closes, the SAME press reaches the
+        // live terminal and anchors a selection.
+        app.state.close_file_manager();
+        compute_view(&mut app.state, Rect::new(0, 0, 60, 16));
+        assert!(
+            app.state.pane_at(probe.0, probe.1).is_some(),
+            "control fixture: the probe must sit on the live pane"
+        );
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            probe.0,
+            probe.1,
+        ));
+        assert!(
+            app.state.selection.is_some(),
+            "control: the same press must reach the live terminal"
+        );
+    }
+
+    fn runtime_app_with_fm(fm: FmState) -> crate::app::App {
+        let mut app = super::super::app_for_mouse_test();
+        app.state
+            .try_open_file_manager_with(|_| Some(fm))
+            .expect("Files activation");
+        app.state.view.terminal_area = Rect::new(26, 0, 20, 6);
+        let entry_paths = app
+            .state
+            .file_manager
+            .as_ref()
+            .map(|file_manager| {
+                file_manager
+                    .entries
+                    .iter()
+                    .take(4)
+                    .map(|entry| entry.path.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        app.state.view.file_manager_row_areas = entry_paths
+            .into_iter()
+            .enumerate()
+            .map(|(entry_idx, entry_path)| FileManagerRowArea {
+                rect: Rect::new(26, 2 + entry_idx as u16, 20, 1),
+                entry_idx,
+                entry_path,
+            })
+            .collect();
+        let files_generation = app
+            .state
+            .stage
+            .active_instance_generation()
+            .expect("active Files generation");
+        app.state.view.file_manager_miller = crate::ui::project_miller_view(
+            Rect::new(26, 1, 20, 5),
+            app.state.file_manager.as_ref().expect("open FM"),
+            files_generation,
+        );
+        let mut trail = crate::ui::project_trail_view(
+            Rect::new(26, 2, 20, 4),
+            &app.state.file_manager.as_ref().expect("open FM").trail,
+            &app.state
+                .file_manager
+                .as_ref()
+                .expect("open FM")
+                .trail_snapshots,
+            &[20],
+            true,
+            false,
+        );
+        trail.files_generation = Some(files_generation);
+        app.state.view.file_manager_trail = trail;
+        app
+    }
+
+    /// A runtime app showing a rendered PDF page, with the real projected
+    /// geometry `compute_view` produces rather than a hand-built frame — the
+    /// indicator's position depends on the detail panel's exact content rect.
+    fn runtime_app_with_pdf_preview(
+        page: usize,
+        total_pages: usize,
+    ) -> (crate::app::App, TempDir, crate::ui::PdfPageIndicator) {
+        let td = TempDir::new("pdf-indicator");
+        td.file("manual.pdf");
+        let source_path = td.root.join("manual.pdf");
+        let mut file_manager = FmState::new(&td.root);
+        file_manager.preview_generation = 1;
+        file_manager.preview =
+            crate::fm::FmPreview::File(crate::fm::FmFilePreview::Pdf(crate::fm::FmPdfPreview {
+                source_path: source_path.clone(),
+                generation: 1,
+                page,
+                total_pages: Some(total_pages),
+                state: crate::fm::FmPdfPreviewState::Pending,
+            }));
+        file_manager.sync_trail_bridge_for_test();
+
+        let mut app = super::super::app_for_mouse_test();
+        app.state
+            .try_open_file_manager_with(|_| Some(file_manager))
+            .expect("Files activation");
+        app.state.kitty_graphics_enabled = true;
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 120, 30));
+        let content = app
+            .state
+            .view
+            .file_manager_trail
+            .detail_panel
+            .as_ref()
+            .expect("Trail detail panel")
+            .content_rect;
+
+        let preview = app
+            .state
+            .file_manager
+            .as_mut()
+            .and_then(|file_manager| match &mut file_manager.preview {
+                crate::fm::FmPreview::File(crate::fm::FmFilePreview::Pdf(preview)) => Some(preview),
+                _ => None,
+            })
+            .expect("mutable pdf preview");
+        preview.state = crate::fm::FmPdfPreviewState::Ready {
+            target: crate::fm::ImagePreviewTarget {
+                width_px: u32::from(content.width) * 8,
+                height_px: u32::from(content.height) * 16,
+            },
+            prepared: crate::fm::PreparedImagePreview {
+                width: 8,
+                height: 8,
+                data_fingerprint: 0x99,
+                rgba: vec![0x99; 8 * 8 * 4],
+            },
+        };
+        let preview = preview.clone();
+        let indicator = crate::ui::pdf_page_indicator_for(&app.state, content, &preview)
+            .expect("indicator for a rendered page");
+        (app, td, indicator)
+    }
+
+    // TP-FPDF-23: clicking an arrow turns the page it points at. The indicator
+    // is the only mouse affordance a PDF preview has, so a mouse-first file
+    // manager that cannot turn pages with the mouse has no page navigation.
+    #[test]
+    fn clicking_the_page_indicator_arrows_turns_the_pdf() {
+        let (mut app, _fixture, indicator) = runtime_app_with_pdf_preview(4, 10);
+        let previous = indicator.previous.expect("previous arrow mid-document");
+        let next = indicator.next.expect("next arrow mid-document");
+
+        app.handle_file_manager_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            next.x,
+            next.y,
+        ));
+        assert_eq!(previewed_pdf_page(&app.state), 5);
+
+        app.handle_file_manager_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            previous.x,
+            previous.y,
+        ));
+        assert_eq!(previewed_pdf_page(&app.state), 4);
+    }
+
+    // TP-FVIEW-11: clicking the picture enlarges it, and the indicator's
+    // arrows keep their meaning inside the same rect. Without the ordering the
+    // arrows would open the viewer instead of turning the page.
+    #[test]
+    fn clicking_the_picture_opens_the_viewer_but_the_arrows_still_turn_pages() {
+        let (mut app, _fixture, indicator) = runtime_app_with_pdf_preview(4, 10);
+        let next = indicator.next.expect("next arrow mid-document");
+        app.handle_file_manager_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            next.x,
+            next.y,
+        ));
+        assert!(
+            app.state.preview_viewer.is_none(),
+            "an arrow press turns the page instead of enlarging"
+        );
+        assert_eq!(previewed_pdf_page(&app.state), 5);
+
+        let content = crate::kitty_graphics::file_manager_raster_content_area(&app.state)
+            .expect("raster content area");
+        app.handle_file_manager_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            content.x,
+            content.y,
+        ));
+        assert_eq!(app.state.mode, Mode::PreviewViewer);
+        assert!(app.state.preview_viewer.is_some());
+    }
+
+    // TP-FPDF-24: the rest of the indicator row is not a button. Without this
+    // the empty half of the status line silently turns pages.
+    #[test]
+    fn clicking_beside_the_page_indicator_leaves_the_page_alone() {
+        let (mut app, _fixture, indicator) = runtime_app_with_pdf_preview(4, 10);
+        let next = indicator.next.expect("next arrow mid-document");
+
+        for column in [next.x.saturating_add(1), next.x.saturating_add(4)] {
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                column,
+                next.y,
+            ));
+            assert_eq!(
+                previewed_pdf_page(&app.state),
+                4,
+                "column {column} must not be a page-turn target"
+            );
+        }
+    }
+
+    // TP-FEDIT-01: clicking a text preview opens the file in the editor tab.
+    // The preview is where the reader's eyes already are; a picture click
+    // enlarges, and a text click answering with nothing makes the two panels
+    // feel like different programs. The click queues the SAME plugin intent
+    // the context menu's "Edit in New Tab" produces, so one dispatch seam
+    // serves both paths.
+    #[test]
+    fn clicking_a_text_preview_queues_the_editor_action() {
+        let td = TempDir::new("text-preview-edit");
+        let source_path = td.root.join("notes.md");
+        fs::write(&source_path, b"# baslik\n").expect("write fixture");
+        let mut file_manager = FmState::new(&td.root);
+        file_manager.preview_generation = 1;
+        file_manager.preview =
+            crate::fm::FmPreview::File(crate::fm::FmFilePreview::Text(crate::fm::TextPreview {
+                source_path: source_path.clone(),
+                content: "# baslik\n".to_owned(),
+                truncated: false,
+                highlighted: None,
+            }));
+        file_manager.sync_trail_bridge_for_test();
+
+        let plugin_td = TempDir::new("text-preview-edit-manifest");
+        let manifest = plugin_td.root.join("herdr-plugin.toml");
+        fs::write(
+            &manifest,
+            r#"
+id = "example.edit"
+name = "Example Edit"
+version = "0.1.0"
+min_herdr_version = "0.6.10"
+
+[[actions]]
+id = "edit"
+title = "Edit in New Tab"
+contexts = ["file"]
+file_extensions = ["md", "txt"]
+command = ["edit"]
+"#,
+        )
+        .expect("write plugin manifest");
+        let plugin =
+            crate::app::api::plugins::load_plugin_manifest(&manifest.display().to_string(), true)
+                .expect("valid plugin manifest");
+
+        let mut app = super::super::app_for_mouse_test();
+        app.state
+            .try_open_file_manager_with(|_| Some(file_manager))
+            .expect("Files activation");
+        app.state
+            .installed_plugins
+            .insert(plugin.plugin_id.clone(), plugin);
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 120, 30));
+        let content = app
+            .state
+            .view
+            .file_manager_trail
+            .detail_panel
+            .as_ref()
+            .expect("detail panel")
+            .content_rect;
+
+        app.handle_file_manager_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            content.x + 2,
+            content.y + 1,
+        ));
+        let intent = app
+            .state
+            .request_file_manager_context_action
+            .as_ref()
+            .expect("a text preview click queues the editor intent");
+        assert_eq!(
+            intent.action,
+            FileManagerContextMenuAction::Plugin {
+                plugin_id: "example.edit".into(),
+                action_id: "edit".into(),
+            }
+        );
+        assert_eq!(intent.paths, vec![source_path]);
+    }
+
+    // TP-FM-FOCUS-01: a press inside the preview panel claims Trail ownership,
+    // the way a row press already does. Arriving from the locations rail and
+    // pressing the preview used to queue an intent the scheduled boundary then
+    // refused as `InactiveFocusOwner`: the press was consumed, the editor never
+    // opened, and nothing on screen explained the silence. The assertion is the
+    // boundary's own condition rather than a restatement of it — the queued
+    // action has to come back as an ENABLED item of the menu model recomputed
+    // from current focus, which is exactly what the boundary rechecks.
+    #[test]
+    fn preview_press_from_the_locations_rail_survives_its_own_revalidation() {
+        let td = TempDir::new("preview-press-rail-focus");
+        let source_path = td.root.join("notes.md");
+        fs::write(&source_path, b"# baslik\n").expect("write fixture");
+        let mut file_manager = FmState::new(&td.root);
+        file_manager.preview_generation = 1;
+        file_manager.preview =
+            crate::fm::FmPreview::File(crate::fm::FmFilePreview::Text(crate::fm::TextPreview {
+                source_path: source_path.clone(),
+                content: "# baslik\n".to_owned(),
+                truncated: false,
+                highlighted: None,
+            }));
+        file_manager.sync_trail_bridge_for_test();
+
+        let plugin_td = TempDir::new("preview-press-rail-focus-manifest");
+        let manifest = plugin_td.root.join("herdr-plugin.toml");
+        fs::write(
+            &manifest,
+            r#"
+id = "example.edit"
+name = "Example Edit"
+version = "0.1.0"
+min_herdr_version = "0.6.10"
+
+[[actions]]
+id = "edit"
+title = "Edit in New Tab"
+contexts = ["file"]
+file_extensions = ["md", "txt"]
+command = ["edit"]
+"#,
+        )
+        .expect("write plugin manifest");
+        let plugin =
+            crate::app::api::plugins::load_plugin_manifest(&manifest.display().to_string(), true)
+                .expect("valid plugin manifest");
+
+        let mut app = super::super::app_for_mouse_test();
+        app.state
+            .try_open_file_manager_with(|_| Some(file_manager))
+            .expect("Files activation");
+        app.state
+            .installed_plugins
+            .insert(plugin.plugin_id.clone(), plugin);
+        // The reader arrived by jumping to a pinned place, so the rail owns
+        // focus at the moment the preview is pressed.
+        assert!(app.state.file_manager_locations.focus_rail());
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 120, 30));
+        let content = app
+            .state
+            .view
+            .file_manager_trail
+            .detail_panel
+            .as_ref()
+            .expect("detail panel")
+            .content_rect;
+
+        app.handle_file_manager_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            content.x + 2,
+            content.y + 1,
+        ));
+
+        assert_eq!(
+            app.state.file_manager_locations.focus,
+            crate::app::FileManagerLocationsFocus::Trail,
+            "the preview press takes Trail ownership with it"
+        );
+        let intent = app
+            .state
+            .request_file_manager_context_action
+            .clone()
+            .expect("a text preview press queues the editor intent");
+        let file_manager = app.state.file_manager.as_ref().expect("file manager open");
+        let action_bar = crate::ui::compute_file_manager_action_bar_model(
+            file_manager,
+            &app.state.file_manager_clipboard,
+            false,
+            app.state.file_manager_locations.focus,
+        );
+        let model = FileManagerContextMenuModel::from_action_bar_with_plugins(
+            &action_bar,
+            &crate::app::api::plugins::file_manifest_actions(&app.state.installed_plugins),
+        )
+        .expect("a selection the boundary can revalidate");
+        assert_eq!(model.paths, intent.paths);
+        assert!(
+            model
+                .items
+                .iter()
+                .any(|item| item.action == intent.action && item.enabled),
+            "the queued intent must still be an enabled entry when the boundary rechecks it"
+        );
+    }
+
+    // TP-FM-FOCUS-02: a press on the header claims Trail ownership without
+    // firing the verb underneath it. Coming from the rail every header button
+    // is drawn disabled, so acting on that first press would run a verb the
+    // reader was looking at greyed out — Delete included. Focusing instead
+    // lights the bar and the second press acts. Before this the bar was simply
+    // inert after a rail jump: pressing it did nothing, with nothing to say why.
+    //
+    // The bar here is the REAL prepared one from `compute_view`, not a
+    // hand-built all-enabled stand-in: the disabled state is the whole
+    // premise, so a fixture that pretends otherwise would pass either way.
+    #[test]
+    fn header_press_from_the_locations_rail_claims_focus_before_acting() {
+        let td = TempDir::new("header-press-rail-focus");
+        td.file("selected.txt");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        assert!(app
+            .state
+            .file_manager
+            .as_mut()
+            .expect("open FM")
+            .replace_selection(0));
+        assert!(app.state.file_manager_locations.focus_rail());
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 120, 30));
+
+        let copy_seat = app
+            .state
+            .view
+            .file_manager_header_action_areas
+            .iter()
+            .find(|area| area.action == FileManagerHeaderAction::Copy)
+            .expect("the header draws a copy seat")
+            .rect;
+        assert!(
+            !app.state
+                .view
+                .file_manager_action_bar
+                .as_ref()
+                .expect("a prepared action bar")
+                .action_state(FileManagerHeaderAction::Copy)
+                .expect("a prepared copy state")
+                .enabled,
+            "the premise: with the rail owning focus the reader sees a disabled bar"
+        );
+
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                copy_seat.x,
+                copy_seat.y,
+            )),
+            FileManagerMouseDispatch::Consumed,
+            "the focusing press does not fire the verb under the pointer"
+        );
+        assert_eq!(
+            app.state.file_manager_locations.focus,
+            crate::app::FileManagerLocationsFocus::Trail,
+            "the header press takes Trail ownership with it"
+        );
+
+        // The app renders between events; that is what lights the bar.
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 120, 30));
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                copy_seat.x,
+                copy_seat.y,
+            )),
+            FileManagerMouseDispatch::HeaderAction(FileManagerHeaderAction::Copy),
+            "with the bar owned, the next press acts"
+        );
+    }
+
+    // TP-FEDIT-03: a PDF page is a preview like any other. Clicking it answers
+    // with the plugin viewer when one claims `pdf` — the same popup a picture
+    // and a workbook get — and only falls back to the built-in enlarge overlay
+    // when nothing matches. Without this the one file type herdr renders as
+    // pixels AND paginates was the one type the click could not open.
+    #[test]
+    fn clicking_a_pdf_preview_queues_the_viewer_action() {
+        let (mut app, _fixture, indicator) = runtime_app_with_pdf_preview(4, 10);
+
+        let plugin_td = TempDir::new("pdf-preview-view-manifest");
+        let manifest = plugin_td.root.join("herdr-plugin.toml");
+        fs::write(
+            &manifest,
+            r#"
+id = "example.view"
+name = "Example View"
+version = "0.1.0"
+min_herdr_version = "0.6.10"
+
+[[actions]]
+id = "a-view-here"
+title = "View Here"
+contexts = ["file"]
+file_extensions = ["pdf", "png"]
+command = ["view"]
+"#,
+        )
+        .expect("write plugin manifest");
+        let plugin =
+            crate::app::api::plugins::load_plugin_manifest(&manifest.display().to_string(), true)
+                .expect("valid plugin manifest");
+        app.state
+            .installed_plugins
+            .insert(plugin.plugin_id.clone(), plugin);
+
+        let content = crate::kitty_graphics::file_manager_raster_content_area(&app.state)
+            .expect("raster content area");
+        app.handle_file_manager_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            content.x,
+            content.y,
+        ));
+
+        let intent = app
+            .state
+            .request_file_manager_context_action
+            .as_ref()
+            .expect("a pdf preview click queues the viewer intent");
+        assert_eq!(
+            intent.action,
+            FileManagerContextMenuAction::Plugin {
+                plugin_id: "example.view".into(),
+                action_id: "a-view-here".into(),
+            }
+        );
+        assert!(
+            app.state.preview_viewer.is_none(),
+            "the plugin popup answers instead of the built-in overlay"
+        );
+
+        // The arrows keep their meaning: a page turn is not a request to open
+        // the document somewhere else.
+        app.state.request_file_manager_context_action = None;
+        let next = indicator.next.expect("next arrow mid-document");
+        app.handle_file_manager_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            next.x,
+            next.y,
+        ));
+        assert!(app.state.request_file_manager_context_action.is_none());
+        assert_eq!(previewed_pdf_page(&app.state), 5);
+    }
+
+    // TP-FEDIT-02: a text preview with no matching plugin action swallows the
+    // click rather than queuing an intent that cannot run. Nothing happening
+    // is honest; an intent for an absent editor fails somewhere the reader
+    // cannot see.
+    #[test]
+    fn clicking_a_text_preview_without_an_editor_queues_nothing() {
+        let td = TempDir::new("text-preview-noedit");
+        let source_path = td.root.join("notes.md");
+        fs::write(&source_path, b"# baslik\n").expect("write fixture");
+        let mut file_manager = FmState::new(&td.root);
+        file_manager.preview_generation = 1;
+        file_manager.preview =
+            crate::fm::FmPreview::File(crate::fm::FmFilePreview::Text(crate::fm::TextPreview {
+                source_path,
+                content: "# baslik\n".to_owned(),
+                truncated: false,
+                highlighted: None,
+            }));
+        file_manager.sync_trail_bridge_for_test();
+
+        let mut app = super::super::app_for_mouse_test();
+        app.state
+            .try_open_file_manager_with(|_| Some(file_manager))
+            .expect("Files activation");
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 120, 30));
+        let content = app
+            .state
+            .view
+            .file_manager_trail
+            .detail_panel
+            .as_ref()
+            .expect("detail panel")
+            .content_rect;
+
+        app.handle_file_manager_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            content.x + 2,
+            content.y + 1,
+        ));
+        assert!(app.state.request_file_manager_context_action.is_none());
+    }
+
+    fn trail_row_by_path(app: &crate::app::App, path: &std::path::Path) -> crate::ui::TrailRowView {
+        app.state
+            .view
+            .file_manager_trail
+            .columns
+            .iter()
+            .flat_map(|column| &column.rows)
+            .find(|row| row.entry_path == path)
+            .cloned()
+            .expect("exact Trail row")
+    }
+
+    fn trail_row_by_index(app: &crate::app::App, entry_index: usize) -> crate::ui::TrailRowView {
+        app.state
+            .view
+            .file_manager_trail
+            .columns
+            .iter()
+            .flat_map(|column| &column.rows)
+            .find(|row| row.entry_index == entry_index)
+            .cloned()
+            .expect("indexed Trail row")
+    }
+
+    fn trail_action(
+        app: &crate::app::App,
+        entry_index: usize,
+        action: FileManagerRowAction,
+    ) -> FileManagerRowActionArea {
+        trail_row_by_index(app, entry_index)
+            .actions
+            .into_iter()
+            .find(|area| area.action == action)
+            .expect("exact Trail row action")
+    }
+
+    fn reproject_runtime_trail(app: &mut crate::app::App, width: u16, height: u16) {
+        let files_generation = app
+            .state
+            .stage
+            .active_instance_generation()
+            .expect("active Files generation");
+        let mut trail = crate::ui::project_trail_view(
+            Rect::new(26, 2, width, height),
+            &app.state.file_manager.as_ref().expect("open FM").trail,
+            &app.state
+                .file_manager
+                .as_ref()
+                .expect("open FM")
+                .trail_snapshots,
+            &[20],
+            true,
+            false,
+        );
+        trail.files_generation = Some(files_generation);
+        app.state.view.file_manager_trail = trail;
+    }
+
+    fn install_row_actions(app: &mut crate::app::App, entry_idx: usize) -> PathBuf {
+        let entry_path = app
+            .state
+            .file_manager
+            .as_ref()
+            .and_then(|file_manager| file_manager.entries.get(entry_idx))
+            .expect("row-action fixture entry")
+            .path
+            .clone();
+        let row = app
+            .state
+            .view
+            .file_manager_row_areas
+            .iter_mut()
+            .find(|row| row.entry_idx == entry_idx)
+            .expect("row-action fixture row");
+        row.rect.width = 17;
+        app.state.view.file_manager_row_action_areas = FileManagerRowAction::ALL
+            .into_iter()
+            .enumerate()
+            .map(|(action_idx, action)| FileManagerRowActionArea {
+                rect: Rect::new(43 + action_idx as u16, row.rect.y, 1, 1),
+                entry_idx,
+                entry_path: entry_path.clone(),
+                action,
+            })
+            .collect();
+        entry_path
+    }
+
+    fn install_focused_agent(app: &mut crate::app::App) -> crate::terminal::TerminalId {
+        let workspace = crate::workspace::Workspace::test_new("fm-agent-handoff");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace
+            .terminal_id(pane_id)
+            .expect("focused agent terminal id")
+            .clone();
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("focused agent terminal state")
+            .set_agent_name("fm-target".into());
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        terminal_id
+    }
+
+    fn mouse(kind: MouseEventKind, col: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn mouse_with_modifiers(
+        kind: MouseEventKind,
+        col: u16,
+        row: u16,
+        modifiers: KeyModifiers,
+    ) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: col,
+            row,
+            modifiers,
+        }
+    }
+
+    fn install_wide_header_actions(app: &mut crate::app::App) {
+        app.state.view.terminal_area = Rect::new(26, 0, 60, 6);
+        app.state.view.file_manager_header_action_areas = vec![
+            FileManagerHeaderActionArea {
+                rect: Rect::new(50, 0, 6, 1),
+                action: FileManagerHeaderAction::Copy,
+            },
+            FileManagerHeaderActionArea {
+                rect: Rect::new(57, 0, 7, 1),
+                action: FileManagerHeaderAction::Paste,
+            },
+            FileManagerHeaderActionArea {
+                rect: Rect::new(65, 0, 12, 1),
+                action: FileManagerHeaderAction::NewFolder,
+            },
+            FileManagerHeaderActionArea {
+                rect: Rect::new(78, 0, 8, 1),
+                action: FileManagerHeaderAction::Delete,
+            },
+        ];
+        app.state.view.file_manager_action_bar = Some(FileManagerActionBarModel {
+            selection: None,
+            clipboard_count: 0,
+            actions: FileManagerHeaderAction::ALL.map(|action| FileManagerActionState {
+                action,
+                enabled: true,
+                disabled_reason: None,
+            }),
+        });
+    }
+
+    /// The temp directory is returned alongside the state so the fixture is
+    /// removed when the test ends rather than leaked for the run's lifetime.
+    fn app_with_pdf_preview(page: usize, total_pages: usize) -> (AppState, TempDir) {
+        let td = TempDir::new("pdf-pages");
+        td.file("manual.pdf");
+        let mut app = app_with_fm(FmState::new(&td.root));
+        let file_manager = app.file_manager.as_mut().expect("open FM");
+        let source_path = file_manager.cwd.join("manual.pdf");
+        file_manager.preview =
+            crate::fm::FmPreview::File(crate::fm::FmFilePreview::Pdf(crate::fm::FmPdfPreview {
+                source_path,
+                generation: 1,
+                page,
+                total_pages: Some(total_pages),
+                state: crate::fm::FmPdfPreviewState::Ready {
+                    target: crate::fm::ImagePreviewTarget {
+                        width_px: 40,
+                        height_px: 40,
+                    },
+                    prepared: crate::fm::PreparedImagePreview {
+                        width: 1,
+                        height: 1,
+                        data_fingerprint: 3,
+                        rgba: vec![0, 0, 0, 255],
+                    },
+                },
+            }));
+        (app, td)
+    }
+
+    fn previewed_pdf_page(app: &AppState) -> usize {
+        match &app.file_manager.as_ref().expect("open FM").preview {
+            crate::fm::FmPreview::File(crate::fm::FmFilePreview::Pdf(preview)) => preview.page,
+            other => panic!("expected a pdf preview, found {other:?}"),
+        }
+    }
+
+    // TP-FPDF-21: PageDown/PageUp turn the previewed PDF's pages. They are
+    // chosen over the arrows because Left/Right already move between Trail
+    // columns: taking them would mean a selected PDF makes the file manager
+    // stop navigating directories.
+    #[test]
+    fn page_keys_turn_the_previewed_pdf() {
+        let (mut app, _fixture) = app_with_pdf_preview(0, 3);
+
+        handle_file_manager_key(&mut app, key(KeyCode::PageDown));
+        assert_eq!(previewed_pdf_page(&app), 1);
+        handle_file_manager_key(&mut app, key(KeyCode::PageUp));
+        assert_eq!(previewed_pdf_page(&app), 0);
+    }
+
+    // TP-FPDF-22: the same keys over a non-PDF preview change nothing at all,
+    // including the Trail cursor they must never be confused with.
+    #[test]
+    fn page_keys_are_inert_without_a_pdf_preview() {
+        let td = TempDir::new("pdf-pages-inert");
+        td.file("a.txt");
+        td.file("b.txt");
+        let mut app = app_with_fm(FmState::new(&td.root));
+        let before = app.file_manager.as_ref().expect("open FM").clone();
+
+        handle_file_manager_key(&mut app, key(KeyCode::PageDown));
+        handle_file_manager_key(&mut app, key(KeyCode::PageUp));
+
+        let after = app.file_manager.as_ref().expect("open FM");
+        assert_eq!(after.cursor, before.cursor);
+        assert_eq!(after.preview, before.preview);
+    }
+
+    // TP-FVIEW-03: Enter enlarges a picture. Directories keep their meaning,
+    // so the two never compete for the same selection.
+    #[test]
+    fn enter_opens_the_viewer_on_a_picture() {
+        let (mut app, _fixture) = app_with_pdf_preview(0, 3);
+        assert_eq!(
+            handle_file_manager_key(&mut app, key(KeyCode::Enter)),
+            FileManagerKeyDispatch::Consumed
+        );
+        assert_eq!(app.mode, Mode::PreviewViewer);
+        assert_eq!(
+            app.preview_viewer
+                .as_ref()
+                .map(|viewer| viewer.source_path.clone()),
+            Some(
+                app.file_manager
+                    .as_ref()
+                    .expect("open FM")
+                    .cwd
+                    .join("manual.pdf")
+            )
+        );
+    }
+
+    // TP-FVIEW-04: `q` closes the viewer, not the application. This is the
+    // tier that gets forgotten: a suppressed global that must be gated on "no
+    // viewer open", or the first `q` inside the viewer quits herdr.
+    #[test]
+    fn q_and_esc_close_the_viewer_rather_than_the_app() {
+        for closing in [KeyCode::Char('q'), KeyCode::Esc] {
+            let (mut app, _fixture) = app_with_pdf_preview(0, 3);
+            handle_file_manager_key(&mut app, key(KeyCode::Enter));
+            assert_eq!(app.mode, Mode::PreviewViewer);
+
+            handle_preview_viewer_key(&mut app, key(closing));
+
+            assert!(
+                app.preview_viewer.is_none(),
+                "{closing:?} closes the viewer"
+            );
+            assert_ne!(app.mode, Mode::PreviewViewer);
+            assert!(
+                app.file_manager.is_some(),
+                "{closing:?} must not close the file manager underneath"
+            );
+        }
+    }
+
+    // TP-FVIEW-05: while the viewer is up it owns the keyboard, so navigation
+    // keys do not move the selection behind it. Without this the file manager
+    // scrolls under a picture the user cannot see moving.
+    #[test]
+    fn the_viewer_owns_the_keyboard_while_it_is_open() {
+        let (mut app, _fixture) = app_with_pdf_preview(0, 3);
+        handle_file_manager_key(&mut app, key(KeyCode::Enter));
+        let before = app.file_manager.as_ref().expect("open FM").clone();
+
+        assert!(
+            app.blocking_overlay_active(),
+            "the viewer routes as a topmost overlay"
+        );
+        for code in [KeyCode::Down, KeyCode::Char('j'), KeyCode::Right] {
+            handle_preview_viewer_key(&mut app, key(code));
+        }
+
+        let after = app.file_manager.as_ref().expect("open FM");
+        assert_eq!(after.cursor, before.cursor);
+        assert_eq!(after.trail.active_col(), before.trail.active_col());
+        assert_eq!(app.mode, Mode::PreviewViewer, "unknown keys are swallowed");
+    }
+
+    // TP-FVIEW-06: page keys keep working inside the viewer, which is the
+    // point of enlarging a PDF in the first place.
+    #[test]
+    fn page_keys_still_turn_pages_inside_the_viewer() {
+        let (mut app, _fixture) = app_with_pdf_preview(0, 3);
+        handle_file_manager_key(&mut app, key(KeyCode::Enter));
+
+        handle_preview_viewer_key(&mut app, key(KeyCode::PageDown));
+        assert_eq!(previewed_pdf_page(&app), 1);
+        handle_preview_viewer_key(&mut app, key(KeyCode::PageUp));
+        assert_eq!(previewed_pdf_page(&app), 0);
+    }
+
+    // TP-FVIEW-07: a preview drawn from cells has nothing to enlarge, and
+    // opening the viewer on one would produce a full frame with no picture in
+    // it. Enter keeps its other meanings there.
+    #[test]
+    fn the_viewer_refuses_previews_that_have_no_picture() {
+        let td = TempDir::new("viewer-refusal");
+        td.file("notes.txt");
+        let mut app = app_with_fm(FmState::new(&td.root));
+        assert!(!open_preview_viewer(&mut app));
+        assert!(app.preview_viewer.is_none());
+        assert_ne!(app.mode, Mode::PreviewViewer);
+
+        // An undecodable image is a picture herdr cannot show, which is the
+        // same empty frame by a different route.
+        let file_manager = app.file_manager.as_mut().expect("open FM");
+        file_manager.preview = crate::fm::FmPreview::File(crate::fm::FmFilePreview::Image(
+            crate::fm::FmImagePreview {
+                source_path: td.root.join("drawing.svg"),
+                generation: 1,
+                state: crate::fm::FmImagePreviewState::Unsupported,
+            },
+        ));
+        assert!(!open_preview_viewer(&mut app));
+        assert!(app.preview_viewer.is_none());
+    }
+
+    // TP-A3.5: j/k (and arrows) move the cursor within the list.
+    #[test]
+    fn jk_moves_cursor() {
+        let td = TempDir::new("jk");
+        td.file("a");
+        td.file("b");
+        td.file("c");
+        let mut app = app_with_fm(FmState::new(&td.root));
+
+        handle_file_manager_key(&mut app, key(KeyCode::Char('j')));
+        assert_eq!(app.file_manager.as_ref().unwrap().cursor, 1);
+        handle_file_manager_key(&mut app, key(KeyCode::Down));
+        assert_eq!(app.file_manager.as_ref().unwrap().cursor, 2);
+        handle_file_manager_key(&mut app, key(KeyCode::Char('k')));
+        assert_eq!(app.file_manager.as_ref().unwrap().cursor, 1);
+    }
+
+    // TP-A3.6 / TP-TRAIL-T7-INPUT-03: Enter opens the selected Trail branch;
+    // TP-TRAIL-REVEAL-01: the reader's own navigation away disarms the
+    // reveal — Left/Backspace and a manual horizontal pan both put the
+    // window back under the reader's control.
+    #[test]
+    fn backing_out_and_a_manual_pan_disarm_the_reveal() {
+        let td = TempDir::new("reveal-disarm");
+        td.dir("sub");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        app.state
+            .file_manager
+            .as_mut()
+            .expect("open FM")
+            .miller
+            .horizontal
+            .reveal_child = true;
+        app.handle_focused_file_manager_key(key(KeyCode::Left));
+        assert!(
+            !app.state
+                .file_manager
+                .as_ref()
+                .expect("open FM")
+                .miller
+                .horizontal
+                .reveal_child,
+            "Left disarms the reveal"
+        );
+
+        app.state
+            .file_manager
+            .as_mut()
+            .expect("open FM")
+            .miller
+            .horizontal
+            .reveal_child = true;
+        let _ =
+            app.handle_miller_horizontal_scroll(MouseEventKind::ScrollRight, KeyModifiers::NONE);
+        let horizontal = &app
+            .state
+            .file_manager
+            .as_ref()
+            .expect("open FM")
+            .miller
+            .horizontal;
+        if !horizontal.follow_active {
+            assert!(
+                !horizontal.reveal_child,
+                "a manual pan that landed disarms the reveal"
+            );
+        } else {
+            // Nothing to pan in this fixture is a fixture problem, not a
+            // pass: the disarm must have something to measure.
+            panic!("the fixture must give the wheel something to pan");
+        }
+    }
+
+    // Backspace moves focus to its exact parent column without filesystem I/O.
+    #[test]
+    fn enter_and_backspace_navigate_directories() {
+        let td = TempDir::new("nav");
+        td.dir("sub");
+        fs::write(td.root.join("sub").join("inner"), b"x").expect("write inner");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+
+        app.handle_focused_file_manager_key(key(KeyCode::Left));
+        app.handle_focused_file_manager_key(key(KeyCode::Enter));
+        assert!(app.complete_file_manager_io_for_test());
+        let file_manager = app.state.file_manager.as_ref().expect("open FM");
+        assert_eq!(
+            file_manager.trail.active_col(),
+            1,
+            "enter focuses the opened child column"
+        );
+        assert_eq!(
+            file_manager.trail.cols()[1].directory,
+            td.root.join("sub"),
+            "enter opens the exact selected directory"
+        );
+
+        app.handle_focused_file_manager_key(key(KeyCode::Backspace));
+        assert_eq!(
+            app.state
+                .file_manager
+                .as_ref()
+                .expect("open FM")
+                .trail
+                .active_col(),
+            0,
+            "backspace focuses the parent Trail column"
+        );
+    }
+
+    // TP-TRAIL-T7-INPUT-03 / TP-FMN-IO-03: the pure input reducer emits an
+    // exact bounded-worker intent and performs no directory activation itself.
+    #[test]
+    fn keyboard_enter_emits_exact_trail_intent_without_input_loop_mutation() {
+        let td = TempDir::new("typed-keyboard-navigation");
+        td.dir("child");
+        let child = td.root.join("child");
+        let mut state = app_with_fm(FmState::new(&td.root));
+        let _ = handle_file_manager_key(&mut state, key(KeyCode::Left));
+        let before = state.file_manager.as_ref().expect("open FM").clone();
+
+        let dispatch = handle_file_manager_key(&mut state, key(KeyCode::Enter));
+
+        assert!(matches!(
+            dispatch,
+            FileManagerKeyDispatch::ActivateDirectory {
+                trail_col: 0,
+                entry_index: 0,
+                ref expected_path,
+            } if expected_path == &child
+        ));
+        let after = state.file_manager.as_ref().expect("open FM");
+        assert_eq!(after.trail, before.trail, "input dispatch cannot branch");
+        assert_eq!(after.trail_snapshots, before.trail_snapshots);
+        assert_eq!(after.cwd, before.cwd);
+        assert_eq!(after.entries, before.entries);
+        assert_eq!(after.cursor, before.cursor);
+        assert_eq!(after.directory_generation, before.directory_generation);
+        assert_eq!(after.preview_generation, before.preview_generation);
+    }
+
+    // P5 RED: '.' emits one exact hidden-refresh intent without reading disk
+    // or mutating the Files model in the input layer.
+    #[test]
+    fn dot_emits_hidden_refresh_request_without_mutating_files() {
+        let td = TempDir::new("hidden");
+        td.file("shown");
+        td.file(".secret");
+        let mut app = app_with_fm(FmState::new(&td.root));
+        let before = app.file_manager.as_ref().expect("open FM").clone();
+
+        let dispatch = handle_file_manager_key(&mut app, key(KeyCode::Char('.')));
+
+        let FileManagerKeyDispatch::Refresh(request) = dispatch else {
+            panic!("dot must emit one typed hidden-refresh request");
+        };
+        assert_eq!(
+            request.reason,
+            crate::fm::FmCurrentRefreshReason::ToggleHidden
+        );
+        assert_eq!(request.source_directory, td.root);
+        assert_eq!(request.source_show_hidden, before.show_hidden);
+        assert_eq!(request.target_show_hidden, !before.show_hidden);
+        assert_eq!(
+            request.files_generation,
+            app.stage
+                .active_instance_generation()
+                .expect("active Files generation")
+        );
+        let after = app.file_manager.as_ref().expect("open FM");
+        assert_eq!(after.entries, before.entries);
+        assert_eq!(after.cursor, before.cursor);
+        assert_eq!(after.show_hidden, before.show_hidden);
+        assert_eq!(after.directory_generation, before.directory_generation);
+        assert_eq!(after.preview_generation, before.preview_generation);
+        assert_eq!(after.miller, before.miller);
+    }
+
+    #[test]
+    fn app_hidden_toggle_applies_once_and_rejects_replay() {
+        let td = TempDir::new("hidden-app-adapter");
+        td.file("shown");
+        td.file(".secret");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        let before = app.state.file_manager.as_ref().expect("open FM").clone();
+        let dispatch = handle_file_manager_key(&mut app.state, key(KeyCode::Char('.')));
+        let FileManagerKeyDispatch::Refresh(request) = dispatch else {
+            panic!("dot must emit hidden refresh");
+        };
+        let stale_replay = request.clone();
+
+        assert_eq!(
+            app.execute_file_manager_current_refresh(*request),
+            Some(false)
+        );
+        assert!(app.complete_file_manager_io_for_test());
+        let toggled = app.state.file_manager.as_ref().expect("open FM");
+        assert!(toggled.show_hidden);
+        assert_eq!(toggled.entries.len(), 2);
+        assert_eq!(
+            toggled.directory_generation,
+            before.directory_generation + 1
+        );
+        assert_eq!(toggled.preview_generation, before.preview_generation + 1);
+        let once = toggled.clone();
+
+        assert_eq!(
+            app.execute_file_manager_current_refresh(*stale_replay),
+            Some(false),
+            "submission itself is non-blocking; stale apply is rejected later"
+        );
+        assert!(!app.complete_file_manager_io_for_test());
+        let after_replay = app.state.file_manager.as_ref().expect("open FM");
+        assert_eq!(after_replay.entries, once.entries);
+        assert_eq!(after_replay.show_hidden, once.show_hidden);
+        assert_eq!(after_replay.directory_generation, once.directory_generation);
+        assert_eq!(after_replay.preview_generation, once.preview_generation);
+
+        let dispatch = handle_file_manager_key(&mut app.state, key(KeyCode::Char('.')));
+        let FileManagerKeyDispatch::Refresh(request) = dispatch else {
+            panic!("second dot must emit a fresh hidden refresh");
+        };
+        assert_eq!(
+            request.reason,
+            crate::fm::FmCurrentRefreshReason::ToggleHidden
+        );
+        assert!(request.source_show_hidden);
+        assert!(!request.target_show_hidden);
+        assert_eq!(
+            app.execute_file_manager_current_refresh(*request),
+            Some(false)
+        );
+        assert!(app.complete_file_manager_io_for_test());
+        let restored = app.state.file_manager.as_ref().expect("open FM");
+        assert!(!restored.show_hidden);
+        assert_eq!(restored.entries.len(), 1);
+        assert_eq!(
+            restored.directory_generation,
+            before.directory_generation + 2
+        );
+        assert_eq!(restored.preview_generation, before.preview_generation + 2);
+    }
+
+    // TP-A3.8: Esc and q must NOT close the file manager. The retired contract
+    // made Esc close the surface, so the Esc that closed an editor popup could
+    // land here a beat later and silently kill the file manager.
+    // Esc keeps a local job — clearing the explicit multi-selection.
+    #[test]
+    fn esc_and_q_do_not_close() {
+        let td = TempDir::new("close");
+        td.file("a");
+
+        let mut app = app_with_fm(FmState::new(&td.root));
+        if let Some(fm) = app.file_manager.as_mut() {
+            assert!(fm.replace_selection(0));
+        }
+        handle_file_manager_key(&mut app, key(KeyCode::Esc));
+        let fm = app.file_manager.as_ref().expect("esc keeps the surface");
+        assert!(
+            fm.multi_selection_paths().is_empty(),
+            "esc clears the explicit selection instead"
+        );
+
+        handle_file_manager_key(&mut app, key(KeyCode::Char('q')));
+        assert!(
+            app.file_manager.is_some(),
+            "q keeps the file manager open too"
+        );
+    }
+
+    // TP-C4.4-CANCEL: Esc is the user cancellation route while an operation
+    // is running. It must emit a typed, repeatable intent without closing the
+    // file manager; the App/worker boundary owns the cancellation side effect.
+    #[test]
+    fn esc_emits_repeatable_operation_cancel_intent_while_running() {
+        let td = TempDir::new("cancel-running-operation");
+        td.file("source.txt");
+        let source = td.root.join("source.txt");
+        let mut app = app_with_fm(FmState::new(&td.root));
+        app.file_manager_operation = Some(crate::app::state::FileManagerOperationState {
+            generation: 7,
+            kind: crate::app::state::FileManagerOperationKind::Copy,
+            destination_directory: td.root.clone(),
+            total_items: 1,
+            completed_items: 0,
+            failed_items: 0,
+            status: crate::app::state::FileManagerOperationStatus::Running,
+            items: vec![crate::app::state::FileManagerOperationItemState {
+                path: source,
+                recovery_path: None,
+                status: crate::app::state::FileManagerOperationItemStatus::Running,
+            }],
+        });
+
+        assert_eq!(
+            handle_file_manager_key(&mut app, key(KeyCode::Esc)),
+            FileManagerKeyDispatch::CancelOperation
+        );
+        assert_eq!(
+            handle_file_manager_key(&mut app, key(KeyCode::Esc)),
+            FileManagerKeyDispatch::CancelOperation
+        );
+        assert!(app.file_manager.is_some());
+    }
+
+    // TP-A3.3-DISPATCH / TP-TRAIL-T7-INPUT-02: one left press on an exact
+    // Trail row selects its absolute entry and refreshes the operation preview.
+    #[test]
+    fn single_click_selects_current_row_and_refreshes_preview() {
+        let td = TempDir::new("mouse-single");
+        td.dir("alpha-dir");
+        td.file("beta.txt");
+        let file_manager =
+            FmState::open_trail_to(&td.root, &td.root, false).expect("fresh Trail root");
+        let mut app = runtime_app_with_fm(file_manager);
+        let target = trail_row_by_path(&app, &td.root.join("beta.txt"));
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            target.name_rect.x,
+            target.name_rect.y,
+        ));
+
+        let fm = app.state.file_manager.as_ref().expect("file manager open");
+        assert_eq!(fm.cursor, 1);
+        assert_eq!(
+            fm.selected().map(|entry| entry.name.as_str()),
+            Some("beta.txt")
+        );
+        assert!(matches!(fm.preview, crate::fm::FmPreview::File(_)));
+    }
+
+    // TP-FFO-MOUSE-01 / TP-FFO-KEY-01 / TP-FFO-IO-01: an exact live Trail
+    // row click transfers the top-level Files input owner. The next vertical
+    // key must therefore move inside that Trail column without moving Rail
+    // cursor authority or performing another directory read.
+    #[test]
+    fn ffo_trail_click_transfers_focus_and_next_down_stays_in_clicked_column() {
+        let td = TempDir::new("ffo-trail-click-owner");
+        for name in ["00.txt", "01.txt", "02.txt"] {
+            td.file(name);
+        }
+        td.set_equal_modified(&["00.txt", "01.txt", "02.txt"]);
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        install_fcl_location_model(&mut app, std::slice::from_ref(&td.root));
+        compute_view(&mut app.state, Rect::new(0, 0, 100, 16));
+        assert!(app
+            .state
+            .file_manager_locations
+            .activate_location(&td.root, &app.state.file_manager_locations_model));
+        let files_generation = app
+            .state
+            .stage
+            .active_instance_generation()
+            .expect("active Files generation");
+        let model_revision = app.state.file_manager_locations_model.revision();
+        let io_generation = 31;
+        app.state.request_file_manager_location_navigation =
+            Some(FileManagerLocationNavigationRequest {
+                path: td.root.clone(),
+                intent: FileManagerLocationNavigationIntent::FollowPreview,
+            });
+        app.state.file_manager_locations.begin_load(
+            td.root.clone(),
+            files_generation,
+            model_revision,
+            io_generation,
+            FileManagerLocationNavigationIntent::FollowPreview,
+        );
+        let rail_cursor_before = app.state.file_manager_locations.cursor.clone();
+        let target = trail_row_by_path(&app, &td.root.join("00.txt"));
+
+        let ((mouse_dispatch, key_dispatch), profile) =
+            crate::render_prof::observe_for_test(|| {
+                let mouse_dispatch = app.handle_file_manager_mouse(mouse(
+                    MouseEventKind::Down(MouseButton::Left),
+                    target.name_rect.x,
+                    target.name_rect.y,
+                ));
+                assert_eq!(
+                    app.state.file_manager_locations.focus,
+                    crate::app::FileManagerLocationsFocus::Trail
+                );
+                let key_dispatch = handle_file_manager_key(&mut app.state, key(KeyCode::Down));
+                (mouse_dispatch, key_dispatch)
+            });
+
+        assert_eq!(mouse_dispatch, FileManagerMouseDispatch::Consumed);
+        assert_eq!(key_dispatch, FileManagerKeyDispatch::Consumed);
+        assert_eq!(
+            app.state
+                .file_manager
+                .as_ref()
+                .expect("open FM")
+                .selected()
+                .map(|entry| entry.name.as_str()),
+            Some("01.txt")
+        );
+        assert_eq!(
+            app.state.file_manager_locations.cursor, rail_cursor_before,
+            "Trail-owned Down cannot move the Locations Rail cursor"
+        );
+        assert!(app.state.request_file_manager_location_navigation.is_none());
+        assert!(app.state.file_manager_locations.pending.is_none());
+        assert!(!app.state.file_manager_locations.is_pending_root(
+            &td.root,
+            files_generation,
+            model_revision,
+            io_generation,
+        ));
+        assert_eq!(profile.counter("fm.filesystem.read"), 0);
+    }
+
+    // TP-DCLICK-01/02/04/06/07 RED: primary click is exact cursor intent,
+    // including for directories. It transfers top-level ownership and paints
+    // the clicked row in its owning column, but only explicit Right/Enter may
+    // transfer focus into a child column. The following vertical key therefore
+    // advances exactly one row inside the clicked owner without serial I/O.
+    #[test]
+    fn directory_primary_click_keeps_vertical_navigation_in_the_owner_column() {
+        let td = TempDir::new("directory-click-owner-focus");
+        for name in ["00-alpha", "01-bravo", "02-current"] {
+            td.dir(name);
+            td.file(&format!("{name}/00-inside.txt"));
+        }
+        td.set_equal_modified(&["00-alpha", "01-bravo", "02-current"]);
+        let current = td.root.join("02-current");
+        let bravo = td.root.join("01-bravo");
+        let file_manager =
+            FmState::open_trail_to(&td.root, &current, false).expect("open resident child Trail");
+        let mut app = runtime_app_with_fm(file_manager);
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        let frame = Rect::new(0, 0, 120, 16);
+        compute_view(&mut app.state, frame);
+        let target = trail_row_by_path(&app, &bravo);
+        assert_eq!(target.trail_index, 0, "fixture clicks the parent column");
+
+        let (dispatch, profile) = crate::render_prof::observe_for_test(|| {
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                target.name_rect.x,
+                target.name_rect.y,
+            ))
+        });
+
+        assert_eq!(dispatch, FileManagerMouseDispatch::Consumed);
+        assert_eq!(profile.counter("fm.filesystem.read"), 0);
+        assert_eq!(
+            app.state.file_manager_locations.focus,
+            crate::app::FileManagerLocationsFocus::Trail
+        );
+        {
+            let clicked = app.state.file_manager.as_ref().expect("open FM");
+            assert_eq!(clicked.trail.active_col(), target.trail_index);
+            assert_eq!(
+                clicked.trail.cursor_path_in_col(target.trail_index),
+                Some(bravo.as_path())
+            );
+            assert_eq!(
+                clicked.selected().map(|entry| entry.path.as_path()),
+                Some(bravo.as_path())
+            );
+            assert_eq!(clicked.cwd, td.root, "operations project the row owner");
+            assert_eq!(
+                clicked.trail.cols()[1].directory,
+                current,
+                "primary dispatch cannot activate or replace the resident child"
+            );
+        }
+
+        compute_view(&mut app.state, frame);
+        let clicked_column = app
+            .state
+            .view
+            .file_manager_trail
+            .columns
+            .iter()
+            .find(|column| column.trail_index == target.trail_index)
+            .expect("clicked owner column remains visible");
+        assert_eq!(
+            clicked_column.selected_entry,
+            Some(target.entry_index),
+            "render projection must paint the exact clicked directory row"
+        );
+
+        let key_dispatch = handle_file_manager_key(&mut app.state, key(KeyCode::Down));
+        assert!(matches!(
+            key_dispatch,
+            FileManagerKeyDispatch::PreviewDirectory { .. }
+        ));
+        let after_down = app.state.file_manager.as_ref().expect("open FM");
+        assert_eq!(after_down.trail.active_col(), target.trail_index);
+        assert_eq!(
+            after_down.selected().map(|entry| entry.path.as_path()),
+            Some(current.as_path()),
+            "Down advances one row in the clicked owner column"
+        );
+    }
+
+    // TP-DCLICK-03/06 RED: bounded preview may replace the resident child
+    // behind a directory cursor, but it cannot own keyboard focus. Right is
+    // the explicit boundary crossing and highlights the child's first row in
+    // that same dispatch.
+    #[test]
+    fn directory_primary_click_requires_right_to_focus_the_prepared_child() {
+        let td = TempDir::new("directory-click-explicit-right");
+        for name in ["00-alpha", "01-bravo", "02-current"] {
+            td.dir(name);
+        }
+        td.file("01-bravo/00-first.txt");
+        td.file("01-bravo/01-second.txt");
+        td.file("02-current/00-old.txt");
+        td.set_equal_modified(&["00-alpha", "01-bravo", "02-current"]);
+        td.set_equal_modified(&["01-bravo/00-first.txt", "01-bravo/01-second.txt"]);
+        let current = td.root.join("02-current");
+        let bravo = td.root.join("01-bravo");
+        let first = bravo.join("00-first.txt");
+        let file_manager =
+            FmState::open_trail_to(&td.root, &current, false).expect("open resident child Trail");
+        let mut app = runtime_app_with_fm(file_manager);
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        compute_view(&mut app.state, Rect::new(0, 0, 120, 16));
+        let target = trail_row_by_path(&app, &bravo);
+
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                target.name_rect.x,
+                target.name_rect.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+        assert_eq!(
+            app.state
+                .file_manager
+                .as_ref()
+                .expect("open FM")
+                .trail
+                .active_col(),
+            0,
+            "click must keep owner focus before preview completion"
+        );
+        assert!(
+            app.complete_file_manager_io_for_test(),
+            "bounded directory preview applies"
+        );
+        {
+            let previewed = app.state.file_manager.as_ref().expect("open FM");
+            assert_eq!(previewed.trail.active_col(), 0);
+            assert_eq!(previewed.trail.cols()[1].directory, bravo);
+            assert_eq!(previewed.trail.cursor_path_in_col(0), Some(bravo.as_path()));
+        }
+
+        assert_eq!(
+            handle_file_manager_key(&mut app.state, key(KeyCode::Right)),
+            FileManagerKeyDispatch::Consumed
+        );
+        let entered = app.state.file_manager.as_ref().expect("open FM");
+        assert_eq!(entered.trail.active_col(), 1);
+        assert_eq!(
+            entered.selected().map(|entry| entry.path.as_path()),
+            Some(first.as_path()),
+            "Right highlights the child's first actionable row immediately"
+        );
+    }
+
+    // TP-FFO-MOUSE-02 / TP-FFO-RENDER-01 / TP-FFO-IO-01: region focus is
+    // independent of row activation. A primary click in a live empty Trail
+    // body transfers only owner state and requests one visible repaint.
+    #[test]
+    fn ffo_live_empty_trail_click_transfers_owner_without_mutating_trail() {
+        let td = TempDir::new("ffo-empty-trail-body");
+        td.dir("empty-trail");
+        td.dir("location");
+        let trail_root = td.root.join("empty-trail");
+        let location = td.root.join("location");
+        let mut app = runtime_app_with_fm(FmState::new(&trail_root));
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        install_fcl_location_model(&mut app, std::slice::from_ref(&location));
+        compute_view(&mut app.state, Rect::new(0, 0, 100, 16));
+        assert!(app
+            .state
+            .file_manager_locations
+            .activate_location(&location, &app.state.file_manager_locations_model));
+
+        let trail = app.state.view.file_manager_locations.layout.trail;
+        let probe = app
+            .state
+            .view
+            .file_manager_trail
+            .columns
+            .first()
+            .map(|column| (column.rect.x, column.rect.bottom().saturating_sub(1)))
+            .expect("live empty Trail column");
+        assert!(rect_contains(trail, probe.0, probe.1));
+        assert!(
+            crate::ui::trail_row_at(&app.state.view.file_manager_trail, probe.0, probe.1).is_none()
+        );
+        assert!(crate::ui::trail_section_header_at(
+            &app.state.view.file_manager_trail,
+            probe.0,
+            probe.1
+        )
+        .is_none());
+        let trail_before = format!(
+            "{:?}",
+            app.state.file_manager.as_ref().expect("open empty Trail")
+        );
+        let request_before = app.state.request_file_manager_location_navigation.clone();
+
+        let (dispatch, profile) = crate::render_prof::observe_for_test(|| {
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                probe.0,
+                probe.1,
+            ))
+        });
+
+        assert_eq!(dispatch, FileManagerMouseDispatch::Consumed);
+        assert_eq!(
+            app.state.file_manager_locations.focus,
+            crate::app::FileManagerLocationsFocus::Trail
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                app.state.file_manager.as_ref().expect("open empty Trail")
+            ),
+            trail_before,
+            "empty-body ownership cannot synthesize a Trail selection"
+        );
+        assert_eq!(
+            app.state.request_file_manager_location_navigation,
+            request_before
+        );
+        assert_eq!(app.file_manager_mouse_render_override, Some(true));
+        assert_eq!(profile.counter("fm.filesystem.read"), 0);
+
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                probe.0,
+                probe.1,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+        assert_eq!(app.file_manager_mouse_render_override, Some(false));
+        assert_eq!(
+            format!(
+                "{:?}",
+                app.state.file_manager.as_ref().expect("open empty Trail")
+            ),
+            trail_before
+        );
+
+        app.state.file_manager_locations.focus = crate::app::FileManagerLocationsFocus::Rail;
+        app.state.view.file_manager_locations.model_revision = app
+            .state
+            .view
+            .file_manager_locations
+            .model_revision
+            .wrapping_add(1);
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                probe.0,
+                probe.1,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+        assert_eq!(
+            app.state.file_manager_locations.focus,
+            crate::app::FileManagerLocationsFocus::Rail,
+            "stale Locations layout cannot grant Trail body authority"
+        );
+        assert_eq!(app.file_manager_mouse_render_override, None);
+    }
+
+    // TP-FFO-LIFE-01: closing Files retires both owner and async location
+    // authority in the same state transaction; reopening cannot inherit Rail.
+    #[test]
+    fn ffo_close_files_restores_trail_owner_and_retires_location_authority() {
+        let td = TempDir::new("ffo-close-owner-lifecycle");
+        td.file("00.txt");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        install_fcl_location_model(&mut app, std::slice::from_ref(&td.root));
+        assert!(app
+            .state
+            .file_manager_locations
+            .activate_location(&td.root, &app.state.file_manager_locations_model));
+        let files_generation = app
+            .state
+            .stage
+            .active_instance_generation()
+            .expect("active Files generation");
+        let model_revision = app.state.file_manager_locations_model.revision();
+        app.state.request_file_manager_location_navigation =
+            Some(FileManagerLocationNavigationRequest {
+                path: td.root.clone(),
+                intent: FileManagerLocationNavigationIntent::EnterTrail,
+            });
+        app.state.file_manager_locations.begin_load(
+            td.root.clone(),
+            files_generation,
+            model_revision,
+            41,
+            FileManagerLocationNavigationIntent::EnterTrail,
+        );
+
+        app.state.close_file_manager();
+
+        assert!(app.state.file_manager.is_none());
+        assert_eq!(
+            app.state.file_manager_locations.focus,
+            crate::app::FileManagerLocationsFocus::Trail
+        );
+        assert!(app.state.file_manager_locations.pending.is_none());
+        assert!(app.state.request_file_manager_location_navigation.is_none());
+        assert!(app.state.view.file_manager_trail.columns.is_empty());
+    }
+
+    // TP-FFO-MOUSE-04: a coordinate from a retired Trail projection cannot
+    // acquire focus, mutate selection, or emit any typed Files request.
+    #[test]
+    fn ffo_stale_trail_frame_cannot_transfer_focus() {
+        let td = TempDir::new("ffo-stale-trail-owner");
+        td.file("00.txt");
+        td.file("01.txt");
+        td.set_equal_modified(&["00.txt", "01.txt"]);
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        install_fcl_location_model(&mut app, std::slice::from_ref(&td.root));
+        compute_view(&mut app.state, Rect::new(0, 0, 100, 16));
+        assert!(app
+            .state
+            .file_manager_locations
+            .activate_location(&td.root, &app.state.file_manager_locations_model));
+        let stale = trail_row_by_path(&app, &td.root.join("01.txt"));
+        let files_generation = app
+            .state
+            .stage
+            .active_instance_generation()
+            .expect("active Files generation");
+        app.state.view.file_manager_trail.files_generation = Some(files_generation.wrapping_add(1));
+        let trail_before = format!("{:?}", app.state.file_manager.as_ref().expect("open Trail"));
+        let rail_cursor_before = app.state.file_manager_locations.cursor.clone();
+
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                stale.name_rect.x,
+                stale.name_rect.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+
+        assert_eq!(
+            app.state.file_manager_locations.focus,
+            crate::app::FileManagerLocationsFocus::Rail
+        );
+        assert_eq!(app.state.file_manager_locations.cursor, rail_cursor_before);
+        assert_eq!(
+            format!("{:?}", app.state.file_manager.as_ref().expect("open Trail")),
+            trail_before
+        );
+        assert!(app.state.request_file_manager_location_navigation.is_none());
+        assert!(app.state.request_file_manager_context_action.is_none());
+        assert!(app.state.request_file_manager_agent_handoff.is_none());
+        assert!(app.state.request_file_manager_rename.is_none());
+        assert!(app.state.request_file_manager_delete.is_none());
+    }
+
+    // TP-TRAIL-T7-INPUT-02/06: production Files input resolves the immutable
+    // Trail row, even when every legacy Miller/current-row hit projection is
+    // absent. The accepted file activation reconciles the transitional
+    // operation projection to the exact owning directory and row.
+    #[test]
+    fn mouse_activation_uses_exact_trail_row_without_legacy_geometry() {
+        let td = TempDir::new("trail-mouse-authority");
+        td.file("00.txt");
+        td.file("01.txt");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        install_focused_agent(&mut app);
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        compute_view(&mut app.state, Rect::new(0, 0, 80, 16));
+        let target = app
+            .state
+            .view
+            .file_manager_trail
+            .columns
+            .first()
+            .and_then(|column| column.rows.get(1))
+            .cloned()
+            .expect("second Trail row");
+        app.state.view.file_manager_miller = Default::default();
+        app.state.view.file_manager_row_areas.clear();
+        app.state.view.file_manager_row_action_areas.clear();
+
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                target.rect.x,
+                target.rect.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+
+        let file_manager = app.state.file_manager.as_ref().expect("open FM");
+        assert_eq!(file_manager.cwd, td.root);
+        assert_eq!(file_manager.cursor, target.entry_index);
+        assert_eq!(
+            file_manager.selected().map(|entry| &entry.path),
+            Some(&target.entry_path)
+        );
+    }
+
+    // TP-FLF-MOUSE-01 / TP-DCLICK-01: mouse directory selection keeps the
+    // exact parent row focused. Its prepared child may remain resident, but
+    // unlike explicit keyboard entry it cannot synthesize child focus.
+    #[test]
+    fn flf_mouse_directory_click_preserves_parent_focus_contract() {
+        let td = TempDir::new("flf-mouse-preserve");
+        td.dir("child");
+        let child = td.root.join("child");
+        fs::write(child.join("first.txt"), b"first").expect("child row");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        compute_view(&mut app.state, Rect::new(0, 0, 80, 16));
+        let target = trail_row_by_path(&app, &child);
+
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                target.rect.x,
+                target.rect.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+        assert!(app.complete_file_manager_io_for_test());
+
+        let file_manager = app.state.file_manager.as_ref().expect("open FM");
+        assert_eq!(file_manager.trail.active_col(), 0);
+        assert_eq!(
+            file_manager.trail.cols()[0].selected.as_deref(),
+            Some(child.as_path())
+        );
+        assert_eq!(file_manager.trail.cols()[1].selected, None);
+        assert!(file_manager.trail.cursor_override().is_none());
+        assert_eq!(
+            file_manager.active_trail_entry_identity(),
+            Some((0, 0, child, true))
+        );
+    }
+
+    // TP-TRAIL-T7-INPUT-03: Left/Right change the Trail's one active-column
+    // focus. They do not emit legacy parent-directory navigation requests.
+    #[test]
+    fn keyboard_navigation_uses_active_trail_column() {
+        let td = TempDir::new("trail-keyboard-authority");
+        td.dir("alpha");
+        fs::write(td.root.join("alpha").join("inside.txt"), b"x").expect("nested file");
+        let file_manager = FmState::open_trail_to(&td.root, &td.root.join("alpha"), false)
+            .expect("open child Trail");
+        let mut state = app_with_fm(file_manager);
+        assert_eq!(
+            state
+                .file_manager
+                .as_ref()
+                .expect("open FM")
+                .trail
+                .active_col(),
+            1,
+            "directory preview opens the child Trail column"
+        );
+
+        assert_eq!(
+            handle_file_manager_key(&mut state, key(KeyCode::Left)),
+            FileManagerKeyDispatch::Consumed
+        );
+        assert_eq!(
+            state
+                .file_manager
+                .as_ref()
+                .expect("open FM")
+                .trail
+                .active_col(),
+            0
+        );
+    }
+
+    // TP-FMH-LEFT-01/02 + TP-FMH-STEP-01 + TP-FLF-FOCUS-01: Left is pure
+    // owner focus. Each event crosses one resident edge; the first event past
+    // the root transfers to Rail, where another Left is render-neutral.
+    #[test]
+    fn left_arrow_moves_one_column_per_event_and_transfers_to_rail_at_root() {
+        let td = TempDir::new("horizontal-left-step");
+        td.dir("alpha");
+        fs::create_dir(td.root.join("alpha").join("bravo")).expect("nested directory");
+        fs::write(td.root.join("alpha").join("bravo").join("inside.txt"), b"x")
+            .expect("nested file");
+        let target = td.root.join("alpha").join("bravo");
+        let file_manager =
+            FmState::open_trail_to(&td.root, &target, false).expect("open three-column Trail");
+        let mut app = runtime_app_with_fm(file_manager);
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        install_fcl_location_model(&mut app, std::slice::from_ref(&td.root));
+        compute_view(&mut app.state, Rect::new(0, 0, 100, 16));
+        let prepared = app
+            .state
+            .file_manager
+            .as_ref()
+            .expect("open FM")
+            .trail
+            .cols()
+            .to_vec();
+
+        app.handle_focused_file_manager_key(key(KeyCode::Left));
+        assert_eq!(
+            app.state
+                .file_manager
+                .as_ref()
+                .expect("open FM")
+                .trail
+                .active_col(),
+            1,
+            "one Left event crosses exactly one resident edge"
+        );
+        app.handle_focused_file_manager_key(key(KeyCode::Left));
+        assert_eq!(
+            app.state
+                .file_manager
+                .as_ref()
+                .expect("open FM")
+                .trail
+                .active_col(),
+            0,
+            "the second Left event reaches the root"
+        );
+
+        app.file_manager_key_render_override = None;
+        assert_eq!(
+            handle_file_manager_key(&mut app.state, key(KeyCode::Left)),
+            FileManagerKeyDispatch::Consumed,
+            "the next Left crosses exactly one owner edge into Rail"
+        );
+        assert_eq!(
+            app.state.file_manager_locations.focus,
+            crate::app::FileManagerLocationsFocus::Rail
+        );
+        app.handle_focused_file_manager_key(key(KeyCode::Left));
+        let after = app.state.file_manager.as_ref().expect("open FM");
+        assert_eq!(
+            after.trail.active_col(),
+            0,
+            "Rail Left leaves Trail at root"
+        );
+        assert_eq!(after.trail.cols(), prepared.as_slice());
+        assert_eq!(
+            app.file_manager_key_render_override,
+            Some(false),
+            "an inert Rail boundary key cannot request a render"
+        );
+    }
+
+    // TP-FMH-RIGHT-01 + TP-FMH-STEP-01: a resident directory chain may be
+    // traversed without disk I/O, but one Right event may focus only the next
+    // column even when multiple descendants are already prepared.
+    #[test]
+    fn right_arrow_moves_one_resident_column_per_event() {
+        let td = TempDir::new("horizontal-right-step");
+        td.dir("alpha");
+        fs::create_dir(td.root.join("alpha").join("bravo")).expect("nested directory");
+        fs::write(td.root.join("alpha").join("bravo").join("inside.txt"), b"x")
+            .expect("nested file");
+        let target = td.root.join("alpha").join("bravo");
+        let file_manager =
+            FmState::open_trail_to(&td.root, &target, false).expect("open three-column Trail");
+        let mut state = app_with_fm(file_manager);
+        assert_eq!(
+            handle_file_manager_key(&mut state, key(KeyCode::Left)),
+            FileManagerKeyDispatch::Consumed
+        );
+        assert_eq!(
+            handle_file_manager_key(&mut state, key(KeyCode::Left)),
+            FileManagerKeyDispatch::Consumed
+        );
+
+        let (dispatch, profile) = crate::render_prof::observe_for_test(|| {
+            handle_file_manager_key(&mut state, key(KeyCode::Right))
+        });
+        assert_eq!(dispatch, FileManagerKeyDispatch::Consumed);
+        let after = state.file_manager.as_ref().expect("open FM");
+        assert_eq!(
+            after.trail.active_col(),
+            1,
+            "one Right event cannot jump through a prepared descendant"
+        );
+        assert_eq!(
+            after.trail.cols().len(),
+            2,
+            "entering the child starts a fresh first-row transaction"
+        );
+        assert_eq!(after.trail_snapshots.cols().len(), 2);
+        assert_eq!(
+            after
+                .active_trail_entry_identity()
+                .map(|(_, index, path, _)| (index, path)),
+            Some((0, target)),
+            "the entered column highlights its exact first resident child"
+        );
+        assert_eq!(
+            profile.counter("fm.filesystem.read"),
+            0,
+            "resident Right focus cannot reread an exact prepared child"
+        );
+    }
+
+    // TP-FMH-RIGHT-03 + TP-FMH-ALIAS-01: Right/l are column-navigation
+    // commands, not file activation aliases. A non-directory cursor must be
+    // completely inert: no selection projection, worker, focus, or render.
+    #[test]
+    fn right_navigation_on_file_is_inert_without_side_effects() {
+        for code in [KeyCode::Right, KeyCode::Char('l')] {
+            let td = TempDir::new("horizontal-right-file-inert");
+            td.dir("00-child");
+            td.file("01-file.txt");
+            td.set_equal_modified(&["00-child", "01-file.txt"]);
+            let file_manager = FmState::new(&td.root);
+            let mut app = runtime_app_with_fm(file_manager);
+
+            app.handle_focused_file_manager_key(key(KeyCode::Left));
+            app.handle_focused_file_manager_key(key(KeyCode::Down));
+            let before = app.state.file_manager.as_ref().expect("open FM").clone();
+            assert_eq!(
+                before.selected().map(|entry| entry.path.as_path()),
+                Some(td.root.join("01-file.txt").as_path()),
+                "fixture cursor must own the file row"
+            );
+
+            assert_eq!(
+                handle_file_manager_key(&mut app.state, key(code)),
+                FileManagerKeyDispatch::Inert,
+                "the pure reducer cannot turn Right/l into file activation"
+            );
+            app.file_manager_key_render_override = None;
+            app.handle_focused_file_manager_key(key(code));
+
+            let after = app.state.file_manager.as_ref().expect("open FM");
+            assert_eq!(
+                after.trail, before.trail,
+                "Right/l on a file cannot mutate the Trail"
+            );
+            assert_eq!(after.trail_snapshots, before.trail_snapshots);
+            assert_eq!(after.cwd, before.cwd);
+            assert_eq!(after.entries, before.entries);
+            assert_eq!(after.cursor, before.cursor);
+            assert_eq!(after.directory_generation, before.directory_generation);
+            assert_eq!(after.preview_generation, before.preview_generation);
+            assert_eq!(
+                app.file_manager_key_render_override,
+                Some(false),
+                "Right/l on a file is render-neutral"
+            );
+        }
+    }
+
+    // TP-FMN-NAV-01..03 RED: each Up event advances exactly one row in the
+    // original owner column, including when the landed rows are directories.
+    // The resident child may remain visible, but focus must never transfer to
+    // it without an explicit Right/l/Enter command.
+    #[test]
+    fn repeated_up_over_directories_moves_one_row_without_child_focus_transfer() {
+        let td = TempDir::new("keyboard-cursor-only-directories");
+        for name in ["00-alpha", "01-bravo", "02-current"] {
+            td.dir(name);
+        }
+        td.set_equal_modified(&["00-alpha", "01-bravo", "02-current"]);
+        let current = td.root.join("02-current");
+        let file_manager =
+            FmState::open_trail_to(&td.root, &current, false).expect("open child Trail");
+        let mut state = app_with_fm(file_manager);
+        assert_eq!(
+            handle_file_manager_key(&mut state, key(KeyCode::Left)),
+            FileManagerKeyDispatch::Consumed
+        );
+
+        assert!(matches!(
+            handle_file_manager_key(&mut state, key(KeyCode::Up)),
+            FileManagerKeyDispatch::PreviewDirectory {
+                trail_col: 0,
+                entry_index: 1,
+                ..
+            }
+        ));
+        let after_first = state.file_manager.as_ref().expect("open FM");
+        assert_eq!(after_first.trail.active_col(), 0);
+        assert_eq!(after_first.cursor, 1, "first Up moves exactly one row");
+        assert_eq!(
+            after_first.selected().map(|entry| entry.path.as_path()),
+            Some(td.root.join("01-bravo").as_path())
+        );
+        assert_eq!(
+            after_first.trail.cols()[1].directory,
+            current,
+            "cursor movement does not replace the resident child branch"
+        );
+
+        assert!(matches!(
+            handle_file_manager_key(&mut state, key(KeyCode::Up)),
+            FileManagerKeyDispatch::PreviewDirectory {
+                trail_col: 0,
+                entry_index: 0,
+                ..
+            }
+        ));
+        let after_second = state.file_manager.as_ref().expect("open FM");
+        assert_eq!(after_second.trail.active_col(), 0);
+        assert_eq!(after_second.cursor, 0, "second Up moves one more row");
+        assert_eq!(
+            after_second.selected().map(|entry| entry.path.as_path()),
+            Some(td.root.join("00-alpha").as_path())
+        );
+        assert_eq!(after_second.trail.cols()[1].directory, current);
+    }
+
+    // TP-FMN-NAV-03: Shift+vertical preserves the same cursor-only owner law
+    // while extending the explicit selection across a directory row.
+    #[test]
+    fn shift_vertical_over_directory_extends_selection_without_branching() {
+        let td = TempDir::new("shift-cursor-only-directory");
+        td.file("00-file.txt");
+        td.dir("01-directory");
+        td.file("02-file.txt");
+        td.set_equal_modified(&["00-file.txt", "01-directory", "02-file.txt"]);
+        let mut file_manager = FmState::new(&td.root);
+        assert!(file_manager.replace_selection(0));
+        let mut state = app_with_fm(file_manager);
+
+        assert_eq!(
+            handle_file_manager_key(
+                &mut state,
+                key_with_modifiers(KeyCode::Down, KeyModifiers::SHIFT),
+            ),
+            FileManagerKeyDispatch::Consumed
+        );
+
+        let after = state.file_manager.as_ref().expect("open FM");
+        assert_eq!(after.trail.active_col(), 0);
+        assert_eq!(after.trail.cols().len(), 1, "Shift cannot open a child");
+        assert_eq!(after.cursor, 1);
+        assert_eq!(after.multi_selection_paths().len(), 2);
+        assert!(after
+            .multi_selection_paths()
+            .contains(&td.root.join("01-directory")));
+    }
+
+    // TP-FMN-NAV-04 + TP-FMN-RENDER-01 RED: render consumes the cursor-only
+    // exact path, not the stale activated branch selection. Until a matching
+    // async directory preview arrives, the old mismatched child must be hidden
+    // rather than displayed under the newly highlighted sibling.
+    #[test]
+    fn cursor_only_parent_move_projects_new_highlight_without_stale_child() {
+        let td = TempDir::new("cursor-only-render-projection");
+        for name in ["00-alpha", "01-bravo", "02-current"] {
+            td.dir(name);
+        }
+        td.set_equal_modified(&["00-alpha", "01-bravo", "02-current"]);
+        let current = td.root.join("02-current");
+        let file_manager =
+            FmState::open_trail_to(&td.root, &current, false).expect("open child Trail");
+        let mut app = runtime_app_with_fm(file_manager);
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+
+        assert_eq!(
+            handle_file_manager_key(&mut app.state, key(KeyCode::Left)),
+            FileManagerKeyDispatch::Consumed
+        );
+        assert!(matches!(
+            handle_file_manager_key(&mut app.state, key(KeyCode::Up)),
+            FileManagerKeyDispatch::PreviewDirectory { .. }
+        ));
+        compute_view(&mut app.state, Rect::new(0, 0, 120, 16));
+
+        let trail = &app.state.view.file_manager_trail;
+        assert_eq!(trail.columns.len(), 1, "mismatched stale child is hidden");
+        let root_column = trail.columns.first().expect("root column");
+        assert_eq!(root_column.trail_index, 0);
+        assert_eq!(root_column.selected_entry, Some(1));
+        assert_eq!(
+            root_column.rows[root_column
+                .rows
+                .iter()
+                .position(|row| row.entry_index == 1)
+                .expect("highlighted row is visible")]
+            .entry_path,
+            td.root.join("01-bravo")
+        );
+    }
+
+    // TP-FMN-NAV-05 RED: Right/l and Enter are the explicit activation
+    // commands. After cursor-only movement they must activate that exact
+    // cursor path, never the previously opened child branch.
+    #[test]
+    fn explicit_keyboard_activation_enters_exact_cursor_directory() {
+        for activation in [KeyCode::Right, KeyCode::Enter] {
+            let td = TempDir::new("explicit-cursor-directory-activation");
+            for name in ["00-alpha", "01-bravo", "02-current"] {
+                td.dir(name);
+            }
+            td.set_equal_modified(&["00-alpha", "01-bravo", "02-current"]);
+            let current = td.root.join("02-current");
+            let file_manager =
+                FmState::open_trail_to(&td.root, &current, false).expect("open child Trail");
+            let mut app = runtime_app_with_fm(file_manager);
+
+            app.handle_focused_file_manager_key(key(KeyCode::Left));
+            app.handle_focused_file_manager_key(key(KeyCode::Up));
+            app.handle_focused_file_manager_key(key(activation));
+            assert!(app.complete_file_manager_io_for_test());
+
+            let after = app.state.file_manager.as_ref().expect("open FM");
+            assert_eq!(after.trail.active_col(), 1);
+            assert_eq!(after.trail.cols().len(), 2);
+            assert_eq!(after.trail.cols()[1].directory, td.root.join("01-bravo"));
+            assert_eq!(
+                after.trail.cols()[0].selected.as_deref(),
+                Some(td.root.join("01-bravo").as_path())
+            );
+        }
+    }
+
+    // TP-FLF-ENTER-03: crossing one prepared hierarchy edge with Right owns
+    // the child column and immediately highlights its first real row.
+    #[test]
+    fn flf_entered_child_highlights_first_actionable_entry() {
+        let td = TempDir::new("flf-entered-child");
+        td.dir("child");
+        let child = td.root.join("child");
+        let first = child.join("00-first.txt");
+        fs::write(&first, b"first").expect("first child row");
+        TempDir::set_modified(&first);
+        let file_manager =
+            FmState::open_trail_to(&td.root, &child, false).expect("prepared child Trail");
+        let mut state = app_with_fm(file_manager);
+
+        assert_eq!(
+            handle_file_manager_key(&mut state, key(KeyCode::Left)),
+            FileManagerKeyDispatch::Consumed
+        );
+        assert_eq!(
+            handle_file_manager_key(&mut state, key(KeyCode::Right)),
+            FileManagerKeyDispatch::Consumed
+        );
+
+        let file_manager = state.file_manager.as_ref().expect("open FM");
+        assert_eq!(file_manager.trail.active_col(), 1);
+        assert_eq!(
+            file_manager
+                .active_trail_entry_identity()
+                .map(|(_, index, path, _)| (index, path)),
+            Some((0, first))
+        );
+
+        let cold = TempDir::new("flf-entered-child-cold");
+        let cold_anchor = cold.root.join("00-anchor.txt");
+        fs::write(&cold_anchor, b"anchor").expect("cold anchor row");
+        TempDir::set_modified(&cold_anchor);
+        cold.dir("01-child");
+        let cold_child = cold.root.join("01-child");
+        let cold_first = cold_child.join("00-first.txt");
+        fs::write(&cold_first, b"first").expect("cold first child row");
+        TempDir::set_modified(&cold_first);
+        cold.set_equal_modified(&["00-anchor.txt", "01-child"]);
+        let mut app = runtime_app_with_fm(FmState::new(&cold.root));
+        app.state.file_manager_locations.focus_trail();
+
+        assert!(matches!(
+            handle_file_manager_key(&mut app.state, key(KeyCode::Down)),
+            FileManagerKeyDispatch::PreviewDirectory { .. }
+        ));
+        app.handle_focused_file_manager_key(key(KeyCode::Right));
+        assert!(app.complete_file_manager_io_for_test());
+
+        let file_manager = app.state.file_manager.as_ref().expect("open cold FM");
+        assert_eq!(file_manager.trail.active_col(), 1);
+        assert_eq!(
+            file_manager
+                .active_trail_entry_identity()
+                .map(|(_, index, path, _)| (index, path)),
+            Some((0, cold_first))
+        );
+    }
+
+    // TP-FLF-ENTER-04: because explicit entry owns row zero immediately, the
+    // next Down event advances exactly once to row one.
+    #[test]
+    fn flf_next_down_after_entry_selects_second_entry() {
+        let td = TempDir::new("flf-next-down");
+        td.dir("child");
+        let child = td.root.join("child");
+        let first = child.join("00-first.txt");
+        let second = child.join("01-second.txt");
+        for path in [&first, &second] {
+            fs::write(path, b"row").expect("child row");
+            TempDir::set_modified(path);
+        }
+        let file_manager =
+            FmState::open_trail_to(&td.root, &child, false).expect("prepared child Trail");
+        let mut state = app_with_fm(file_manager);
+
+        assert_eq!(
+            handle_file_manager_key(&mut state, key(KeyCode::Left)),
+            FileManagerKeyDispatch::Consumed
+        );
+        assert_eq!(
+            handle_file_manager_key(&mut state, key(KeyCode::Right)),
+            FileManagerKeyDispatch::Consumed
+        );
+        assert_eq!(
+            handle_file_manager_key(&mut state, key(KeyCode::Down)),
+            FileManagerKeyDispatch::Consumed
+        );
+
+        assert_eq!(
+            state
+                .file_manager
+                .as_ref()
+                .expect("open FM")
+                .active_trail_entry_identity()
+                .map(|(_, index, path, _)| (index, path)),
+            Some((1, second))
+        );
+    }
+
+    // TP-FLF-HISTORY-01: keyboard entry is a fresh focus transaction. A
+    // previously selected deeper destination cannot survive behind it.
+    #[test]
+    fn flf_keyboard_activation_discards_hidden_destination_history() {
+        let td = TempDir::new("flf-discard-history");
+        td.dir("alpha");
+        let alpha = td.root.join("alpha");
+        let bravo = alpha.join("bravo");
+        fs::create_dir_all(&bravo).expect("deep prepared branch");
+        TempDir::set_modified(&bravo);
+        let file_manager =
+            FmState::open_trail_to(&td.root, &bravo, false).expect("deep prepared Trail");
+        let mut state = app_with_fm(file_manager);
+
+        assert_eq!(
+            handle_file_manager_key(&mut state, key(KeyCode::Left)),
+            FileManagerKeyDispatch::Consumed
+        );
+        assert_eq!(
+            handle_file_manager_key(&mut state, key(KeyCode::Left)),
+            FileManagerKeyDispatch::Consumed
+        );
+        assert_eq!(
+            handle_file_manager_key(&mut state, key(KeyCode::Right)),
+            FileManagerKeyDispatch::Consumed
+        );
+
+        let file_manager = state.file_manager.as_ref().expect("open FM");
+        assert_eq!(file_manager.trail.active_col(), 1);
+        assert_eq!(file_manager.trail.cols().len(), 2);
+        assert_eq!(file_manager.trail.cols()[1].selected, None);
+        assert_eq!(
+            file_manager.trail.cursor_override(),
+            Some((1, bravo.as_path()))
+        );
+    }
+
+    // TP-FLF-PERF-01: first-entry initialization is entirely snapshot-backed;
+    // crossing a prepared child edge cannot enumerate the filesystem.
+    #[test]
+    fn flf_first_entry_initialization_performs_zero_filesystem_reads() {
+        let td = TempDir::new("flf-first-entry-no-read");
+        td.dir("child");
+        let child = td.root.join("child");
+        let first = child.join("first.txt");
+        fs::write(&first, b"first").expect("first child row");
+        TempDir::set_modified(&first);
+        let file_manager =
+            FmState::open_trail_to(&td.root, &child, false).expect("prepared child Trail");
+        let mut state = app_with_fm(file_manager);
+        assert_eq!(
+            handle_file_manager_key(&mut state, key(KeyCode::Left)),
+            FileManagerKeyDispatch::Consumed
+        );
+
+        let (dispatch, profile) = crate::render_prof::observe_for_test(|| {
+            handle_file_manager_key(&mut state, key(KeyCode::Right))
+        });
+
+        assert_eq!(dispatch, FileManagerKeyDispatch::Consumed);
+        assert_eq!(profile.counter("fm.filesystem.read"), 0);
+        assert_eq!(
+            state
+                .file_manager
+                .as_ref()
+                .expect("open FM")
+                .active_trail_entry_identity()
+                .map(|(_, index, path, _)| (index, path)),
+            Some((0, first))
+        );
+    }
+
+    // TP-FMN-IO-01/02 RED: a vertical directory landing publishes its cursor
+    // immediately, then prepares the right-side child through the bounded FM
+    // worker. The completion may replace the preview branch but may not steal
+    // owner-column focus.
+    #[test]
+    fn keyboard_directory_cursor_schedules_bounded_preview_without_focus_transfer() {
+        let td = TempDir::new("async-keyboard-directory-preview");
+        for name in ["00-alpha", "01-bravo", "02-current"] {
+            td.dir(name);
+            fs::write(td.root.join(name).join("inside.txt"), b"x").expect("write child fixture");
+        }
+        td.set_equal_modified(&["00-alpha", "01-bravo", "02-current"]);
+        let current = td.root.join("02-current");
+        let file_manager =
+            FmState::open_trail_to(&td.root, &current, false).expect("open child Trail");
+        let mut app = runtime_app_with_fm(file_manager);
+
+        app.handle_focused_file_manager_key(key(KeyCode::Left));
+        app.handle_focused_file_manager_key(key(KeyCode::Up));
+
+        let pending = app.state.file_manager.as_ref().expect("open FM");
+        assert_eq!(pending.trail.active_col(), 0);
+        assert_eq!(pending.cursor, 1);
+        assert_eq!(pending.trail.cols()[1].directory, current);
+        assert!(
+            app.complete_file_manager_io_for_test(),
+            "directory preview is prepared by the bounded worker"
+        );
+        let applied = app.state.file_manager.as_ref().expect("open FM");
+        assert_eq!(applied.trail.active_col(), 0, "preview cannot steal focus");
+        assert_eq!(applied.trail.cols().len(), 2);
+        assert_eq!(applied.trail.cols()[1].directory, td.root.join("01-bravo"));
+    }
+
+    // TP-FMN-IO-04 RED: active column/cursor identity is part of preview
+    // authority. If the user moves Left while the child preview is running,
+    // that completion is stale even when filesystem generations still match.
+    #[test]
+    fn directory_preview_after_horizontal_focus_change_is_rejected() {
+        let td = TempDir::new("stale-preview-after-horizontal-focus");
+        td.dir("current");
+        for name in ["00-alpha", "01-bravo"] {
+            fs::create_dir(td.root.join("current").join(name))
+                .expect("create child directory fixture");
+        }
+        let current = td.root.join("current");
+        let file_manager =
+            FmState::open_trail_to(&td.root, &current, false).expect("open child Trail");
+        let mut app = runtime_app_with_fm(file_manager);
+
+        app.handle_focused_file_manager_key(key(KeyCode::Down));
+        assert_eq!(
+            app.state
+                .file_manager
+                .as_ref()
+                .expect("open FM")
+                .trail
+                .active_col(),
+            1
+        );
+        app.handle_focused_file_manager_key(key(KeyCode::Left));
+        assert_eq!(
+            app.state
+                .file_manager
+                .as_ref()
+                .expect("open FM")
+                .trail
+                .active_col(),
+            0
+        );
+
+        assert!(
+            !app.complete_file_manager_io_for_test(),
+            "completion for the retired child cursor must be discarded"
+        );
+        let after = app.state.file_manager.as_ref().expect("open FM");
+        assert_eq!(after.trail.active_col(), 0);
+        assert_eq!(after.trail.cols().len(), 2);
+        assert_eq!(after.trail.cols()[1].directory, current);
+    }
+
+    // TP-FMN-IO-03: a directory may disappear after its resident owner
+    // snapshot was rendered. The bounded preview failure leaves the cursor and
+    // previously activated branch intact and never transfers focus.
+    #[test]
+    fn missing_directory_preview_preserves_cursor_and_resident_branch() {
+        let td = TempDir::new("missing-directory-preview");
+        for name in ["00-alpha", "01-missing", "02-current"] {
+            td.dir(name);
+        }
+        td.set_equal_modified(&["00-alpha", "01-missing", "02-current"]);
+        let current = td.root.join("02-current");
+        let missing = td.root.join("01-missing");
+        let file_manager =
+            FmState::open_trail_to(&td.root, &current, false).expect("open child Trail");
+        fs::remove_dir(&missing).expect("retire directory after snapshot");
+        let mut app = runtime_app_with_fm(file_manager);
+
+        app.handle_focused_file_manager_key(key(KeyCode::Left));
+        app.handle_focused_file_manager_key(key(KeyCode::Up));
+        assert!(!app.complete_file_manager_io_for_test());
+
+        let after = app.state.file_manager.as_ref().expect("open FM");
+        assert_eq!(after.trail.active_col(), 0);
+        assert_eq!(after.cursor, 1);
+        assert_eq!(
+            after.selected().map(|entry| entry.path.as_path()),
+            Some(missing.as_path())
+        );
+        assert_eq!(after.trail.cols()[1].directory, current);
+    }
+
+    // TP-FMN-NAV-05 + TP-FMN-IO-03 RED: explicit Enter uses the bounded
+    // activation lane shared with Right/l. Unlike primary click's preview
+    // lane, only a matching activation completion focuses the new child.
+    #[test]
+    fn keyboard_enter_activates_cursor_directory_off_input_loop() {
+        let td = TempDir::new("async-keyboard-directory-activation");
+        for name in ["00-alpha", "01-bravo", "02-current"] {
+            td.dir(name);
+            fs::write(td.root.join(name).join("inside.txt"), b"x").expect("write child fixture");
+        }
+        td.set_equal_modified(&["00-alpha", "01-bravo", "02-current"]);
+        let current = td.root.join("02-current");
+        let file_manager =
+            FmState::open_trail_to(&td.root, &current, false).expect("open child Trail");
+        let mut app = runtime_app_with_fm(file_manager);
+        let _ = handle_file_manager_key(&mut app.state, key(KeyCode::Left));
+        let _ = handle_file_manager_key(&mut app.state, key(KeyCode::Up));
+
+        app.handle_focused_file_manager_key(key(KeyCode::Enter));
+
+        let pending = app.state.file_manager.as_ref().expect("open FM");
+        assert_eq!(pending.trail.active_col(), 0);
+        assert_eq!(
+            pending.trail.cols()[1].directory,
+            current,
+            "input path performs no cold directory read/branch"
+        );
+        assert!(app.complete_file_manager_io_for_test());
+        let applied = app.state.file_manager.as_ref().expect("open FM");
+        assert_eq!(applied.trail.active_col(), 1);
+        assert_eq!(applied.trail.cols()[1].directory, td.root.join("01-bravo"));
+    }
+
+    // TP-FMN-WHEEL-01 RED: Ghostty may encode one physical detent as an
+    // exact-coordinate SGR triplet less than 2 ms apart. Only the first raw
+    // packet is one semantic row step; the next human-scale packet survives.
+    #[test]
+    fn vertical_wheel_microburst_collapses_exact_host_triplet() {
+        let started = Instant::now();
+        let mut gate = FileManagerVerticalWheelBurstGate::default();
+
+        assert!(gate.accept_at(7, 1, 1, 42, 9, started));
+        assert!(!gate.accept_at(7, 1, 1, 42, 9, started + Duration::from_micros(100)));
+        assert!(!gate.accept_at(7, 1, 1, 42, 9, started + Duration::from_micros(250)));
+        assert!(gate.accept_at(7, 1, 1, 42, 9, started + Duration::from_millis(5)));
+    }
+
+    // TP-FMN-WHEEL-02 RED: the filter is intentionally narrow. Reversal,
+    // another owner/coordinate, and the exact 2 ms boundary are independent
+    // semantic input and can never be swallowed as host amplification.
+    #[test]
+    fn vertical_wheel_filter_preserves_distinct_intent() {
+        let started = Instant::now();
+        let mut gate = FileManagerVerticalWheelBurstGate::default();
+
+        assert!(gate.accept_at(7, 1, 1, 42, 9, started));
+        assert!(gate.accept_at(7, 1, -1, 42, 9, started + Duration::from_micros(100)));
+        assert!(gate.accept_at(7, 2, -1, 42, 9, started + Duration::from_micros(200)));
+        assert!(gate.accept_at(7, 2, -1, 43, 9, started + Duration::from_micros(300)));
+        assert!(gate.accept_at(
+            7,
+            2,
+            -1,
+            43,
+            9,
+            started + Duration::from_micros(300) + Duration::from_millis(2)
+        ));
+    }
+
+    // TP-FMN-WHEEL-01/02 integration, now over the column window
+    // (TP-TRAIL-VSCROLL-02): decoding three same-detent packets advances ONE
+    // line, while the next 5 ms detent and immediate reversal are both
+    // preserved. Profiler counters expose the normalization live.
+    #[test]
+    fn vertical_wheel_microburst_moves_one_line_end_to_end() {
+        let td = TempDir::new("vertical-wheel-end-to-end");
+        for index in 0..5 {
+            td.file(&format!("{index:02}.txt"));
+        }
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        let row = trail_row_by_index(&app, 0);
+        let started = Instant::now();
+        let down = mouse(MouseEventKind::ScrollDown, row.name_rect.x, row.name_rect.y);
+
+        let (_, profile) = crate::render_prof::observe_for_test(|| {
+            let _ = app.handle_file_manager_mouse_at(down, started);
+            assert_eq!(app.file_manager_mouse_render_override, Some(true));
+            let _ = app.handle_file_manager_mouse_at(down, started + Duration::from_micros(100));
+            assert_eq!(app.file_manager_mouse_render_override, Some(false));
+            let _ = app.handle_file_manager_mouse_at(down, started + Duration::from_micros(250));
+            assert_eq!(app.file_manager_mouse_render_override, Some(false));
+            assert_eq!(
+                app.state
+                    .file_manager
+                    .as_ref()
+                    .expect("open FM")
+                    .miller
+                    .vertical
+                    .start_for(&td.root),
+                Some(1),
+                "one host triplet is one semantic line step"
+            );
+
+            let _ = app.handle_file_manager_mouse_at(down, started + Duration::from_millis(5));
+            let _ = app.handle_file_manager_mouse_at(
+                mouse(MouseEventKind::ScrollUp, row.name_rect.x, row.name_rect.y),
+                started + Duration::from_millis(5) + Duration::from_micros(100),
+            );
+        });
+
+        assert_eq!(
+            app.state
+                .file_manager
+                .as_ref()
+                .expect("open FM")
+                .miller
+                .vertical
+                .start_for(&td.root),
+            Some(1),
+            "the 5 ms detent and its immediate reversal cancel out"
+        );
+        assert_eq!(profile.counter("fm.vertical_wheel.accepted"), 3);
+        assert_eq!(profile.counter("fm.vertical_wheel.coalesced"), 2);
+    }
+
+    // TP-FMN-RENDER-01 RED: an accepted packet at the list boundary is still
+    // semantically inert. It is counted for diagnostics but cannot authorize
+    // a full virtual frame when neither focus nor cursor changed.
+    #[test]
+    fn clamped_vertical_wheel_declines_render() {
+        let td = TempDir::new("clamped-wheel-render");
+        td.file("00.txt");
+        td.file("01.txt");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        let row = trail_row_by_index(&app, 0);
+
+        let (_, profile) = crate::render_prof::observe_for_test(|| {
+            let _ = app.handle_file_manager_mouse_at(
+                mouse(MouseEventKind::ScrollUp, row.name_rect.x, row.name_rect.y),
+                Instant::now(),
+            );
+        });
+
+        assert_eq!(app.state.file_manager.as_ref().expect("open FM").cursor, 0);
+        assert_eq!(app.file_manager_mouse_render_override, Some(false));
+        assert_eq!(profile.counter("fm.vertical_wheel.accepted"), 1);
+        assert_eq!(profile.counter("fm.vertical_wheel.coalesced"), 0);
+    }
+
+    // TP-FFO-WHEEL-01 / TP-FFO-WHEEL-02 / TP-FFO-RENDER-01 / TP-FFO-IO-01:
+    // an accepted clamped detent may still change top-level owner and render
+    // once. A later idempotent detent and a host-amplified duplicate may not.
+    #[test]
+    fn ffo_clamped_trail_wheel_transfers_owner_and_requests_one_render() {
+        let td = TempDir::new("ffo-clamped-wheel-owner");
+        td.file("00.txt");
+        td.set_equal_modified(&["00.txt"]);
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        install_fcl_location_model(&mut app, std::slice::from_ref(&td.root));
+        assert!(app
+            .state
+            .file_manager_locations
+            .activate_location(&td.root, &app.state.file_manager_locations_model));
+        let row = trail_row_by_index(&app, 0);
+        let up = mouse(MouseEventKind::ScrollUp, row.name_rect.x, row.name_rect.y);
+        let started = Instant::now();
+
+        let (_, profile) = crate::render_prof::observe_for_test(|| {
+            let _ = app.handle_file_manager_mouse_at(up, started);
+            assert_eq!(
+                app.state.file_manager_locations.focus,
+                crate::app::FileManagerLocationsFocus::Trail
+            );
+            assert_eq!(app.state.file_manager.as_ref().expect("open FM").cursor, 0);
+            assert_eq!(app.file_manager_mouse_render_override, Some(true));
+
+            let _ = app.handle_file_manager_mouse_at(up, started + Duration::from_millis(5));
+            assert_eq!(
+                app.state.file_manager_locations.focus,
+                crate::app::FileManagerLocationsFocus::Trail
+            );
+            assert_eq!(app.state.file_manager.as_ref().expect("open FM").cursor, 0);
+            assert_eq!(app.file_manager_mouse_render_override, Some(false));
+
+            app.state.file_manager_locations.focus = crate::app::FileManagerLocationsFocus::Rail;
+            let _ = app.handle_file_manager_mouse_at(
+                up,
+                started + Duration::from_millis(5) + Duration::from_micros(100),
+            );
+            assert_eq!(
+                app.state.file_manager_locations.focus,
+                crate::app::FileManagerLocationsFocus::Rail,
+                "a coalesced packet cannot reacquire Trail authority"
+            );
+            assert_eq!(app.file_manager_mouse_render_override, Some(false));
+        });
+
+        assert_eq!(profile.counter("fm.vertical_wheel.accepted"), 2);
+        assert_eq!(profile.counter("fm.vertical_wheel.coalesced"), 1);
+        assert_eq!(profile.counter("fm.filesystem.read"), 0);
+    }
+
+    // TP-FMN-RENDER-01 RED: the headless route must make the same visible
+    // change distinction for keyboard movement. A clamped Up is consumed but
+    // does not repaint; the next real Down step does.
+    #[test]
+    fn clamped_keyboard_vertical_move_declines_render() {
+        let td = TempDir::new("clamped-key-render");
+        td.file("00.txt");
+        td.file("01.txt");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+
+        let clamped = app.route_client_events(
+            vec![crate::raw_input::RawInputEvent::Key(
+                key(KeyCode::Up).into(),
+            )],
+            true,
+        );
+        assert!(!clamped, "clamped keyboard cursor action is render-inert");
+        assert_eq!(app.state.file_manager.as_ref().expect("open FM").cursor, 0);
+
+        let moved = app.route_client_events(
+            vec![crate::raw_input::RawInputEvent::Key(
+                key(KeyCode::Down).into(),
+            )],
+            true,
+        );
+        assert!(moved, "a visible one-row keyboard step requests render");
+        assert_eq!(app.state.file_manager.as_ref().expect("open FM").cursor, 1);
+    }
+
+    // TP-FMN-NAV-03 / TP-FMN-RENDER-01 RED: Shift+vertical shares the same
+    // clamped movement law. Re-extending the already-selected edge row is not
+    // a visible selection transition and must not authorize a render.
+    #[test]
+    fn clamped_shift_vertical_move_is_inert_and_preserves_selection() {
+        let td = TempDir::new("clamped-shift-key-render");
+        td.file("00.txt");
+        td.file("01.txt");
+        let mut file_manager = FmState::new(&td.root);
+        assert!(file_manager.replace_selection(0));
+        let mut state = app_with_fm(file_manager);
+        let before = state.file_manager.as_ref().expect("open FM").clone();
+
+        let dispatch = handle_file_manager_key(
+            &mut state,
+            key_with_modifiers(KeyCode::Up, KeyModifiers::SHIFT),
+        );
+
+        assert_eq!(dispatch, FileManagerKeyDispatch::Inert);
+        let after = state.file_manager.as_ref().expect("open FM");
+        assert_eq!(after.cursor, before.cursor);
+        assert_eq!(after.trail, before.trail);
+        assert_eq!(
+            after.multi_selection_paths(),
+            before.multi_selection_paths()
+        );
+        assert_eq!(after.preview_generation, before.preview_generation);
+    }
+
+    // TP-TRAIL-T7-INPUT-04: right-click derives exact operation identity from
+    // the live Trail row rect/path. Retired current-row geometry cannot grant
+    // or revoke that authority.
+    #[test]
+    fn trail_row_hit_drives_operation_identity_without_legacy_geometry() {
+        let td = TempDir::new("trail-operation-hit");
+        td.file("00.txt");
+        td.file("01.txt");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        install_focused_agent(&mut app);
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        compute_view(&mut app.state, Rect::new(0, 0, 80, 16));
+        let target = app
+            .state
+            .view
+            .file_manager_trail
+            .columns
+            .first()
+            .and_then(|column| column.rows.get(1))
+            .cloned()
+            .expect("second Trail row");
+        app.state.view.file_manager_miller = Default::default();
+        app.state.view.file_manager_row_areas.clear();
+        app.state.view.file_manager_row_action_areas.clear();
+
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Right),
+                target.rect.x,
+                target.rect.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+
+        let ContextMenuKind::File { model } = &app
+            .state
+            .context_menu
+            .as_ref()
+            .expect("Trail row opens file menu")
+            .kind
+        else {
+            panic!("expected file context menu")
+        };
+        assert_eq!(model.paths, vec![target.entry_path]);
+    }
+
+    // TP-TRAIL-T7-INPUT-01: a delayed frame from a closed Files instance
+    // cannot act on a reopened instance, even when cwd and row paths match.
+    #[test]
+    fn stale_trail_frame_cannot_activate_reopened_files_instance() {
+        let td = TempDir::new("trail-stale-generation");
+        td.file("00.txt");
+        td.file("01.txt");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        install_focused_agent(&mut app);
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        compute_view(&mut app.state, Rect::new(0, 0, 80, 16));
+        let stale_frame = app.state.view.file_manager_trail.clone();
+        let stale_target = stale_frame.columns[0].rows[1].clone();
+        let stale_generation = stale_frame
+            .files_generation
+            .expect("projected Files generation");
+
+        app.state.close_file_manager();
+        app.state
+            .try_open_file_manager_with(|_| Some(FmState::new(&td.root)))
+            .expect("reopen same cwd");
+        let reopened_generation = app
+            .state
+            .stage
+            .active_instance_generation()
+            .expect("reopened Files generation");
+        assert_ne!(stale_generation, reopened_generation);
+        app.state.view.file_manager_trail = stale_frame;
+        let before = app.state.file_manager.as_ref().expect("open FM").clone();
+
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                stale_target.rect.x,
+                stale_target.rect.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+
+        let after = app.state.file_manager.as_ref().expect("open FM");
+        assert_eq!(after.trail, before.trail);
+        assert_eq!(after.cwd, before.cwd);
+        assert_eq!(after.cursor, before.cursor);
+        assert_eq!(
+            after.multi_selection_paths(),
+            before.multi_selection_paths()
+        );
+        assert!(app.state.request_file_manager_context_action.is_none());
+    }
+
+    // TP-TRAIL-T7-INPUT-02 / TP-DCLICK-01: an ancestor-column click
+    // revalidates the exact path and prepares the selected sibling branch,
+    // while focus remains on the exact clicked owner row.
+    #[test]
+    fn directory_click_previews_exact_ancestor_branch_without_entering() {
+        let td = TempDir::new("trail-ancestor-rebranch");
+        td.dir("alpha");
+        td.dir("zeta");
+        fs::create_dir_all(td.root.join("alpha").join("deep")).expect("deep branch");
+        let alpha = td.root.join("alpha");
+        let deep = alpha.join("deep");
+        let zeta = td.root.join("zeta");
+        let file_manager =
+            FmState::open_trail_to(&td.root, &deep, false).expect("deep Trail fixture");
+        let mut app = runtime_app_with_fm(file_manager);
+        install_focused_agent(&mut app);
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        compute_view(&mut app.state, Rect::new(0, 0, 120, 16));
+        let target = app
+            .state
+            .view
+            .file_manager_trail
+            .columns
+            .iter()
+            .find(|column| column.trail_index == 0)
+            .and_then(|column| column.rows.iter().find(|row| row.entry_path == zeta))
+            .cloned()
+            .expect("zeta ancestor row");
+
+        let (dispatch, profile) = crate::render_prof::observe_for_test(|| {
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                target.rect.x,
+                target.rect.y,
+            ))
+        });
+
+        assert_eq!(dispatch, FileManagerMouseDispatch::Consumed);
+        assert_eq!(
+            profile.counter("fm.filesystem.read"),
+            0,
+            "a cold Trail directory click must enqueue bounded I/O, never read on input dispatch"
+        );
+        assert!(
+            app.complete_file_manager_io_for_test(),
+            "the exact cold directory preview applies after bounded I/O"
+        );
+        let file_manager = app.state.file_manager.as_ref().expect("open FM");
+        assert_eq!(file_manager.trail.active_col(), 0);
+        assert_eq!(file_manager.trail.cols().len(), 2);
+        assert_eq!(
+            file_manager.trail.cols()[0].selected.as_deref(),
+            Some(zeta.as_path())
+        );
+        assert_eq!(file_manager.trail.cols()[1].directory, zeta);
+        assert!(!file_manager
+            .trail
+            .cols()
+            .iter()
+            .any(|column| column.directory == alpha || column.directory == deep));
+    }
+
+    // TP-TRAIL-T7-INPUT-02: remembered geometry whose exact path no longer
+    // matches the live snapshot is consumed without changing Trail state.
+    #[test]
+    fn stale_trail_row_path_is_inert() {
+        let td = TempDir::new("trail-stale-path");
+        td.file("00.txt");
+        td.file("01.txt");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        install_focused_agent(&mut app);
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        compute_view(&mut app.state, Rect::new(0, 0, 80, 16));
+        let row = app.state.view.file_manager_trail.columns[0].rows[1].clone();
+        app.state.view.file_manager_trail.columns[0].rows[1].entry_path =
+            td.root.join("vanished.txt");
+        let before = app.state.file_manager.as_ref().expect("open FM").clone();
+
+        let _ = app.handle_file_manager_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            row.rect.x,
+            row.rect.y,
+        ));
+
+        let after = app.state.file_manager.as_ref().expect("open FM");
+        assert_eq!(after.trail, before.trail);
+        assert_eq!(
+            after.multi_selection_paths(),
+            before.multi_selection_paths()
+        );
+    }
+
+    // TP-TRAIL-T7-INPUT-04: Ctrl selection consumes the same Trail row hit
+    // authority; clearing legacy row geometry cannot disable or redirect it.
+    #[test]
+    fn trail_row_hit_drives_explicit_bulk_selection() {
+        let td = TempDir::new("trail-bulk-hit");
+        td.file("00.txt");
+        td.file("01.txt");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        install_focused_agent(&mut app);
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        compute_view(&mut app.state, Rect::new(0, 0, 80, 16));
+        let target = app.state.view.file_manager_trail.columns[0].rows[1].clone();
+        app.state.view.file_manager_miller = Default::default();
+        app.state.view.file_manager_row_areas.clear();
+        let mut event = mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            target.rect.x,
+            target.rect.y,
+        );
+        event.modifiers = KeyModifiers::CONTROL;
+
+        let _ = app.handle_file_manager_mouse(event);
+
+        let file_manager = app.state.file_manager.as_ref().expect("open FM");
+        assert!(file_manager
+            .multi_selection_paths()
+            .contains(&target.entry_path));
+        assert_eq!(
+            file_manager.selected().map(|entry| &entry.path),
+            Some(&target.entry_path)
+        );
+    }
+
+    // TP-FM3-CURRENT-CUTOVER / TP-TRAIL-T7-INPUT-02: plain-click authority
+    // comes from the generation-safe Trail row, not either legacy row list.
+    #[test]
+    fn current_plain_click_uses_typed_miller_target_without_legacy_rows() {
+        let td = TempDir::new("typed-current-click");
+        for index in 0..3 {
+            td.file(&format!("{index:02}.txt"));
+        }
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        install_focused_agent(&mut app);
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        compute_view(&mut app.state, Rect::new(0, 0, 80, 16));
+        let target = trail_row_by_index(&app, 1);
+        app.state.view.file_manager_miller = Default::default();
+        app.state.view.file_manager_row_areas.clear();
+
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                target.rect.x,
+                target.rect.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+
+        let file_manager = app.state.file_manager.as_ref().expect("open FM");
+        assert_eq!(file_manager.cursor, target.entry_index);
+        assert_eq!(
+            file_manager.selected().map(|entry| &entry.path),
+            Some(&target.entry_path)
+        );
+    }
+
+    // TP-FM3-OVERLAY: the typed Files handler remains fail-closed while a
+    // topmost overlay owns input. Exact live row geometry cannot select,
+    // activate, scroll, or open a second context surface behind that overlay.
+    #[test]
+    fn overlay_blocks_every_typed_miller_row_gesture() {
+        let td = TempDir::new("typed-row-overlay");
+        td.dir("directory");
+        td.file("file.txt");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        install_focused_agent(&mut app);
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        compute_view(&mut app.state, Rect::new(0, 0, 80, 16));
+        let target = app
+            .state
+            .view
+            .file_manager_miller
+            .columns
+            .iter()
+            .find(|column| column.kind.is_current())
+            .and_then(|column| column.rows.get(1))
+            .cloned()
+            .expect("second typed CURRENT row");
+        let before = app.state.file_manager.as_ref().expect("open FM").clone();
+        app.state.mode = Mode::ContextMenu;
+
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Down(MouseButton::Right),
+            MouseEventKind::ScrollDown,
+        ] {
+            assert_eq!(
+                app.handle_file_manager_mouse(mouse(kind, target.rect.x, target.rect.y)),
+                FileManagerMouseDispatch::NotHandled
+            );
+        }
+
+        let after = app.state.file_manager.as_ref().expect("open FM");
+        assert_eq!(after.cwd, before.cwd);
+        assert_eq!(after.entries, before.entries);
+        assert_eq!(after.cursor, before.cursor);
+        assert_eq!(after.viewport_start, before.viewport_start);
+        assert_eq!(after.preview_viewport_start, before.preview_viewport_start);
+        assert_eq!(
+            after.multi_selection_paths(),
+            before.multi_selection_paths()
+        );
+        assert_eq!(after.parent, before.parent);
+        assert_eq!(after.preview, before.preview);
+        assert_eq!(after.directory_generation, before.directory_generation);
+        assert_eq!(after.preview_generation, before.preview_generation);
+        assert_eq!(after.miller, before.miller);
+        assert!(app.state.context_menu.is_none());
+    }
+
+    // TP-FM3-ALL-COLUMN-PLAIN / TP-DCLICK-01: one plain click in each visible
+    // Trail column focuses its exact live entry and prepares any directory
+    // branch without transferring focus into it.
+    #[test]
+    fn plain_click_focuses_exact_live_row_in_every_visible_column() {
+        let td = TempDir::new("typed-all-column-click");
+        let a = td.root.join("a");
+        let b = a.join("b");
+        let current = b.join("current");
+        let preview_directory = current.join("preview-directory");
+        fs::create_dir_all(&preview_directory).expect("create deep FM fixture");
+        fs::write(preview_directory.join("child.txt"), b"x").expect("write preview child");
+        fs::write(current.join("peer.txt"), b"x").expect("write current peer");
+
+        let file_manager =
+            FmState::open_trail_to(&td.root, &current, false).expect("deep Trail fixture");
+
+        let frame = Rect::new(0, 0, 200, 18);
+        let mut template = runtime_app_with_fm(file_manager.clone());
+        install_focused_agent(&mut template);
+        template.state.mobile_width_threshold = 0;
+        template.state.sidebar_collapsed = true;
+        compute_view(&mut template.state, frame);
+        let targets = template
+            .state
+            .view
+            .file_manager_trail
+            .columns
+            .iter()
+            .flat_map(|column| {
+                column
+                    .rows
+                    .first()
+                    .cloned()
+                    .map(|row| (row, column.directory.clone()))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            targets.len() >= 4,
+            "fixture must expose ancestor and active Trail rows"
+        );
+
+        for (target, owner_directory) in targets {
+            let target_is_directory = file_manager
+                .trail_entry_is_directory(
+                    target.trail_index,
+                    target.entry_index,
+                    &target.entry_path,
+                )
+                .expect("published target remains in the immutable fixture");
+            let mut app = runtime_app_with_fm(file_manager.clone());
+            install_focused_agent(&mut app);
+            app.state.mobile_width_threshold = 0;
+            app.state.sidebar_collapsed = true;
+            compute_view(&mut app.state, frame);
+
+            assert_eq!(
+                app.handle_file_manager_mouse(mouse(
+                    MouseEventKind::Down(MouseButton::Left),
+                    target.name_rect.x,
+                    target.name_rect.y,
+                )),
+                FileManagerMouseDispatch::Consumed
+            );
+            if target_is_directory {
+                assert!(
+                    app.complete_file_manager_io_for_test(),
+                    "the exact directory preview applies after bounded I/O"
+                );
+            }
+
+            let actual = app.state.file_manager.as_ref().expect("open FM");
+            assert_eq!(
+                actual.trail.active_col(),
+                target.trail_index,
+                "plain click retains the exact row-owner column"
+            );
+            assert_eq!(
+                actual.cwd.as_path(),
+                owner_directory.as_path(),
+                "plain click projects the row's owning Trail directory"
+            );
+            assert_eq!(
+                actual.selected().map(|entry| &entry.path),
+                Some(&target.entry_path),
+                "plain click focuses the exact live target path"
+            );
+        }
+    }
+
+    // TP-FM3-TOCTOU: the prepared snapshot can remain internally fresh while
+    // the filesystem changes before dispatch. The second exact directory read
+    // rejects the renamed path atomically and the stale event is not replayed.
+
+    // TP-FM3-NONCURRENT-CONTEXT / TP-TRAIL-T7-INPUT-02: a live right-click in
+    // any Trail column activates its exact owner before opening the file menu.
+    #[test]
+    fn right_click_live_non_current_row_opens_exact_context_menu() {
+        let td = TempDir::new("typed-noncurrent-context");
+        let current = td.root.join("current");
+        let preview_directory = current.join("preview-directory");
+        let target_path = preview_directory.join("target.txt");
+        fs::create_dir_all(&preview_directory).expect("create preview directory");
+        fs::write(&target_path, b"x").expect("write context target");
+
+        let file_manager = FmState::open_trail_to(&current, &preview_directory, false)
+            .expect("preview-directory Trail");
+        let mut app = runtime_app_with_fm(file_manager);
+        install_focused_agent(&mut app);
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        compute_view(&mut app.state, Rect::new(0, 0, 100, 16));
+        let target = trail_row_by_path(&app, &target_path);
+        app.state.file_manager_locations.focus = crate::app::FileManagerLocationsFocus::Rail;
+
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Right),
+                target.name_rect.x,
+                target.name_rect.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+        assert_eq!(
+            app.state.file_manager_locations.focus,
+            crate::app::FileManagerLocationsFocus::Trail
+        );
+
+        let file_manager = app.state.file_manager.as_ref().expect("open FM");
+        assert_eq!(file_manager.cwd, preview_directory);
+        assert_eq!(
+            file_manager.selected().map(|entry| &entry.path),
+            Some(&target_path)
+        );
+        assert_eq!(app.state.mode, Mode::ContextMenu);
+        let ContextMenuKind::File { model } = &app
+            .state
+            .context_menu
+            .as_ref()
+            .expect("typed file menu")
+            .kind
+        else {
+            panic!("expected typed file menu");
+        };
+        assert_eq!(model.paths, vec![target_path]);
+    }
+
+    // TP-FM3-CROSS-COLUMN-DOUBLE / TP-DCLICK-01/03: repeated clicks preserve
+    // one exact prepared directory branch without entering it. Only a
+    // subsequent Right crosses into the child and highlights its first row.
+    #[test]
+    fn repeated_directory_click_requires_right_to_enter_prepared_child() {
+        let td = TempDir::new("typed-noncurrent-double");
+        let current = td.root.join("current");
+        let preview_directory = current.join("preview-directory");
+        let child_directory = preview_directory.join("child-directory");
+        fs::create_dir_all(&child_directory).expect("create nested directory");
+        fs::write(child_directory.join("inside.txt"), b"x").expect("write nested fixture");
+
+        let file_manager = FmState::open_trail_to(&current, &preview_directory, false)
+            .expect("preview-directory Trail");
+        let mut app = runtime_app_with_fm(file_manager);
+        install_focused_agent(&mut app);
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        let frame = Rect::new(0, 0, 100, 16);
+        compute_view(&mut app.state, frame);
+        let preview_target = trail_row_by_path(&app, &child_directory);
+
+        app.handle_file_manager_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            preview_target.name_rect.x,
+            preview_target.name_rect.y,
+        ));
+        assert!(
+            app.complete_file_manager_io_for_test(),
+            "the first bounded directory preview applies"
+        );
+        assert_eq!(
+            app.state.file_manager.as_ref().expect("open FM").cwd,
+            preview_directory
+        );
+        compute_view(&mut app.state, frame);
+        let current_target = trail_row_by_path(&app, &child_directory);
+
+        app.handle_file_manager_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            current_target.name_rect.x,
+            current_target.name_rect.y,
+        ));
+        assert!(
+            app.complete_file_manager_io_for_test(),
+            "the repeated bounded directory preview applies"
+        );
+
+        {
+            let file_manager = app.state.file_manager.as_ref().expect("open FM");
+            assert_eq!(
+                file_manager
+                    .trail
+                    .cols()
+                    .last()
+                    .map(|column| &column.directory),
+                Some(&child_directory),
+                "repeated stable-path preview preserves the exact child branch"
+            );
+            assert_eq!(
+                file_manager.trail.active_col(),
+                file_manager.trail.cols().len().saturating_sub(2),
+                "repeated clicks keep focus in the child owner's column"
+            );
+        }
+
+        assert_eq!(
+            handle_file_manager_key(&mut app.state, key(KeyCode::Right)),
+            FileManagerKeyDispatch::Consumed
+        );
+        let entered = app.state.file_manager.as_ref().expect("open FM");
+        assert_eq!(
+            entered.trail.active_col(),
+            entered.trail.cols().len().saturating_sub(1)
+        );
+        assert_eq!(
+            entered.selected().map(|entry| entry.path.as_path()),
+            Some(child_directory.join("inside.txt").as_path()),
+            "Right highlights the first child row without an extra Down"
+        );
+    }
+
+    // TP-A3.3-DISPATCH / TP-DCLICK-01: repeated primary focus keeps one exact
+    // prepared child branch while the owner directory retains focus.
+    #[test]
+    fn repeated_directory_click_preserves_prepared_branch_without_entering() {
+        let td = TempDir::new("mouse-double-directory");
+        td.dir("alpha-dir");
+        fs::write(td.root.join("alpha-dir").join("child.txt"), b"x").expect("write child fixture");
+        let file_manager =
+            FmState::open_trail_to(&td.root, &td.root, false).expect("fresh Trail root");
+        let mut app = runtime_app_with_fm(file_manager);
+        let target = trail_row_by_path(&app, &td.root.join("alpha-dir"));
+        let click = mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            target.name_rect.x,
+            target.name_rect.y,
+        );
+
+        app.handle_mouse(click);
+        app.handle_mouse(click);
+        assert!(
+            app.complete_file_manager_io_for_test() || app.complete_file_manager_io_for_test(),
+            "the latest repeated directory preview applies"
+        );
+
+        let fm = app.state.file_manager.as_ref().expect("file manager open");
+        assert_eq!(fm.trail.active_col(), 0);
+        assert_eq!(fm.cwd, td.root, "operation projection keeps the row owner");
+        assert_eq!(fm.cursor, 0);
+        assert_eq!(fm.trail.cols().len(), 2);
+        assert_eq!(
+            fm.trail.cols()[1].directory,
+            td.root.join("alpha-dir"),
+            "the selected directory remains the exact open child branch"
+        );
+    }
+
+    // TP-A3.3-DISPATCH: repeated activation of a file keeps it selected and
+    // never opens a child Trail column.
+    #[test]
+    fn file_double_click_stays_selected_without_entering() {
+        let td = TempDir::new("mouse-double-file");
+        td.dir("alpha-dir");
+        td.file("beta.txt");
+        let file_manager =
+            FmState::open_trail_to(&td.root, &td.root, false).expect("fresh Trail root");
+        let mut app = runtime_app_with_fm(file_manager);
+        let target = trail_row_by_path(&app, &td.root.join("beta.txt"));
+        let click = mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            target.name_rect.x,
+            target.name_rect.y,
+        );
+
+        app.handle_mouse(click);
+        app.handle_mouse(click);
+
+        let fm = app.state.file_manager.as_ref().expect("file manager open");
+        assert_eq!(fm.cwd, td.root);
+        assert_eq!(fm.cursor, 1);
+        assert_eq!(
+            fm.selected().map(|entry| entry.name.as_str()),
+            Some("beta.txt")
+        );
+    }
+
+    // TP-A3.3-DISPATCH / TP-DCLICK-01: rapid focus of two directory rows keeps
+    // the second exact preview and cursor without transferring into its child.
+    #[test]
+    fn rapid_clicks_on_different_rows_do_not_activate_directory() {
+        let td = TempDir::new("mouse-different-rows");
+        td.dir("alpha-dir");
+        td.dir("beta-dir");
+        let file_manager =
+            FmState::open_trail_to(&td.root, &td.root, false).expect("fresh Trail root");
+        let mut app = runtime_app_with_fm(file_manager);
+        let alpha = trail_row_by_path(&app, &td.root.join("alpha-dir"));
+        let beta = trail_row_by_path(&app, &td.root.join("beta-dir"));
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            alpha.name_rect.x,
+            alpha.name_rect.y,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            beta.name_rect.x,
+            beta.name_rect.y,
+        ));
+        assert!(
+            app.complete_file_manager_io_for_test() || app.complete_file_manager_io_for_test(),
+            "only the latest rapid directory preview applies"
+        );
+
+        let fm = app.state.file_manager.as_ref().expect("file manager open");
+        assert_eq!(fm.trail.active_col(), 0);
+        assert_eq!(fm.cwd, td.root);
+        assert_eq!(fm.cursor, 1);
+        assert_eq!(
+            fm.selected().map(|entry| entry.name.as_str()),
+            Some("beta-dir")
+        );
+        assert_eq!(fm.trail.cols().len(), 2);
+        assert_eq!(fm.trail.cols()[1].directory, td.root.join("beta-dir"));
+    }
+
+    // TP-TRAIL-VSCROLL-03: an arrow press gives the scrolled column back to
+    // the selection — otherwise the reader moves a selection they can no
+    // longer see.
+    #[test]
+    fn moving_the_cursor_gives_the_scrolled_column_back_to_the_selection() {
+        let td = TempDir::new("wheel-then-arrow");
+        for index in 0..30 {
+            td.file(&format!("{index:02}.txt"));
+        }
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        let row = trail_row_by_index(&app, 0);
+        let mut now = Instant::now();
+        for _ in 0..5 {
+            now += Duration::from_millis(5);
+            let _ = app.handle_file_manager_mouse_at(
+                mouse(MouseEventKind::ScrollDown, row.name_rect.x, row.name_rect.y),
+                now,
+            );
+        }
+        let fm = app.state.file_manager.as_mut().expect("open fm");
+        assert!(
+            fm.miller.vertical.start_for(&td.root).is_some(),
+            "precondition: scrolled"
+        );
+
+        let _ = fm.move_trail_cursor(1);
+        assert_eq!(
+            fm.miller.vertical.start_for(&td.root),
+            None,
+            "the window follows the selection again"
+        );
+    }
+
+    // TP-TRAIL-VSCROLL-02 boundary: the register clamps AT the last full
+    // window. Without the input-side clamp the stored start keeps growing
+    // past it; the projection hides the excess, but the first detents back
+    // up then spend themselves shrinking it — a rubber band at the bottom
+    // edge. Pinned absolutely: however many detents land, the register never
+    // exceeds what the projection calls the last window.
+    #[test]
+    fn the_register_never_exceeds_the_last_full_window() {
+        let td = TempDir::new("wheel-rubber-band");
+        for index in 0..30 {
+            td.file(&format!("{index:02}.txt"));
+        }
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        let row = trail_row_by_index(&app, 0);
+        let mut now = Instant::now();
+
+        for _ in 0..60 {
+            now += Duration::from_millis(5);
+            let _ = app.handle_file_manager_mouse_at(
+                mouse(MouseEventKind::ScrollDown, row.name_rect.x, row.name_rect.y),
+                now,
+            );
+        }
+        // Read the same view the events resolved against — a fresh frame
+        // would carry a different height and call a different window "last".
+        let column = app
+            .state
+            .view
+            .file_manager_trail
+            .columns
+            .first()
+            .cloned()
+            .expect("visible column");
+        let last_window = column.line_total - column.line_height;
+        assert!(last_window > 0, "precondition: the listing overflows");
+        assert_eq!(
+            app.state
+                .file_manager
+                .as_ref()
+                .expect("open fm")
+                .miller
+                .vertical
+                .start_for(&td.root),
+            Some(last_window),
+            "sixty detents stop exactly at the last full window"
+        );
+    }
+
+    // TP-TRAIL-VSCROLL-02 (was TP-A3.3-DISPATCH, which pinned the cursor road
+    // this replaces): wheel input over a column moves its window one bounded
+    // line per detent. The FM header is not a column and moves nothing.
+    #[test]
+    fn wheel_scrolls_within_bounds_only_over_column_bodies() {
+        let td = TempDir::new("mouse-wheel");
+        for index in 0..6 {
+            td.file(&format!("{index:02}.txt"));
+        }
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        let row = trail_row_by_index(&app, 0);
+        let mut now = Instant::now();
+
+        let start_of = |app: &App| {
+            app.state
+                .file_manager
+                .as_ref()
+                .expect("open fm")
+                .miller
+                .vertical
+                .start_for(&td.root)
+        };
+
+        let _ = app.handle_file_manager_mouse_at(
+            mouse(MouseEventKind::ScrollUp, row.name_rect.x, row.name_rect.y),
+            now,
+        );
+        assert_eq!(
+            start_of(&app),
+            Some(0),
+            "already at the top, it stays there"
+        );
+
+        for _ in 0..20 {
+            now += Duration::from_millis(5);
+            let _ = app.handle_file_manager_mouse_at(
+                mouse(MouseEventKind::ScrollDown, row.name_rect.x, row.name_rect.y),
+                now,
+            );
+        }
+        let bottom = start_of(&app).expect("the column carries a window now");
+        assert!(bottom > 0, "twenty detents moved it down");
+
+        now += Duration::from_millis(5);
+        let _ = app.handle_file_manager_mouse_at(mouse(MouseEventKind::ScrollDown, 27, 0), now);
+        assert_eq!(
+            start_of(&app),
+            Some(bottom),
+            "the header is not a column body"
+        );
+
+        for _ in 0..20 {
+            now += Duration::from_millis(5);
+            let _ = app.handle_file_manager_mouse_at(
+                mouse(MouseEventKind::ScrollUp, row.name_rect.x, row.name_rect.y),
+                now,
+            );
+        }
+        assert_eq!(start_of(&app), Some(0), "and back to the first line");
+        assert_eq!(
+            app.state.file_manager.as_ref().expect("open fm").cursor,
+            0,
+            "the cursor sat still through all of it"
+        );
+    }
+
+    // MTIME-5 RED: date headers are typed non-row terrain. Every button and
+    // modifier is consumed without creating row, menu, selection, detail, or
+    // horizontal-scroll authority.
+    #[test]
+    fn grouped_miller_header_buttons_and_modifiers_are_inert() {
+        let td = TempDir::new("grouped-header-inert");
+        td.file("older.txt");
+        td.file("today.txt");
+        fs::File::open(td.root.join("today.txt"))
+            .expect("open recent header fixture")
+            .set_times(fs::FileTimes::new().set_modified(std::time::SystemTime::now()))
+            .expect("set recent header fixture mtime");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        let header = app.state.view.file_manager_trail.columns[0].section_headers[0].clone();
+        let before = {
+            let fm = app.state.file_manager.as_ref().expect("open FM");
+            (
+                fm.cursor,
+                fm.trail.clone(),
+                fm.trail_snapshots.detail().cloned(),
+                fm.multi_selection_paths().clone(),
+                fm.miller.horizontal.offset_cells,
+            )
+        };
+
+        for event in [
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                header.rect.x,
+                header.rect.y,
+            ),
+            mouse(
+                MouseEventKind::Down(MouseButton::Right),
+                header.rect.x,
+                header.rect.y,
+            ),
+            mouse(
+                MouseEventKind::Down(MouseButton::Middle),
+                header.rect.x,
+                header.rect.y,
+            ),
+            mouse_with_modifiers(
+                MouseEventKind::Down(MouseButton::Left),
+                header.rect.x,
+                header.rect.y,
+                KeyModifiers::CONTROL,
+            ),
+            mouse_with_modifiers(
+                MouseEventKind::Down(MouseButton::Left),
+                header.rect.x,
+                header.rect.y,
+                KeyModifiers::SHIFT,
+            ),
+            mouse_with_modifiers(
+                MouseEventKind::Down(MouseButton::Left),
+                header.rect.x,
+                header.rect.y,
+                KeyModifiers::ALT,
+            ),
+        ] {
+            assert_eq!(
+                app.handle_file_manager_mouse(event),
+                FileManagerMouseDispatch::Consumed
+            );
+        }
+
+        let fm = app.state.file_manager.as_ref().expect("open FM");
+        assert_eq!(
+            (
+                fm.cursor,
+                fm.trail.clone(),
+                fm.trail_snapshots.detail().cloned(),
+                fm.multi_selection_paths().clone(),
+                fm.miller.horizontal.offset_cells,
+            ),
+            before
+        );
+        assert!(app.state.context_menu.is_none());
+    }
+
+    // MTIME-5 RED: a plain vertical wheel event over a date header navigates
+    // the header's owning column and cannot enter the horizontal fallback.
+    #[test]
+    fn grouped_miller_header_wheel_moves_owning_column_not_horizontal_offset() {
+        let td = TempDir::new("grouped-header-wheel");
+        td.dir("child");
+        fs::write(td.root.join("child/today.txt"), b"x").expect("write recent child fixture");
+        fs::write(td.root.join("child/older.txt"), b"x").expect("write older child fixture");
+        fs::File::open(td.root.join("child/today.txt"))
+            .expect("open recent child fixture")
+            .set_times(fs::FileTimes::new().set_modified(std::time::SystemTime::now()))
+            .expect("set recent child fixture mtime");
+        TempDir::set_modified(&td.root.join("child/older.txt"));
+        let fm = FmState::open_trail_to(&td.root, &td.root.join("child"), false)
+            .expect("grouped child Trail fixture");
+        let mut app = runtime_app_with_fm(fm);
+        let header = app
+            .state
+            .view
+            .file_manager_trail
+            .columns
+            .iter()
+            .find(|column| column.trail_index == 1)
+            .and_then(|column| column.section_headers.first())
+            .cloned()
+            .expect("visible child date header");
+        let expected_path = td.root.join("child/today.txt");
+        let before_offset = app
+            .state
+            .file_manager
+            .as_ref()
+            .expect("open FM")
+            .miller
+            .horizontal
+            .offset_cells;
+
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::ScrollDown,
+                header.rect.x,
+                header.rect.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+
+        let fm = app.state.file_manager.as_ref().expect("open FM");
+        assert_eq!(
+            fm.selected().map(|entry| entry.path.as_path()),
+            Some(expected_path.as_path())
+        );
+        assert_eq!(fm.trail.active_col(), header.trail_index);
+        assert_eq!(fm.miller.horizontal.offset_cells, before_offset);
+    }
+
+    // MTIME-5 RED: the prepared timestamp interval is part of the exact row
+    // hit target and therefore resolves the same stable path as the name.
+    #[test]
+    fn grouped_miller_timestamp_click_activates_exact_row_path() {
+        let td = TempDir::new("grouped-timestamp-hit");
+        td.file("target.txt");
+        fs::File::open(td.root.join("target.txt"))
+            .expect("open timestamp target")
+            .set_times(fs::FileTimes::new().set_modified(std::time::SystemTime::now()))
+            .expect("set timestamp target mtime");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        let expected_path = td.root.join("target.txt");
+        let row = trail_row_by_path(&app, &expected_path);
+        let timestamp = row.timestamp.expect("complete timestamp geometry");
+
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                timestamp.rect.x,
+                timestamp.rect.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+        assert_eq!(
+            app.state
+                .file_manager
+                .as_ref()
+                .expect("open FM")
+                .selected()
+                .map(|entry| entry.path.as_path()),
+            Some(expected_path.as_path())
+        );
+    }
+
+    // TP-FMN-WHEEL-03 / TP-TRAIL-T7-INPUT-03: one accepted wheel event over
+    // an ancestor moves exactly one row in that owner. Directory preview is
+    // bounded/off-loop and its completion cannot transfer focus to the child.
+    #[test]
+    fn plain_wheel_moves_one_ancestor_row_without_child_focus_transfer() {
+        let td = TempDir::new("ancestor-trail-wheel");
+        for name in ["00-alpha", "01-bravo", "02-current"] {
+            td.dir(name);
+        }
+        td.set_equal_modified(&["00-alpha", "01-bravo", "02-current"]);
+        let current = td.root.join("02-current");
+        let file_manager =
+            FmState::open_trail_to(&td.root, &current, false).expect("ancestor Trail fixture");
+        let mut app = runtime_app_with_fm(file_manager);
+        install_focused_agent(&mut app);
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        compute_view(&mut app.state, Rect::new(0, 0, 120, 10));
+        let ancestor_row = app
+            .state
+            .view
+            .file_manager_trail
+            .columns
+            .first()
+            .and_then(|column| column.rows.first())
+            .cloned()
+            .expect("ancestor Trail row");
+
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::ScrollUp,
+                ancestor_row.name_rect.x,
+                ancestor_row.name_rect.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+
+        let pending = app.state.file_manager.as_ref().expect("open FM");
+        assert_eq!(pending.trail.active_col(), 0);
+        assert_eq!(pending.cursor, 1, "one wheel event moves exactly one row");
+        assert_eq!(pending.trail.cols()[1].directory, current);
+        assert!(app.complete_file_manager_io_for_test());
+
+        let after = app.state.file_manager.as_ref().expect("open FM");
+        assert_eq!(after.trail.active_col(), 0, "preview cannot steal focus");
+        assert_eq!(
+            after.trail.cols()[0].selected.as_deref(),
+            Some(td.root.join("01-bravo").as_path())
+        );
+        assert_eq!(after.trail.cols()[1].directory, td.root.join("01-bravo"));
+    }
+
+    // TP-TRAIL-VSCROLL-02 (was TP-FM3-PREVIEW-WHEEL / TP-TRAIL-T7-INPUT-03,
+    // which pinned the cursor road this replaces): human-scale wheel detents
+    // over the hovered child scroll ITS content, one line per detent, and
+    // leave both the cursor and the activated branch where they were.
+    #[test]
+    fn plain_wheel_scrolls_only_the_hovered_child_column() {
+        let td = TempDir::new("preview-wheel");
+        let preview_directory = td.root.join("preview-directory");
+        fs::create_dir_all(&preview_directory).expect("create preview directory");
+        for index in 0..12 {
+            fs::write(preview_directory.join(format!("{index:02}.txt")), b"x")
+                .expect("write preview entry");
+        }
+        let modified = std::time::UNIX_EPOCH + Duration::from_secs(10);
+        for index in 0..12 {
+            let path = preview_directory.join(format!("{index:02}.txt"));
+            let entry = fs::File::open(path).expect("open preview entry");
+            entry
+                .set_times(fs::FileTimes::new().set_modified(modified))
+                .expect("set preview entry mtime");
+        }
+        let file_manager = FmState::open_trail_to(&td.root, &preview_directory, false)
+            .expect("child Trail fixture");
+        let mut app = runtime_app_with_fm(file_manager);
+        install_focused_agent(&mut app);
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        let frame = Rect::new(0, 0, 100, 8);
+        compute_view(&mut app.state, frame);
+        let child_column = app
+            .state
+            .view
+            .file_manager_trail
+            .columns
+            .last()
+            .cloned()
+            .expect("visible child Trail column");
+        let probe = child_column.rows[0].name_rect;
+        let selected_before = app
+            .state
+            .file_manager
+            .as_ref()
+            .expect("open FM")
+            .selected()
+            .map(|entry| entry.path.clone());
+
+        let mut now = Instant::now();
+        for _ in 0..3 {
+            let _ = app.handle_file_manager_mouse_at(
+                mouse(MouseEventKind::ScrollDown, probe.x, probe.y),
+                now,
+            );
+            now += Duration::from_millis(5);
+        }
+        let after = app.state.file_manager.as_ref().expect("open FM");
+        assert_eq!(
+            after.miller.vertical.start_for(&preview_directory),
+            Some(3),
+            "three detents moved this column's window three lines"
+        );
+        assert_eq!(
+            after.miller.vertical.start_for(&td.root),
+            None,
+            "and left every other column alone"
+        );
+        assert_eq!(
+            after.selected().map(|entry| entry.path.clone()),
+            selected_before,
+            "scrolling the content does not move the selection"
+        );
+        assert_eq!(
+            after.trail.cols()[1].selected,
+            None,
+            "nor can it activate a file branch"
+        );
+    }
+
+    // TP-TRAIL-VSCROLL-02 (was TP-FM3-PARENT-WHEEL / TP-TRAIL-T7-INPUT-03):
+    // repeated wheel movement in one column remains bounded at the top of
+    // its listing, and the activated branch under it is untouched.
+    #[test]
+    fn plain_wheel_clamps_the_hovered_parent_column_at_its_first_line() {
+        let td = TempDir::new("prepared-parent-wheel");
+        for index in 0..10 {
+            td.dir(&format!("{index:02}-sibling"));
+        }
+        let current = td.root.join("zz-current");
+        fs::create_dir(&current).expect("create current directory");
+        let mut names = (0..10)
+            .map(|index| format!("{index:02}-sibling"))
+            .collect::<Vec<_>>();
+        names.push("zz-current".to_string());
+        let name_refs = names.iter().map(String::as_str).collect::<Vec<_>>();
+        td.set_equal_modified(&name_refs);
+        let file_manager =
+            FmState::open_trail_to(&td.root, &current, false).expect("parent Trail fixture");
+        let mut app = runtime_app_with_fm(file_manager);
+        install_focused_agent(&mut app);
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        compute_view(&mut app.state, Rect::new(0, 0, 200, 8));
+        let parent_column = app
+            .state
+            .view
+            .file_manager_trail
+            .columns
+            .first()
+            .cloned()
+            .expect("visible parent Trail column");
+        let target = parent_column.rows[0].clone();
+        let cursor_before = app.state.file_manager.as_ref().expect("open FM").cursor;
+
+        let mut now = Instant::now();
+        for _ in 0..30 {
+            let _ = app.handle_file_manager_mouse_at(
+                mouse(
+                    MouseEventKind::ScrollUp,
+                    target.name_rect.x,
+                    target.name_rect.y,
+                ),
+                now,
+            );
+            now += Duration::from_millis(5);
+        }
+
+        let after = app.state.file_manager.as_ref().expect("open FM");
+        assert_eq!(
+            after.miller.vertical.start_for(&td.root),
+            Some(0),
+            "thirty detents upward stop at the first line, they do not wrap or underflow"
+        );
+        assert_eq!(
+            after.trail.active_col(),
+            1,
+            "hover is not focus: scrolling the parent leaves the child active"
+        );
+        assert_eq!(after.cursor, cursor_before, "the cursor never moved");
+        assert_eq!(
+            after.trail.cols()[1].directory,
+            current,
+            "and the activated branch under it is untouched"
+        );
+    }
+
+    // TP-FM3-NONCURRENT-MODIFIERS: Ctrl/Shift selection authority is confined
+    // to CURRENT. A preview/ancestor target with either modifier is consumed
+    // without activating a directory or creating cross-directory selection.
+
+    // TP-FM3-STALE-CONTEXT: a right-click target can become stale on disk
+    // after projection. The second revalidation must preserve model state and
+    // must not open a destructive context overlay.
+
+    // TP-FM1.3-HSCROLL-MODIFIERS: only the exact Shift+wheel gesture changes
+    // the horizontal window. Control/Alt and combined modifiers are consumed
+    // fail-closed and cannot accidentally become vertical list navigation.
+    #[test]
+    fn non_shift_modified_wheel_is_consumed_without_moving_any_axis() {
+        let td = TempDir::new("miller-wheel-modifiers");
+        for index in 0..3 {
+            td.file(&format!("{index:02}.txt"));
+        }
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        let before = app.state.file_manager.as_ref().expect("open FM").clone();
+
+        for modifiers in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ] {
+            assert_eq!(
+                app.handle_file_manager_mouse(mouse_with_modifiers(
+                    MouseEventKind::ScrollDown,
+                    27,
+                    3,
+                    modifiers,
+                )),
+                FileManagerMouseDispatch::Consumed
+            );
+        }
+
+        let after = app.state.file_manager.as_ref().expect("open FM");
+        assert_eq!(after.cursor, before.cursor);
+        assert_eq!(after.viewport_start, before.viewport_start);
+        assert_eq!(
+            after.miller.horizontal.offset_cells,
+            before.miller.horizontal.offset_cells
+        );
+    }
+
+    // TP-TRAIL-FSCROLL-01/02/06: one horizontal event moves by one third of
+    // the leading logical column, keeps that column partially visible, and
+    // publishes only stage-contained hit geometry. This is intentionally
+    // compile-valid against the whole-column implementation so RED proves the
+    // missing behavior rather than a missing symbol.
+    #[test]
+    fn fractional_scroll_uses_each_leading_columns_own_width() {
+        let td = TempDir::new("trail-fractional-scroll");
+        let root = td.root.join("root");
+        let mut current = root.clone();
+        for level in 0..7 {
+            current.push(format!("level-{level}"));
+        }
+        fs::create_dir_all(&current).expect("create deep Trail fixture");
+
+        for width in [18_u16, 30, 48] {
+            let mut file_manager =
+                FmState::open_trail_to(&root, &current, false).expect("open deep Trail");
+            for segment in &mut file_manager.miller.chain {
+                segment.preferred_width = width;
+            }
+            let original_trail = file_manager.trail.clone();
+            let mut app = runtime_app_with_fm(file_manager);
+            install_focused_agent(&mut app);
+            app.state.mobile_width_threshold = 0;
+            app.state.sidebar_collapsed = true;
+            let frame = Rect::new(0, 0, 64, 14);
+            compute_view(&mut app.state, frame);
+            let horizontal = &mut app
+                .state
+                .file_manager
+                .as_mut()
+                .expect("open FM")
+                .miller
+                .horizontal;
+            horizontal.offset_cells = 0;
+            horizontal.follow_active = false;
+            compute_view(&mut app.state, frame);
+            let stage = app.state.view.terminal_area;
+            let trail = app.state.view.file_manager_locations.layout.trail;
+            let probe = (trail.x.saturating_add(1), trail.y.saturating_add(1));
+
+            assert_eq!(
+                app.handle_file_manager_mouse(
+                    mouse(MouseEventKind::ScrollRight, probe.0, probe.1,)
+                ),
+                FileManagerMouseDispatch::Consumed
+            );
+            compute_view(&mut app.state, frame);
+
+            let view = &app.state.view.file_manager_trail;
+            let leading = view.columns.first().expect("partially visible root column");
+            let step = width.div_ceil(3);
+            assert_eq!(
+                leading.trail_index, 0,
+                "one event must not skip the leading logical column"
+            );
+            assert_eq!(
+                leading.rect.width,
+                width - step,
+                "one event clips exactly one third of the {width}-cell column"
+            );
+            assert!(view.columns.iter().all(|column| {
+                stage.contains((column.rect.x, column.rect.y).into())
+                    && column.rect.right() <= stage.right()
+                    && column.rows.iter().all(|row| {
+                        row.rect.right() <= stage.right()
+                            && row.name_rect.right() <= stage.right()
+                            && row
+                                .actions
+                                .iter()
+                                .all(|action| action.rect.right() <= stage.right())
+                    })
+            }));
+            assert_eq!(
+                app.state.file_manager.as_ref().expect("open FM").trail,
+                original_trail,
+                "fractional scrolling changes viewport presentation only"
+            );
+        }
+    }
+
+    // TP-TRAIL-WHEEL-FALLBACK-01: some terminal hosts report the user's
+    // horizontal Miller gesture as an unmodified vertical wheel event. A
+    // wheel over a live column's empty body must still reach the existing
+    // fractional horizontal reducer without stealing visible-row navigation.
+    #[test]
+    fn plain_wheel_over_empty_trail_body_uses_fractional_horizontal_fallback() {
+        let td = TempDir::new("trail-plain-wheel-fallback");
+        let root = td.root.join("root");
+        let mut current = root.clone();
+        for level in 0..7 {
+            current.push(format!("level-{level}"));
+        }
+        fs::create_dir_all(&current).expect("create deep Trail fixture");
+
+        let mut file_manager =
+            FmState::open_trail_to(&root, &current, false).expect("open deep Trail");
+        for segment in &mut file_manager.miller.chain {
+            segment.preferred_width = 30;
+        }
+        let mut app = runtime_app_with_fm(file_manager);
+        install_focused_agent(&mut app);
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        let frame = Rect::new(0, 0, 64, 14);
+        compute_view(&mut app.state, frame);
+
+        let view = &app.state.view.file_manager_trail;
+        let initial_offset = view.offset_cells;
+        let step_left = view.scroll_step_left;
+        let column = view.columns.first().expect("visible Trail column");
+        let probe = (column.rect.x, column.rect.bottom().saturating_sub(1));
+        assert!(
+            crate::ui::trail_row_at(view, probe.0, probe.1).is_none(),
+            "the probe must exercise empty column body, not row navigation"
+        );
+        assert!(initial_offset > step_left);
+
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(MouseEventKind::ScrollUp, probe.0, probe.1)),
+            FileManagerMouseDispatch::Consumed
+        );
+        assert_eq!(
+            app.state
+                .file_manager
+                .as_ref()
+                .expect("open FM")
+                .miller
+                .horizontal
+                .offset_cells,
+            initial_offset - step_left,
+            "plain wheel over empty Trail body must use the fractional horizontal reducer"
+        );
+
+        compute_view(&mut app.state, frame);
+        assert_eq!(
+            app.state.view.file_manager_trail.offset_cells,
+            initial_offset - step_left,
+            "the fallback-selected origin must survive the next frame"
+        );
+    }
+
+    // TP-TRAIL-HSCROLL-BRANCH: a manually positioned five-column viewport
+    // must not turn its rightmost visible column into a navigation boundary.
+    // Reactivating the real directory there preserves the loaded Trail branch
+    // and rearms active-end following so its child column is visible again.
+    #[test]
+    fn rightmost_visible_directory_click_preserves_branch_and_reveals_child() {
+        let td = TempDir::new("trail-rightmost-visible-branch");
+        let root = td.root.join("root");
+        let mut current = root.clone();
+        for level in 0..7 {
+            current.push(format!("level-{level}"));
+        }
+        let next = current.join("next");
+        fs::create_dir_all(&next).expect("create deep Trail branch fixture");
+        fs::write(next.join("visible-child.txt"), b"x").expect("write next-column child");
+
+        let file_manager = FmState::open_trail_to(&root, &current, false).expect("open deep Trail");
+        let mut app = runtime_app_with_fm(file_manager);
+        install_focused_agent(&mut app);
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        // Preserve the original 130-cell Trail viewport after FCL-3 reserves
+        // the wide 24-cell locations rail and its one-cell separator.
+        let frame = Rect::new(0, 0, 155, 18);
+        compute_view(&mut app.state, frame);
+
+        let initial_offset = app.state.view.file_manager_trail.offset_cells;
+        let probe = app
+            .state
+            .view
+            .file_manager_trail
+            .columns
+            .first()
+            .map(|column| (column.rect.x, column.rect.bottom().saturating_sub(1)))
+            .expect("visible Trail column");
+        for _ in 0..32 {
+            let active_is_visible = app
+                .state
+                .view
+                .file_manager_trail
+                .columns
+                .iter()
+                .any(|column| column.directory == current);
+            if !active_is_visible {
+                break;
+            }
+            assert_eq!(
+                app.handle_file_manager_mouse(mouse(MouseEventKind::ScrollLeft, probe.0, probe.1,)),
+                FileManagerMouseDispatch::Consumed
+            );
+            compute_view(&mut app.state, frame);
+        }
+
+        let before = app.state.file_manager.as_ref().expect("open FM");
+        assert!(
+            !before.miller.horizontal.follow_active,
+            "manual horizontal input must own the pre-click viewport"
+        );
+        assert!(
+            before.miller.horizontal.offset_cells < initial_offset,
+            "fractional input must expose the fifth column while hiding its active child"
+        );
+        let deepest = before.trail.deepest();
+        let visible = &app.state.view.file_manager_trail.columns;
+        assert_eq!(
+            visible.len(),
+            5,
+            "the regression fixture must expose exactly five live columns"
+        );
+        let rightmost = visible
+            .iter()
+            .max_by_key(|column| column.rect.right())
+            .expect("rightmost visible Trail column");
+        assert_eq!(rightmost.trail_index + 1, deepest);
+        assert_eq!(
+            current.parent(),
+            Some(rightmost.directory.as_path()),
+            "the fifth visible column owns the hidden active child's row"
+        );
+        let target = rightmost
+            .rows
+            .iter()
+            .find(|row| row.entry_path == current)
+            .cloned()
+            .expect("rightmost directory row");
+
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                target.name_rect.x,
+                target.name_rect.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+        assert!(
+            app.complete_file_manager_io_for_test(),
+            "the hidden child preview applies after bounded I/O"
+        );
+        compute_view(&mut app.state, frame);
+
+        let after = app.state.file_manager.as_ref().expect("open FM");
+        assert_eq!(
+            after.trail.deepest(),
+            deepest,
+            "reactivating the same open branch preserves its logical depth"
+        );
+        assert_eq!(
+            after.trail.cols().last().map(|column| &column.directory),
+            Some(&current)
+        );
+        assert_eq!(
+            after.trail.active_col(),
+            target.trail_index,
+            "click keeps focus on the visible directory owner"
+        );
+        assert!(
+            after.miller.horizontal.follow_active,
+            "same-branch preview rearms following around the focused owner"
+        );
+        // TP-TRAIL-REVEAL-01 rebase: the click used to leave the child
+        // clipped off-screen until Right revealed it — the exact dead press
+        // the reveal removed. The branch-preservation core of this proof is
+        // untouched: depth, the focus owner, and rearmed following above.
+        assert!(
+            app.state
+                .view
+                .file_manager_trail
+                .columns
+                .iter()
+                .any(|column| column.directory == current),
+            "the reactivated branch's child column is revealed by the click itself"
+        );
+
+        assert_eq!(
+            handle_file_manager_key(&mut app.state, key(KeyCode::Right)),
+            FileManagerKeyDispatch::Consumed
+        );
+        compute_view(&mut app.state, frame);
+        let entered = app.state.file_manager.as_ref().expect("open FM");
+        assert_eq!(entered.trail.active_col(), deepest);
+        assert_eq!(
+            entered.selected().map(|entry| entry.path.as_path()),
+            Some(next.as_path()),
+            "Right highlights the hidden child's first row immediately"
+        );
+        assert!(
+            app.state
+                .view
+                .file_manager_trail
+                .columns
+                .iter()
+                .any(|column| column.directory == current),
+            "visible indices={:?}, offset={}, max={}, detail={:?}",
+            app.state
+                .view
+                .file_manager_trail
+                .columns
+                .iter()
+                .map(|column| column.trail_index)
+                .collect::<Vec<_>>(),
+            app.state.view.file_manager_trail.offset_cells,
+            app.state.view.file_manager_trail.max_offset_cells,
+            app.state.view.file_manager_trail.detail_panel,
+        );
+        let revealed = app
+            .state
+            .view
+            .file_manager_trail
+            .columns
+            .iter()
+            .find(|column| column.directory == current)
+            .expect("hidden child Trail column must become visible");
+        assert!(
+            revealed.rows.iter().any(|row| row.entry_path == next),
+            "the revealed column must render the clicked directory's contents"
+        );
+    }
+
+    #[test]
+    fn fractional_scroll_resize_clamps_and_navigation_rearms_auto_follow() {
+        let td = TempDir::new("trail-fractional-lifecycle");
+        let root = td.root.join("root");
+        let mut current = root.clone();
+        for level in 0..7 {
+            current.push(format!("level-{level}"));
+        }
+        fs::create_dir_all(&current).expect("create deep Trail fixture");
+        let mut file_manager =
+            FmState::open_trail_to(&root, &current, false).expect("open deep Trail");
+        for segment in &mut file_manager.miller.chain {
+            segment.preferred_width = 30;
+        }
+        let mut app = runtime_app_with_fm(file_manager);
+        install_focused_agent(&mut app);
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+
+        compute_view(&mut app.state, Rect::new(0, 0, 64, 14));
+        let narrow_max = app.state.view.file_manager_trail.max_offset_cells;
+        assert!(narrow_max > 0);
+        {
+            let horizontal = &mut app
+                .state
+                .file_manager
+                .as_mut()
+                .expect("open FM")
+                .miller
+                .horizontal;
+            horizontal.offset_cells = narrow_max;
+            horizontal.follow_active = false;
+        }
+
+        compute_view(&mut app.state, Rect::new(0, 0, 110, 14));
+        let wider_max = app.state.view.file_manager_trail.max_offset_cells;
+        let horizontal = app
+            .state
+            .file_manager
+            .as_ref()
+            .expect("open FM")
+            .miller
+            .horizontal;
+        assert_eq!(horizontal.offset_cells, wider_max);
+        assert!(wider_max <= narrow_max);
+        assert!(
+            !horizontal.follow_active,
+            "resize clamps manual scroll without stealing viewport authority"
+        );
+
+        app.state.file_manager.as_mut().expect("open FM").leave();
+        assert!(
+            app.state
+                .file_manager
+                .as_ref()
+                .expect("open FM")
+                .miller
+                .horizontal
+                .follow_active,
+            "Trail navigation rearms active-column auto-follow"
+        );
+        compute_view(&mut app.state, Rect::new(0, 0, 110, 14));
+        let file_manager = app.state.file_manager.as_ref().expect("open FM");
+        let active = file_manager.trail.active_col();
+        assert!(
+            app.state
+                .view
+                .file_manager_trail
+                .columns
+                .iter()
+                .any(|column| column.trail_index == active),
+            "the rearmed projection keeps the active Trail column visible"
+        );
+    }
+
+    // FCL-0 characterization: the content rail program must preserve this
+    // existing fractional Trail viewport authority byte-for-byte.
+    // TP-TRAIL-HSCROLL-01: the canonical Globex Miller viewport auto-follows
+    // the active end when a deep Trail opens, then lets the user scroll back
+    // to still-live ancestor columns. The chosen origin must survive the next
+    // pure projection instead of snapping right again.
+    #[test]
+    fn shift_wheel_scrolls_deep_trail_left_and_persists_render_origin() {
+        let td = TempDir::new("trail-horizontal-scroll");
+        let root = td.root.join("root");
+        let mut current = root.clone();
+        for level in 0..7 {
+            current.push(format!("level-{level}"));
+        }
+        fs::create_dir_all(&current).expect("create deep Trail fixture");
+
+        let mut file_manager =
+            FmState::open_trail_to(&root, &current, false).expect("open deep Trail");
+        for segment in &mut file_manager.miller.chain {
+            segment.preferred_width = crate::fm::miller::MILLER_COLUMN_MIN_WIDTH;
+        }
+        let original_trail = file_manager.trail.clone();
+        let mut app = runtime_app_with_fm(file_manager);
+        install_focused_agent(&mut app);
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        let frame = Rect::new(0, 0, 70, 14);
+        compute_view(&mut app.state, frame);
+
+        let initial_offset = app.state.view.file_manager_trail.offset_cells;
+        assert!(
+            initial_offset > 0,
+            "a deep Trail must initially auto-follow its active end"
+        );
+        let step_left = app.state.view.file_manager_trail.scroll_step_left;
+        let trail = app.state.view.file_manager_locations.layout.trail;
+        let probe = (trail.x.saturating_add(1), trail.y.saturating_add(1));
+
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse_with_modifiers(
+                MouseEventKind::ScrollUp,
+                probe.0,
+                probe.1,
+                KeyModifiers::SHIFT,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+        let expected_offset = initial_offset.saturating_sub(step_left);
+        assert_eq!(
+            app.state
+                .file_manager
+                .as_ref()
+                .expect("open FM")
+                .miller
+                .horizontal
+                .offset_cells,
+            expected_offset,
+            "Shift+wheel left exposes a fractional slice of the preceding live ancestor"
+        );
+
+        compute_view(&mut app.state, frame);
+        assert_eq!(
+            app.state.view.file_manager_trail.offset_cells, expected_offset,
+            "the Trail renderer must preserve the user-selected cell offset"
+        );
+        assert_eq!(
+            app.state.file_manager.as_ref().expect("open FM").trail,
+            original_trail,
+            "horizontal scroll changes viewport state only"
+        );
+    }
+
+    // TP-FM1.3-HSCROLL: native horizontal wheel events and Shift+wheel move
+    // ONLY the bounded Miller window. Current/preview remain visible after
+    // every recompute, while vertical cursor/viewport, entries, selection,
+    // preview identity, and the structural Miller revision stay unchanged.
+    #[test]
+    fn horizontal_wheel_is_bounded_for_single_trail_column_and_preserves_focus() {
+        let td = TempDir::new("miller-horizontal-wheel");
+        let mut current = td.root.clone();
+        for level in 0..8 {
+            current.push(format!("level-{level}"));
+        }
+        fs::create_dir_all(&current).expect("create deep Miller fixture");
+        fs::write(current.join("00.txt"), b"x").expect("write selected fixture");
+
+        let mut file_manager = FmState::new(&current);
+        for segment in &mut file_manager.miller.chain {
+            segment.preferred_width = crate::fm::miller::MILLER_COLUMN_MIN_WIDTH;
+        }
+        let mut app = runtime_app_with_fm(file_manager);
+        install_focused_agent(&mut app);
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        let frame = Rect::new(0, 0, 144, 18);
+        compute_view(&mut app.state, frame);
+
+        let before = app.state.file_manager.as_ref().expect("open FM").clone();
+        let initial_offset = app
+            .state
+            .file_manager
+            .as_ref()
+            .expect("open FM")
+            .miller
+            .horizontal
+            .offset_cells;
+        let probe = app
+            .state
+            .view
+            .file_manager_miller
+            .columns
+            .iter()
+            .find(|column| column.kind.is_current())
+            .map(|column| (column.content_rect.x, column.content_rect.y))
+            .expect("current column probe");
+
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(MouseEventKind::ScrollRight, probe.0, probe.1,)),
+            FileManagerMouseDispatch::Consumed
+        );
+        assert_eq!(
+            app.state
+                .file_manager
+                .as_ref()
+                .expect("open FM")
+                .miller
+                .horizontal
+                .offset_cells,
+            initial_offset,
+            "a one-column Trail has no hidden horizontal origin"
+        );
+        compute_view(&mut app.state, frame);
+        assert!(
+            app.state
+                .view
+                .file_manager_miller
+                .columns
+                .iter()
+                .any(|column| column.kind.is_current()),
+            "current remains visible after horizontal scroll"
+        );
+        assert!(
+            app.state
+                .view
+                .file_manager_miller
+                .columns
+                .iter()
+                .any(|column| column.kind.is_preview()),
+            "preview remains visible after horizontal scroll"
+        );
+
+        app.handle_file_manager_mouse(mouse_with_modifiers(
+            MouseEventKind::ScrollUp,
+            probe.0,
+            probe.1,
+            KeyModifiers::SHIFT,
+        ));
+        assert_eq!(
+            app.state
+                .file_manager
+                .as_ref()
+                .expect("open FM")
+                .miller
+                .horizontal
+                .offset_cells,
+            initial_offset,
+            "Shift+ScrollUp maps to horizontal left"
+        );
+        compute_view(&mut app.state, frame);
+
+        app.handle_file_manager_mouse(mouse_with_modifiers(
+            MouseEventKind::ScrollDown,
+            probe.0,
+            probe.1,
+            KeyModifiers::SHIFT,
+        ));
+        assert_eq!(
+            app.state
+                .file_manager
+                .as_ref()
+                .expect("open FM")
+                .miller
+                .horizontal
+                .offset_cells,
+            initial_offset,
+            "Shift+ScrollDown remains bounded for one Trail column"
+        );
+        app.handle_file_manager_mouse(mouse(MouseEventKind::ScrollLeft, probe.0, probe.1));
+        assert_eq!(
+            app.state
+                .file_manager
+                .as_ref()
+                .expect("open FM")
+                .miller
+                .horizontal
+                .offset_cells,
+            initial_offset,
+            "native ScrollLeft returns to the bounded origin"
+        );
+
+        for _ in 0..64 {
+            app.handle_file_manager_mouse(mouse(MouseEventKind::ScrollLeft, probe.0, probe.1));
+        }
+        assert_eq!(
+            app.state
+                .file_manager
+                .as_ref()
+                .expect("open FM")
+                .miller
+                .horizontal
+                .offset_cells,
+            initial_offset,
+            "left input clamps at the fullest focused window"
+        );
+
+        for _ in 0..64 {
+            app.handle_file_manager_mouse(mouse(MouseEventKind::ScrollRight, probe.0, probe.1));
+        }
+        let maximum_offset = app.state.view.file_manager_trail.max_offset_cells;
+        assert_eq!(
+            app.state
+                .file_manager
+                .as_ref()
+                .expect("open FM")
+                .miller
+                .horizontal
+                .offset_cells,
+            maximum_offset,
+            "right input clamps at the final content cell"
+        );
+        compute_view(&mut app.state, frame);
+        assert!(
+            app.state
+                .view
+                .file_manager_miller
+                .columns
+                .iter()
+                .any(|column| column.kind.is_current()),
+            "current remains visible at the right clamp"
+        );
+        assert!(
+            app.state
+                .view
+                .file_manager_miller
+                .columns
+                .iter()
+                .any(|column| column.kind.is_preview()),
+            "preview remains visible at the right clamp"
+        );
+
+        let after = app.state.file_manager.as_ref().expect("open FM");
+        assert_eq!(after.cursor, before.cursor);
+        assert_eq!(after.viewport_start, before.viewport_start);
+        assert_eq!(after.entries, before.entries);
+        assert_eq!(
+            after.multi_selection_paths(),
+            before.multi_selection_paths()
+        );
+        assert_eq!(after.preview_generation, before.preview_generation);
+        assert_eq!(after.preview, before.preview);
+        assert_eq!(after.miller.chain, before.miller.chain);
+        assert_eq!(after.miller.revision, before.miller.revision);
+    }
+
+    // TP-FM1.3-HSCROLL-AUTHORITY: horizontal input consumes only a fresh
+    // active-Files snapshot inside the Files terrain. Stale model/generation
+    // identity is inert, overlays retain priority, and outside coordinates
+    // remain available to the outer shell router.
+    #[test]
+    fn horizontal_wheel_fails_closed_without_fresh_files_authority() {
+        let td = TempDir::new("miller-horizontal-authority");
+        let mut current = td.root.clone();
+        for level in 0..8 {
+            current.push(format!("level-{level}"));
+        }
+        fs::create_dir_all(&current).expect("create deep Miller fixture");
+        fs::write(current.join("00.txt"), b"x").expect("write selected fixture");
+
+        let mut file_manager = FmState::new(&current);
+        for segment in &mut file_manager.miller.chain {
+            segment.preferred_width = crate::fm::miller::MILLER_COLUMN_MIN_WIDTH;
+        }
+        let mut app = runtime_app_with_fm(file_manager);
+        install_focused_agent(&mut app);
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        compute_view(&mut app.state, Rect::new(0, 0, 144, 18));
+
+        let center = app.state.view.terminal_area;
+        let probe = (center.x, center.y.saturating_add(2));
+        let initial_offset = app
+            .state
+            .file_manager
+            .as_ref()
+            .expect("open FM")
+            .miller
+            .horizontal
+            .offset_cells;
+
+        app.state.view.file_manager_trail.model_revision = app
+            .state
+            .view
+            .file_manager_trail
+            .model_revision
+            .saturating_add(1);
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(MouseEventKind::ScrollRight, probe.0, probe.1,)),
+            FileManagerMouseDispatch::Consumed
+        );
+        assert_eq!(
+            app.state
+                .file_manager
+                .as_ref()
+                .expect("open FM")
+                .miller
+                .horizontal
+                .offset_cells,
+            initial_offset,
+            "stale structural revision cannot move the window"
+        );
+
+        compute_view(&mut app.state, Rect::new(0, 0, 144, 18));
+        app.state.view.file_manager_trail.files_generation = app
+            .state
+            .view
+            .file_manager_trail
+            .files_generation
+            .map(|generation| generation.saturating_add(1));
+        app.handle_file_manager_mouse(mouse(MouseEventKind::ScrollRight, probe.0, probe.1));
+        assert_eq!(
+            app.state
+                .file_manager
+                .as_ref()
+                .expect("open FM")
+                .miller
+                .horizontal
+                .offset_cells,
+            initial_offset,
+            "wrong Files generation cannot move the window"
+        );
+
+        compute_view(&mut app.state, Rect::new(0, 0, 144, 18));
+        let previous_mode = app.state.mode;
+        app.state.mode = Mode::ContextMenu;
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(MouseEventKind::ScrollRight, probe.0, probe.1,)),
+            FileManagerMouseDispatch::NotHandled,
+            "the topmost overlay retains routing priority"
+        );
+        app.state.mode = previous_mode;
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::ScrollRight,
+                center.right(),
+                probe.1,
+            )),
+            FileManagerMouseDispatch::NotHandled,
+            "outside Files terrain remains owned by the outer shell"
+        );
+        assert_eq!(
+            app.state
+                .file_manager
+                .as_ref()
+                .expect("open FM")
+                .miller
+                .horizontal
+                .offset_cells,
+            initial_offset
+        );
+
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(MouseEventKind::ScrollRight, probe.0, probe.1,)),
+            FileManagerMouseDispatch::Consumed,
+            "control: a fresh in-bounds Files snapshot consumes the event"
+        );
+        assert_eq!(
+            app.state
+                .file_manager
+                .as_ref()
+                .expect("open FM")
+                .miller
+                .horizontal
+                .offset_cells,
+            initial_offset,
+            "control: a fresh one-column Trail remains bounded"
+        );
+    }
+
+    // TP-A3.3-DISPATCH-STALE: a row snapshot can outlive a watcher reload for
+    // one frame. An invalid absolute index is consumed but must not clamp to or
+    // activate an unrelated live entry.
+    #[test]
+    fn stale_row_index_is_consumed_without_selecting_another_entry() {
+        let td = TempDir::new("mouse-stale-row");
+        td.dir("alpha-dir");
+        td.file("beta.txt");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        app.state.view.file_manager_row_areas[0].entry_idx = usize::MAX;
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 27, 2));
+
+        let fm = app.state.file_manager.as_ref().expect("file manager open");
+        assert_eq!(fm.cwd, td.root);
+        assert_eq!(fm.cursor, 0);
+        assert_eq!(
+            fm.selected().map(|entry| entry.name.as_str()),
+            Some("alpha-dir")
+        );
+    }
+
+    // TP-N4.1-SELECTION-STATE: plain mouse selection establishes one explicit
+    // path, normal keyboard navigation moves only cursor focus, and reopen
+    // drops the overlay-local selection.
+    #[test]
+    fn plain_selection_and_cursor_focus_follow_close_reopen_lifecycle() {
+        let td = TempDir::new("selection-focus-reopen");
+        for index in 0..3 {
+            td.file(&format!("{index:02}.txt"));
+        }
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        let selected_path = td.root.join("02.txt");
+        let selected_row = trail_row_by_path(&app, &selected_path);
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            selected_row.name_rect.x,
+            selected_row.name_rect.y,
+        ));
+        let fm = app.state.file_manager.as_ref().expect("open fm");
+        assert_eq!(fm.cursor, 2);
+        assert_eq!(
+            fm.multi_selection_paths().iter().collect::<Vec<_>>(),
+            vec![&selected_path]
+        );
+        assert_eq!(fm.multi_selection_anchor(), Some(selected_path.as_path()));
+
+        handle_file_manager_key(&mut app.state, key(KeyCode::Up));
+        let fm = app.state.file_manager.as_ref().expect("open fm");
+        assert_eq!(fm.cursor, 1);
+        assert_eq!(
+            fm.multi_selection_paths().iter().collect::<Vec<_>>(),
+            vec![&selected_path]
+        );
+
+        // TP-A3.8: Esc no longer closes the surface — it clears the explicit
+        // selection in place. The close half of the lifecycle goes through
+        // the state API, which is the only close route left.
+        handle_file_manager_key(&mut app.state, key(KeyCode::Esc));
+        let fm = app.state.file_manager.as_ref().expect("esc keeps fm open");
+        assert!(fm.multi_selection_paths().is_empty());
+        app.state.close_file_manager();
+        assert!(app.state.file_manager.is_none());
+        app.state
+            .try_open_file_manager_with(|_| Some(FmState::new(&td.root)))
+            .expect("Files activation");
+        let fm = app.state.file_manager.as_ref().expect("reopened fm");
+        assert_eq!(fm.cursor, 0);
+        assert!(fm.multi_selection_paths().is_empty());
+        assert!(fm.multi_selection_anchor().is_none());
+    }
+
+    // TP-N4.1-SELECTION-STATE: exact mouse modifiers share the pure model
+    // semantics; combined modifiers fail closed without changing the set.
+    #[test]
+    fn mouse_plain_control_shift_and_combined_gestures_are_exact() {
+        let td = TempDir::new("multi-selection-mouse-gestures");
+        for index in 0..4 {
+            td.file(&format!("{index:02}.txt"));
+        }
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        let path = |index| td.root.join(format!("{index:02}.txt"));
+        app.state.view.terminal_area = Rect::new(26, 0, 45, 7);
+        reproject_runtime_trail(&mut app, 45, 5);
+        let row = |app: &crate::app::App, index| trail_row_by_path(app, &path(index));
+
+        let target = row(&app, 1);
+        app.handle_file_manager_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            target.name_rect.x,
+            target.name_rect.y,
+        ));
+        let fm = app.state.file_manager.as_ref().expect("open fm");
+        assert_eq!(fm.multi_selection_paths().len(), 1);
+        assert!(fm.multi_selection_paths().contains(&path(1)));
+
+        reproject_runtime_trail(&mut app, 45, 5);
+        let target = row(&app, 3);
+        app.state.file_manager_locations.focus = crate::app::FileManagerLocationsFocus::Rail;
+        app.handle_file_manager_mouse(mouse_with_modifiers(
+            MouseEventKind::Down(MouseButton::Left),
+            target.name_rect.x,
+            target.name_rect.y,
+            KeyModifiers::CONTROL,
+        ));
+        let fm = app.state.file_manager.as_ref().expect("open fm");
+        assert_eq!(fm.cursor, 3);
+        assert_eq!(fm.multi_selection_paths().len(), 2);
+        assert!(fm.multi_selection_paths().contains(&path(1)));
+        assert!(fm.multi_selection_paths().contains(&path(3)));
+        assert_eq!(fm.multi_selection_anchor(), Some(path(3).as_path()));
+        assert_eq!(
+            app.state.file_manager_locations.focus,
+            crate::app::FileManagerLocationsFocus::Trail
+        );
+
+        reproject_runtime_trail(&mut app, 45, 5);
+        let target = row(&app, 2);
+        app.state.file_manager_locations.focus = crate::app::FileManagerLocationsFocus::Rail;
+        app.handle_file_manager_mouse(mouse_with_modifiers(
+            MouseEventKind::Down(MouseButton::Left),
+            target.name_rect.x,
+            target.name_rect.y,
+            KeyModifiers::SHIFT,
+        ));
+        let fm = app.state.file_manager.as_ref().expect("open fm");
+        assert_eq!(fm.cursor, 2);
+        assert_eq!(fm.multi_selection_paths().len(), 2);
+        assert!(fm.multi_selection_paths().contains(&path(2)));
+        assert!(fm.multi_selection_paths().contains(&path(3)));
+        assert!(!fm.multi_selection_paths().contains(&path(1)));
+        assert_eq!(fm.multi_selection_anchor(), Some(path(3).as_path()));
+        assert_eq!(
+            app.state.file_manager_locations.focus,
+            crate::app::FileManagerLocationsFocus::Trail
+        );
+
+        let before_paths = fm.multi_selection_paths().clone();
+        let before_anchor = fm.multi_selection_anchor().map(PathBuf::from);
+        reproject_runtime_trail(&mut app, 45, 5);
+        let target = row(&app, 0);
+        app.state.file_manager_locations.focus = crate::app::FileManagerLocationsFocus::Rail;
+        app.handle_file_manager_mouse(mouse_with_modifiers(
+            MouseEventKind::Down(MouseButton::Left),
+            target.name_rect.x,
+            target.name_rect.y,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        let fm = app.state.file_manager.as_ref().expect("open fm");
+        assert_eq!(fm.cursor, 2);
+        assert_eq!(fm.multi_selection_paths(), &before_paths);
+        assert_eq!(fm.multi_selection_anchor(), before_anchor.as_deref());
+        assert_eq!(
+            app.state.file_manager_locations.focus,
+            crate::app::FileManagerLocationsFocus::Rail,
+            "unsupported combined modifiers cannot transfer owner"
+        );
+    }
+
+    // TP-TRAIL-T7-CHAR-03 / TP-N4.1-SELECTION-STATE: Space toggles the focused
+    // identity, Shift plus vertical navigation extends from the stable anchor,
+    // and plain movement does not rewrite the explicit set.
+    #[test]
+    fn keyboard_toggle_range_and_cursor_only_movement_share_selection_model() {
+        let td = TempDir::new("multi-selection-keyboard-gestures");
+        for index in 0..4 {
+            td.file(&format!("{index:02}.txt"));
+        }
+        td.set_equal_modified(&["00.txt", "01.txt", "02.txt", "03.txt"]);
+        let mut app = app_with_fm(FmState::new(&td.root));
+        let path = |index| td.root.join(format!("{index:02}.txt"));
+
+        handle_file_manager_key(&mut app, key(KeyCode::Char(' ')));
+        handle_file_manager_key(
+            &mut app,
+            key_with_modifiers(KeyCode::Down, KeyModifiers::SHIFT),
+        );
+        handle_file_manager_key(
+            &mut app,
+            key_with_modifiers(KeyCode::Down, KeyModifiers::SHIFT),
+        );
+        let fm = app.file_manager.as_ref().expect("open fm");
+        assert_eq!(fm.cursor, 2);
+        assert_eq!(fm.multi_selection_paths().len(), 3);
+        assert_eq!(fm.multi_selection_anchor(), Some(path(0).as_path()));
+
+        handle_file_manager_key(
+            &mut app,
+            key_with_modifiers(KeyCode::Up, KeyModifiers::SHIFT),
+        );
+        let fm = app.file_manager.as_ref().expect("open fm");
+        assert_eq!(fm.cursor, 1);
+        assert_eq!(fm.multi_selection_paths().len(), 2);
+        assert!(fm.multi_selection_paths().contains(&path(0)));
+        assert!(fm.multi_selection_paths().contains(&path(1)));
+
+        handle_file_manager_key(&mut app, key(KeyCode::Down));
+        let fm = app.file_manager.as_ref().expect("open fm");
+        assert_eq!(fm.cursor, 2);
+        assert_eq!(fm.multi_selection_paths().len(), 2);
+
+        handle_file_manager_key(&mut app, key(KeyCode::Char(' ')));
+        let fm = app.file_manager.as_ref().expect("open fm");
+        assert_eq!(fm.multi_selection_paths().len(), 3);
+        assert!(fm.multi_selection_paths().contains(&path(2)));
+        assert_eq!(fm.multi_selection_anchor(), Some(path(2).as_path()));
+    }
+
+    // TP-N4.2-BULK-AUTHORITY: exact Ctrl+A/Ctrl+Shift+A gestures select all
+    // and clear explicitly, refresh prepared authority, and reject extra mods.
+    #[test]
+    fn keyboard_select_all_and_clear_are_exact_and_refresh_bulk_authority() {
+        let td = TempDir::new("multi-selection-keyboard-bulk");
+        for index in 0..3 {
+            td.file(&format!("{index:02}.txt"));
+        }
+        let mut app = app_with_fm(FmState::new(&td.root));
+
+        handle_file_manager_key(
+            &mut app,
+            key_with_modifiers(KeyCode::Char('a'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(
+            app.file_manager
+                .as_ref()
+                .expect("open fm")
+                .multi_selection_paths()
+                .len(),
+            3
+        );
+        compute_view(&mut app, Rect::new(0, 0, 100, 6));
+        let selected_model = app
+            .view
+            .file_manager_action_bar
+            .as_ref()
+            .expect("selected action bar");
+        assert_eq!(
+            selected_model
+                .selection
+                .as_ref()
+                .map(|selection| selection.label.as_str()),
+            Some("3 selected")
+        );
+
+        handle_file_manager_key(
+            &mut app,
+            key_with_modifiers(
+                KeyCode::Char('a'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+        );
+        let fm = app.file_manager.as_ref().expect("open fm");
+        assert!(fm.multi_selection_paths().is_empty());
+        assert!(fm.multi_selection_anchor().is_none());
+        compute_view(&mut app, Rect::new(0, 0, 100, 6));
+        let cleared_model = app
+            .view
+            .file_manager_action_bar
+            .as_ref()
+            .expect("cleared action bar");
+        assert!(cleared_model.selection.is_none());
+        assert_eq!(
+            cleared_model
+                .action_state(FileManagerHeaderAction::Copy)
+                .expect("copy state")
+                .disabled_reason,
+            Some(FileManagerActionDisabledReason::NoSelection)
+        );
+
+        assert!(app
+            .file_manager
+            .as_mut()
+            .expect("open fm")
+            .replace_selection(1));
+        let before_paths = app
+            .file_manager
+            .as_ref()
+            .expect("open fm")
+            .multi_selection_paths()
+            .clone();
+        handle_file_manager_key(
+            &mut app,
+            key_with_modifiers(
+                KeyCode::Char('a'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+        );
+        assert_eq!(
+            app.file_manager
+                .as_ref()
+                .expect("open fm")
+                .multi_selection_paths(),
+            &before_paths
+        );
+
+        let mut oversized = FmState::test_empty("/virtual");
+        oversized.entries = (0..=MAX_MULTI_SELECTION_PATHS)
+            .map(|index| crate::fm::FileEntry {
+                name: format!("{index:05}.txt"),
+                path: PathBuf::from(format!("/virtual/{index:05}.txt")),
+                kind: if false {
+                    crate::fm::entry_kind::FileEntryKind::Directory
+                } else {
+                    crate::fm::entry_kind::FileEntryKind::RegularFile
+                },
+                modified: None,
+            })
+            .collect();
+        let mut oversized_app = app_with_fm(oversized);
+        handle_file_manager_key(
+            &mut oversized_app,
+            key_with_modifiers(KeyCode::Char('a'), KeyModifiers::CONTROL),
+        );
+        assert!(oversized_app
+            .file_manager
+            .as_ref()
+            .expect("open oversized fm")
+            .multi_selection_paths()
+            .is_empty());
+    }
+
+    // TP-N4.2-BULK-AUTHORITY: keyboard range growth uses the same atomic
+    // ceiling as the state method; rejected growth cannot move focus alone.
+    #[test]
+    fn keyboard_range_overflow_preserves_cursor_paths_and_anchor() {
+        let mut fm = FmState::test_empty("/virtual");
+        fm.entries = (0..=MAX_MULTI_SELECTION_PATHS)
+            .map(|index| crate::fm::FileEntry {
+                name: format!("{index:05}.txt"),
+                path: PathBuf::from(format!("/virtual/{index:05}.txt")),
+                kind: if false {
+                    crate::fm::entry_kind::FileEntryKind::Directory
+                } else {
+                    crate::fm::entry_kind::FileEntryKind::RegularFile
+                },
+                modified: None,
+            })
+            .collect();
+        assert!(fm.replace_selection(0));
+        assert!(fm.extend_selection(MAX_MULTI_SELECTION_PATHS - 1));
+        let mut app = app_with_fm(fm);
+        let before = app.file_manager.as_ref().expect("open fm");
+        let before_cursor = before.cursor;
+        let before_paths = before.multi_selection_paths().clone();
+        let before_anchor = before.multi_selection_anchor().map(PathBuf::from);
+
+        handle_file_manager_key(
+            &mut app,
+            key_with_modifiers(KeyCode::Down, KeyModifiers::SHIFT),
+        );
+
+        let fm = app.file_manager.as_ref().expect("open fm");
+        assert_eq!(fm.cursor, before_cursor);
+        assert_eq!(fm.multi_selection_paths(), &before_paths);
+        assert_eq!(fm.multi_selection_anchor(), before_anchor.as_deref());
+    }
+
+    // TP-N4.1-SELECTION-STATE / TP-TRAIL-T7-INPUT-05: a stale Trail row target
+    // and unrecognized modifier combinations are consumed without mutation.
+    #[test]
+    fn stale_and_unrecognized_selection_gestures_fail_closed() {
+        let td = TempDir::new("multi-selection-stale-gesture");
+        td.file("00.txt");
+        td.file("01.txt");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        assert!(app
+            .state
+            .file_manager
+            .as_mut()
+            .expect("open fm")
+            .replace_selection(0));
+        let target = app
+            .state
+            .view
+            .file_manager_trail
+            .columns
+            .iter_mut()
+            .flat_map(|column| &mut column.rows)
+            .find(|row| row.entry_index == 1)
+            .expect("second Trail row");
+        target.entry_index = usize::MAX;
+        let probe = target.name_rect;
+        let before_paths = app
+            .state
+            .file_manager
+            .as_ref()
+            .expect("open fm")
+            .multi_selection_paths()
+            .clone();
+
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse_with_modifiers(
+                MouseEventKind::Down(MouseButton::Left),
+                probe.x,
+                probe.y,
+                KeyModifiers::CONTROL,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+        handle_file_manager_key(
+            &mut app.state,
+            key_with_modifiers(KeyCode::Down, KeyModifiers::CONTROL),
+        );
+
+        let fm = app.state.file_manager.as_ref().expect("open fm");
+        assert_eq!(fm.cursor, 0);
+        assert_eq!(fm.multi_selection_paths(), &before_paths);
+        assert_eq!(
+            fm.multi_selection_anchor(),
+            Some(td.root.join("00.txt").as_path())
+        );
+    }
+
+    // TP-TRAIL-T7-CHAR-03 / TP-N4.1-SELECTION-STATE: Trail hit geometry
+    // snapshots stable path identity, so the same valid index carrying a
+    // reordered path is rejected on input.
+    #[test]
+    fn row_selection_snapshot_carries_stable_path_identity() {
+        let td = TempDir::new("multi-selection-row-identity");
+        td.file("00.txt");
+        td.file("01.txt");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        let expected = td.root.join("00.txt");
+
+        let target = trail_row_by_index(&app, 0);
+        assert_eq!(target.entry_path, expected);
+
+        let preserved = td.root.join("01.txt");
+        assert!(app
+            .state
+            .file_manager
+            .as_mut()
+            .expect("open fm")
+            .replace_selection(1));
+        app.state
+            .view
+            .file_manager_trail
+            .columns
+            .iter_mut()
+            .flat_map(|column| &mut column.rows)
+            .find(|row| row.entry_index == 0)
+            .expect("first Trail row")
+            .entry_path = td.root.join("reordered.txt");
+
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                target.name_rect.x,
+                target.name_rect.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+        let fm = app.state.file_manager.as_ref().expect("open fm");
+        assert_eq!(fm.cursor, 1);
+        assert_eq!(
+            fm.multi_selection_paths().iter().collect::<Vec<_>>(),
+            vec![&preserved]
+        );
+    }
+
+    // TP-C1.2-DISPATCH / TP-FFO-ACTION-03: a complete visible header rectangle
+    // resolves to its exact tag only while current Trail authority also enables
+    // that action. Unsupported actions are consumed without filesystem work.
+    #[test]
+    fn header_left_click_dispatches_currently_enabled_exact_tags_without_filesystem_effects() {
+        let td = TempDir::new("header-actions");
+        td.file("selected.txt");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        assert!(app
+            .state
+            .file_manager
+            .as_mut()
+            .expect("open FM")
+            .replace_selection(0));
+        app.state.file_manager_clipboard = vec![td.root.join("selected.txt")];
+        app.state.file_manager_locations.focus = crate::app::FileManagerLocationsFocus::Trail;
+        install_wide_header_actions(&mut app);
+        let before_entries = fs::read_dir(&td.root)
+            .expect("read fixture before clicks")
+            .map(|entry| entry.expect("fixture entry").file_name())
+            .collect::<Vec<_>>();
+
+        for (column, expected) in [
+            (
+                50,
+                FileManagerMouseDispatch::HeaderAction(FileManagerHeaderAction::Copy),
+            ),
+            (
+                63,
+                FileManagerMouseDispatch::HeaderAction(FileManagerHeaderAction::Paste),
+            ),
+            // TP-FM-NEWDIR-02: the seat that used to be a dead button now
+            // dispatches — a writable directory is its whole precondition.
+            (
+                76,
+                FileManagerMouseDispatch::HeaderAction(FileManagerHeaderAction::NewFolder),
+            ),
+            (
+                85,
+                FileManagerMouseDispatch::HeaderAction(FileManagerHeaderAction::Delete),
+            ),
+        ] {
+            assert_eq!(
+                app.handle_file_manager_mouse(mouse(
+                    MouseEventKind::Down(MouseButton::Left),
+                    column,
+                    0,
+                )),
+                expected
+            );
+        }
+
+        let fm = app.state.file_manager.as_ref().expect("file manager open");
+        assert_eq!(fm.cwd, td.root);
+        assert_eq!(fm.cursor, 0);
+        let after_entries = fs::read_dir(&td.root)
+            .expect("read fixture after clicks")
+            .map(|entry| entry.expect("fixture entry").file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(after_entries, before_entries);
+    }
+
+    // TP-C4.1-LIFECYCLE: the top-level mouse router must consume the typed
+    // header result and dispatch it to the App controller instead of silently
+    // dropping an enabled Copy action.
+    #[test]
+    fn top_level_mouse_dispatches_header_copy_to_clipboard_controller() {
+        let td = TempDir::new("header-copy-controller");
+        td.file("selected.txt");
+        let selected = td.root.join("selected.txt");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        assert!(app
+            .state
+            .file_manager
+            .as_mut()
+            .expect("open FM")
+            .replace_selection(0));
+        install_wide_header_actions(&mut app);
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 50, 0));
+
+        assert!(app.state.file_manager_clipboard.is_empty());
+        assert_eq!(
+            app.state.request_file_manager_context_action,
+            Some(crate::app::state::FileManagerContextActionIntent {
+                action: FileManagerContextMenuAction::Copy,
+                paths: vec![selected.clone()],
+            })
+        );
+        assert!(app.sync_file_operations_for_test());
+        assert_eq!(app.state.file_manager_clipboard, vec![selected]);
+        assert_eq!(
+            fs::read(td.root.join("selected.txt")).expect("copy action preserves source"),
+            b"x"
+        );
+    }
+
+    // TP-C1.2-DISPATCH: identity/gap/outside/hidden/zero/stale/non-left input
+    // never invents a header action from coordinates or stale paint state.
+    #[test]
+    fn header_action_dispatch_fails_closed_for_non_targets() {
+        let td = TempDir::new("header-non-targets");
+        td.file("selected.txt");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        install_wide_header_actions(&mut app);
+
+        for column in [26, 49, 56, 64, 77] {
+            assert_eq!(
+                app.handle_file_manager_mouse(mouse(
+                    MouseEventKind::Down(MouseButton::Left),
+                    column,
+                    0,
+                )),
+                FileManagerMouseDispatch::Consumed,
+                "non-action header column {column}"
+            );
+        }
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 50, 1,)),
+            FileManagerMouseDispatch::Consumed
+        );
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 25, 0,)),
+            FileManagerMouseDispatch::NotHandled
+        );
+
+        app.state.view.file_manager_header_action_areas.truncate(1);
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 60, 0,)),
+            FileManagerMouseDispatch::Consumed,
+            "hidden Paste action is not inferred"
+        );
+        app.state.view.file_manager_header_action_areas.clear();
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 50, 0,)),
+            FileManagerMouseDispatch::Consumed,
+            "zero visible actions fail closed"
+        );
+
+        install_wide_header_actions(&mut app);
+        for kind in [
+            MouseEventKind::Down(MouseButton::Right),
+            MouseEventKind::Down(MouseButton::Middle),
+        ] {
+            assert_eq!(
+                app.handle_file_manager_mouse(mouse(kind, 50, 0)),
+                FileManagerMouseDispatch::Consumed
+            );
+        }
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse_with_modifiers(
+                MouseEventKind::Down(MouseButton::Left),
+                50,
+                0,
+                KeyModifiers::CONTROL,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+
+        app.state.file_manager = None;
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 50, 0,)),
+            FileManagerMouseDispatch::NotHandled,
+            "stale areas cannot dispatch after FM closes"
+        );
+    }
+
+    // TP-N3.2-AUTHORITY: a disabled visible action is consumed without tag,
+    // selection, clipboard, cwd, or filesystem mutation.
+    #[test]
+    fn disabled_header_action_is_consumed_without_side_effects() {
+        let td = TempDir::new("disabled-header-action");
+        td.file("selected.txt");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        install_wide_header_actions(&mut app);
+        let action_bar = app
+            .state
+            .view
+            .file_manager_action_bar
+            .as_mut()
+            .expect("action bar model");
+        let copy = action_bar
+            .actions
+            .iter_mut()
+            .find(|state| state.action == FileManagerHeaderAction::Copy)
+            .expect("copy state");
+        copy.enabled = false;
+        copy.disabled_reason = Some(FileManagerActionDisabledReason::OperationInFlight);
+
+        let before_cursor = app.state.file_manager.as_ref().expect("open FM").cursor;
+        let before_cwd = app
+            .state
+            .file_manager
+            .as_ref()
+            .expect("open FM")
+            .cwd
+            .clone();
+        let before_clipboard = app.state.file_manager_clipboard.clone();
+        let before_entries = fs::read_dir(&td.root)
+            .expect("read fixture before click")
+            .count();
+
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 50, 0,)),
+            FileManagerMouseDispatch::Consumed
+        );
+        assert_eq!(
+            app.state.file_manager.as_ref().expect("open FM").cursor,
+            before_cursor
+        );
+        assert_eq!(
+            app.state.file_manager.as_ref().expect("open FM").cwd,
+            before_cwd
+        );
+        assert_eq!(app.state.file_manager_clipboard, before_clipboard);
+        assert_eq!(
+            fs::read_dir(&td.root)
+                .expect("read fixture after click")
+                .count(),
+            before_entries
+        );
+    }
+
+    // TP-FFO-ACTION-02: a prepared Trail-owned action rectangle is paint
+    // history, not dispatch authority. If Rail takes focus before the next
+    // frame, the old enabled Copy target is consumed without emitting intent.
+    // Since TP-FM-FOCUS-02 that same press claims Trail ownership back: the
+    // guarantee here is about dispatch and side effects — nothing runs on a
+    // stale rectangle — not about which region owns focus afterwards.
+    #[test]
+    fn ffo_prepared_enabled_header_action_fails_closed_after_rail_takes_focus() {
+        let td = TempDir::new("ffo-stale-prepared-header");
+        td.file("selected.txt");
+        let selected_path = td.root.join("selected.txt");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        assert!(app
+            .state
+            .file_manager
+            .as_mut()
+            .expect("open FM")
+            .replace_selection(0));
+        app.state.file_manager_locations.focus = crate::app::FileManagerLocationsFocus::Trail;
+        install_wide_header_actions(&mut app);
+        app.state.view.file_manager_action_bar = app.state.file_manager.as_ref().map(|fm| {
+            crate::ui::compute_file_manager_action_bar_model(
+                fm,
+                &app.state.file_manager_clipboard,
+                false,
+                crate::app::FileManagerLocationsFocus::Trail,
+            )
+        });
+        assert!(app
+            .state
+            .view
+            .file_manager_action_bar
+            .as_ref()
+            .and_then(|model| model.action_state(FileManagerHeaderAction::Copy))
+            .is_some_and(|action| action.enabled));
+
+        let before_selection = app
+            .state
+            .file_manager
+            .as_ref()
+            .expect("open FM")
+            .multi_selection_paths()
+            .clone();
+        let before_clipboard = app.state.file_manager_clipboard.clone();
+        let before_file = fs::read(&selected_path).expect("read selected fixture before click");
+        let mut before_entries = fs::read_dir(&td.root)
+            .expect("read fixture directory before click")
+            .map(|entry| entry.expect("fixture entry").file_name())
+            .collect::<Vec<_>>();
+        before_entries.sort();
+
+        app.state.file_manager_locations.focus = crate::app::FileManagerLocationsFocus::Rail;
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 50, 0)),
+            FileManagerMouseDispatch::Consumed
+        );
+
+        // The press took ownership back (TP-FM-FOCUS-02) and did nothing else.
+        assert_eq!(
+            app.state.file_manager_locations.focus,
+            crate::app::FileManagerLocationsFocus::Trail
+        );
+        assert_eq!(app.state.file_manager_clipboard, before_clipboard);
+        assert!(app.state.request_file_manager_context_action.is_none());
+        assert!(app.state.file_manager_operation.is_none());
+        assert!(app.state.file_manager_delete_confirmation.is_none());
+        assert_eq!(
+            app.state
+                .file_manager
+                .as_ref()
+                .expect("open FM")
+                .multi_selection_paths(),
+            &before_selection
+        );
+        assert_eq!(
+            fs::read(&selected_path).expect("read selected fixture after click"),
+            before_file
+        );
+        let mut after_entries = fs::read_dir(&td.root)
+            .expect("read fixture directory after click")
+            .map(|entry| entry.expect("fixture entry").file_name())
+            .collect::<Vec<_>>();
+        after_entries.sort();
+        assert_eq!(after_entries, before_entries);
+    }
+
+    // TP-C2.2-ROW-DISPATCH: every complete visible row-action rectangle
+    // resolves to its exact tag plus stable path identity. C2.2 only routes
+    // tags; it must not select the row or mutate clipboard/cwd/filesystem.
+    #[test]
+    fn row_left_click_dispatches_exact_tags_without_side_effects() {
+        let td = TempDir::new("row-actions");
+        td.file("alpha.txt");
+        td.file("beta.txt");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        let entry_path = install_row_actions(&mut app, 1);
+        app.state.file_manager_locations.focus = crate::app::FileManagerLocationsFocus::Rail;
+        let before_cursor = app.state.file_manager.as_ref().expect("open FM").cursor;
+        let before_cwd = app
+            .state
+            .file_manager
+            .as_ref()
+            .expect("open FM")
+            .cwd
+            .clone();
+        let before_clipboard = app.state.file_manager_clipboard.clone();
+        let before_entries = fs::read_dir(&td.root)
+            .expect("read row-action fixture before clicks")
+            .map(|entry| entry.expect("fixture entry").file_name())
+            .collect::<Vec<_>>();
+
+        for action in FileManagerRowAction::ALL {
+            let area = trail_action(&app, 1, action);
+            assert_eq!(
+                app.handle_file_manager_mouse(mouse(
+                    MouseEventKind::Down(MouseButton::Left),
+                    area.rect.x,
+                    area.rect.y,
+                )),
+                FileManagerMouseDispatch::RowAction {
+                    action,
+                    entry_path: entry_path.clone(),
+                }
+            );
+        }
+
+        let fm = app.state.file_manager.as_ref().expect("file manager open");
+        assert_eq!(
+            app.state.file_manager_locations.focus,
+            crate::app::FileManagerLocationsFocus::Trail
+        );
+        assert_eq!(fm.cwd, before_cwd);
+        assert_eq!(fm.cursor, before_cursor);
+        assert_eq!(app.state.file_manager_clipboard, before_clipboard);
+        assert_eq!(
+            fs::read_dir(&td.root)
+                .expect("read row-action fixture after clicks")
+                .map(|entry| entry.expect("fixture entry").file_name())
+                .collect::<Vec<_>>(),
+            before_entries
+        );
+    }
+
+    // TP-TRAIL-T7-CHAR-02 / TP-C5-AUTHORITY: the row SendAgent tag must bind one
+    // exact current path to the focused agent terminal identity without
+    // sending bytes, spawning a process, mutating the filesystem, or
+    // reconstructing authority from text.
+    #[test]
+    fn row_send_agent_prepares_exact_path_and_focused_terminal_identity() {
+        let td = TempDir::new("row-send-agent-authority");
+        td.file("alpha.txt");
+        td.file("beta.txt");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        let terminal_id = install_focused_agent(&mut app);
+        let entry_path = install_row_actions(&mut app, 1);
+        let before = fs::read(&entry_path).expect("read send-agent source before intent");
+        let action = trail_action(&app, 1, FileManagerRowAction::SendAgent);
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            action.rect.x,
+            action.rect.y,
+        ));
+
+        assert_eq!(
+            app.state.request_file_manager_context_action,
+            Some(crate::app::state::FileManagerContextActionIntent {
+                action: FileManagerContextMenuAction::SendAgent,
+                paths: vec![entry_path.clone()],
+            })
+        );
+        assert!(app.state.request_file_manager_agent_handoff.is_none());
+        assert!(app.sync_file_manager_agent_handoff());
+        let picker = app
+            .state
+            .agent_reference_picker
+            .as_ref()
+            .expect("the reference action opens the agent picker");
+        assert_eq!(picker.source_path, entry_path);
+        assert!(
+            app.state.request_file_manager_agent_handoff.is_none(),
+            "opening the picker prepares no delivery authority"
+        );
+        assert!(app.activate_agent_reference_picker_selection());
+        let request = app
+            .state
+            .request_file_manager_agent_handoff
+            .as_ref()
+            .expect("typed reference request after explicit activation");
+        assert_eq!(request.path, entry_path);
+        assert_eq!(request.terminal_id, terminal_id);
+        assert_eq!(
+            fs::read(entry_path).expect("send-agent source remains unchanged"),
+            before
+        );
+    }
+
+    // TP-C5-AUTHORITY: C3's single-path context intent converges on the same
+    // typed current-agent request and is consumed exactly once.
+    #[test]
+    fn context_send_agent_converges_on_typed_current_authority() {
+        let td = TempDir::new("context-send-agent-authority");
+        td.file("selected.txt");
+        let path = td.root.join("selected.txt");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        let terminal_id = install_focused_agent(&mut app);
+        app.state.request_file_manager_context_action =
+            Some(crate::app::state::FileManagerContextActionIntent {
+                action: FileManagerContextMenuAction::SendAgent,
+                paths: vec![path.clone()],
+            });
+
+        assert!(app.sync_file_manager_agent_handoff());
+        assert!(app.state.request_file_manager_context_action.is_none());
+        let picker = app
+            .state
+            .agent_reference_picker
+            .as_ref()
+            .expect("the context intent opens the agent picker");
+        assert_eq!(picker.source_path, path);
+        assert!(app.activate_agent_reference_picker_selection());
+        let request = app
+            .state
+            .request_file_manager_agent_handoff
+            .as_ref()
+            .expect("typed reference request after explicit activation");
+        assert_eq!(request.path, path);
+        assert_eq!(request.terminal_id, terminal_id);
+        assert!(!app.sync_file_manager_agent_handoff());
+    }
+
+    // TP-FIP-REF-03 (supersedes TP-C5-SPLIT): a non-agent terminal prepares
+    // NO authority for the reference action — no send request, no implicit
+    // Claude split, and no pane/terminal/runtime side effect during input.
+    #[test]
+    fn send_agent_on_non_agent_terminal_prepares_no_authority() {
+        let td = TempDir::new("send-agent-split-authority");
+        td.file("alpha.txt");
+        td.file("beta.txt");
+
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        let workspace = crate::workspace::Workspace::test_new("fm-non-agent");
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        let _ = install_row_actions(&mut app, 1);
+        let before_panes = app.state.workspaces[0].tabs[0].layout.pane_count();
+        let before_terminals = app.state.terminals.len();
+        let before_runtimes = app.terminal_runtimes.len();
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 43, 3));
+
+        assert!(app.state.request_file_manager_agent_handoff.is_none());
+        assert!(app.sync_file_manager_agent_handoff());
+        assert!(
+            app.state.request_file_manager_agent_handoff.is_none(),
+            "a non-agent focus must not produce a send request"
+        );
+        assert_eq!(
+            app.state.workspaces[0].tabs[0].layout.pane_count(),
+            before_panes
+        );
+        assert_eq!(app.state.terminals.len(), before_terminals);
+        assert_eq!(app.terminal_runtimes.len(), before_runtimes);
+    }
+
+    // TP-TRAIL-T7-CHAR-02 / TP-C5-AUTHORITY: bulk row authority or an
+    // operation-in-flight snapshot cannot create either existing-agent or
+    // split-and-launch authority.
+    #[test]
+    fn send_agent_authority_fails_closed_without_current_single_path() {
+        let td = TempDir::new("send-agent-fail-closed");
+        td.file("alpha.txt");
+        td.file("beta.txt");
+
+        let mut bulk = runtime_app_with_fm(FmState::new(&td.root));
+        install_focused_agent(&mut bulk);
+        install_row_actions(&mut bulk, 1);
+        let fm = bulk.state.file_manager.as_mut().expect("bulk FM open");
+        assert!(fm.replace_selection(0));
+        assert!(fm.toggle_selection(1));
+        bulk.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 43, 3));
+        assert!(bulk.state.request_file_manager_agent_handoff.is_none());
+
+        let mut busy = runtime_app_with_fm(FmState::new(&td.root));
+        install_focused_agent(&mut busy);
+        install_row_actions(&mut busy, 1);
+        busy.state.file_manager_operation = Some(crate::app::state::FileManagerOperationState {
+            generation: 1,
+            kind: crate::app::state::FileManagerOperationKind::Copy,
+            destination_directory: td.root.clone(),
+            total_items: 1,
+            completed_items: 0,
+            failed_items: 0,
+            status: crate::app::state::FileManagerOperationStatus::Running,
+            items: Vec::new(),
+        });
+        busy.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 43, 3));
+        assert!(busy.state.request_file_manager_agent_handoff.is_none());
+    }
+
+    // TP-TRAIL-T7-CHAR-03 / TP-C4.3-INTENT: the stable row Rename tag must
+    // converge on one typed exact-path file modal. Opening it is pure
+    // client-local authority: no worker generation or filesystem mutation
+    // exists yet.
+    #[test]
+    fn row_rename_opens_exact_file_modal_without_filesystem_work() {
+        let td = TempDir::new("row-rename-intent");
+        td.file("alpha.txt");
+        td.file("beta.txt");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        let entry_path = install_row_actions(&mut app, 1);
+        let before = fs::read(&entry_path).expect("read row rename fixture");
+        let action = trail_action(&app, 1, FileManagerRowAction::Rename);
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            action.rect.x,
+            action.rect.y,
+        ));
+
+        assert_eq!(
+            app.state.request_file_manager_context_action,
+            Some(crate::app::state::FileManagerContextActionIntent {
+                action: FileManagerContextMenuAction::Rename,
+                paths: vec![entry_path.clone()],
+            })
+        );
+        assert_ne!(app.state.mode, Mode::RenameFile);
+        assert!(app.sync_file_operations_for_test());
+        assert_eq!(app.state.mode, Mode::RenameFile);
+        assert_eq!(
+            app.state
+                .file_manager_rename
+                .as_ref()
+                .expect("typed file rename modal")
+                .paths,
+            vec![entry_path.clone()]
+        );
+        assert_eq!(app.state.name_input, "beta.txt");
+        assert!(app.state.name_input_replace_on_type);
+        assert!(app.state.file_manager_operation.is_none());
+        assert_eq!(
+            fs::read(&entry_path).expect("row rename target remains untouched"),
+            before
+        );
+    }
+
+    // TP-TRAIL-T7-CHAR-03 / TP-C6.3-AUTHORITY: the row Delete tag selects its
+    // exact anchored row, emits the same typed C3 intent as context/header
+    // Delete, and reaches the existing confirmation owner only at the
+    // scheduled boundary.
+    #[test]
+    fn row_delete_converges_on_shared_typed_confirmation_authority() {
+        let td = TempDir::new("row-delete-authority");
+        td.file("alpha.txt");
+        td.file("beta.txt");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        let entry_path = install_row_actions(&mut app, 1);
+        let before = fs::read(&entry_path).expect("read row delete fixture");
+        let action = trail_action(&app, 1, FileManagerRowAction::Delete);
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            action.rect.x,
+            action.rect.y,
+        ));
+
+        assert_eq!(
+            app.state.request_file_manager_context_action,
+            Some(crate::app::state::FileManagerContextActionIntent {
+                action: FileManagerContextMenuAction::Delete,
+                paths: vec![entry_path.clone()],
+            })
+        );
+        assert!(app.state.file_manager_delete_confirmation.is_none());
+        assert!(app.sync_file_operations_for_test());
+        assert_eq!(
+            app.state
+                .file_manager_delete_confirmation
+                .as_ref()
+                .expect("shared delete confirmation")
+                .paths,
+            vec![entry_path.clone()]
+        );
+        assert_eq!(
+            fs::read(entry_path).expect("row delete remains confirmation-only"),
+            before
+        );
+    }
+
+    // TP-TRAIL-T7-CHAR-03 / TP-C4.3-INTENT: a row coordinate is not independent
+    // authority while a bulk selection or another operation is active. Both
+    // cases fail closed before a modal or worker request can exist.
+    #[test]
+    fn row_rename_rejects_bulk_selection_and_inflight_operation() {
+        let td = TempDir::new("row-rename-fail-closed");
+        td.file("alpha.txt");
+        td.file("beta.txt");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        install_row_actions(&mut app, 1);
+        let fm = app.state.file_manager.as_mut().expect("open FM");
+        assert!(fm.replace_selection(0));
+        assert!(fm.toggle_selection(1));
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 44, 3));
+        assert_ne!(app.state.mode, Mode::RenameFile);
+        assert!(app.state.file_manager_rename.is_none());
+
+        app.state
+            .file_manager
+            .as_mut()
+            .expect("open FM")
+            .clear_multi_selection();
+        app.state.file_manager_operation = Some(crate::app::state::FileManagerOperationState {
+            generation: 9,
+            kind: crate::app::state::FileManagerOperationKind::Copy,
+            destination_directory: td.root.clone(),
+            total_items: 1,
+            completed_items: 0,
+            failed_items: 0,
+            status: crate::app::state::FileManagerOperationStatus::Running,
+            items: Vec::new(),
+        });
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 44, 3));
+        assert_ne!(app.state.mode, Mode::RenameFile);
+        assert!(app.state.file_manager_rename.is_none());
+    }
+
+    // TP-C2.2-NON-TARGETS: the name rectangle preserves selection, while
+    // gaps, hidden actions, middle presses, modifiers, and stale closed-FM
+    // geometry cannot invent a row action. Right press is owned by C3.2.
+    #[test]
+    fn row_action_dispatch_preserves_names_and_fails_closed_for_non_targets() {
+        let td = TempDir::new("row-action-non-targets");
+        td.file("alpha.txt");
+        td.file("beta.txt");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        install_row_actions(&mut app, 1);
+        let row = trail_row_by_index(&app, 1);
+        let action = row.actions[0].clone();
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            row.name_rect.x,
+            row.name_rect.y,
+        ));
+        assert_eq!(app.state.file_manager.as_ref().expect("open FM").cursor, 1);
+
+        for event in [
+            mouse(
+                MouseEventKind::Down(MouseButton::Middle),
+                action.rect.x,
+                action.rect.y,
+            ),
+            mouse_with_modifiers(
+                MouseEventKind::Down(MouseButton::Left),
+                action.rect.x,
+                action.rect.y,
+                KeyModifiers::CONTROL,
+            ),
+        ] {
+            assert_eq!(
+                app.handle_file_manager_mouse(event),
+                FileManagerMouseDispatch::Consumed
+            );
+        }
+
+        for column in &mut app.state.view.file_manager_trail.columns {
+            for row in &mut column.rows {
+                row.actions.clear();
+            }
+        }
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                action.rect.x,
+                action.rect.y,
+            )),
+            FileManagerMouseDispatch::Consumed,
+            "hidden action is not inferred from its former coordinates"
+        );
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 25, 3,)),
+            FileManagerMouseDispatch::NotHandled
+        );
+
+        app.state.file_manager = None;
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                action.rect.x,
+                action.rect.y,
+            )),
+            FileManagerMouseDispatch::NotHandled
+        );
+    }
+
+    // TP-C2.2-STALE-IDENTITY: a watcher reload can reorder entries between
+    // compute_view and input. Matching coordinates and index are insufficient;
+    // the snapshotted path must still match and the live target must remain
+    // supported before a tag can escape.
+    #[test]
+    fn row_action_dispatch_rejects_reordered_and_unrecognized_targets() {
+        let td = TempDir::new("row-action-stale");
+        td.file("alpha.txt");
+        td.file("beta.txt");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        install_row_actions(&mut app, 0);
+        app.state.file_manager_locations.focus = crate::app::FileManagerLocationsFocus::Rail;
+        let action = trail_action(&app, 0, FileManagerRowAction::Rename);
+        app.state
+            .view
+            .file_manager_trail
+            .columns
+            .iter_mut()
+            .flat_map(|column| &mut column.rows)
+            .find(|row| row.entry_index == 0)
+            .and_then(|row| {
+                row.actions
+                    .iter_mut()
+                    .find(|area| area.action == FileManagerRowAction::Rename)
+            })
+            .expect("rename action")
+            .entry_path = td.root.join("reordered.txt");
+
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                action.rect.x,
+                action.rect.y,
+            )),
+            FileManagerMouseDispatch::Consumed,
+            "same index with a different path is stale"
+        );
+        assert_eq!(
+            app.state.file_manager_locations.focus,
+            crate::app::FileManagerLocationsFocus::Rail
+        );
+
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        install_row_actions(&mut app, 0);
+        app.state.file_manager_locations.focus = crate::app::FileManagerLocationsFocus::Rail;
+        let action = trail_action(&app, 0, FileManagerRowAction::Rename);
+        app.state
+            .view
+            .file_manager_trail
+            .columns
+            .iter_mut()
+            .flat_map(|column| &mut column.rows)
+            .find(|row| row.entry_index == 0)
+            .and_then(|row| {
+                row.actions
+                    .iter_mut()
+                    .find(|area| area.action == FileManagerRowAction::Rename)
+            })
+            .expect("rename action")
+            .entry_idx = usize::MAX;
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                action.rect.x,
+                action.rect.y,
+            )),
+            FileManagerMouseDispatch::Consumed,
+            "unrecognized live target fails closed"
+        );
+        assert_eq!(
+            app.state.file_manager_locations.focus,
+            crate::app::FileManagerLocationsFocus::Rail
+        );
+    }
+
+    // TP-C3.2-POPUP-GEOMETRY: right-clicking a member of an explicit bulk
+    // selection preserves that set while focusing the clicked row. A row
+    // outside the set replaces it with one exact live path before the menu
+    // model is prepared.
+    #[test]
+    fn right_click_applies_exact_selection_policy_before_opening_file_menu() {
+        let td = TempDir::new("file-context-selection-policy");
+        td.file("00.txt");
+        td.file("01.txt");
+        td.file("02.txt");
+        for name in ["00.txt", "01.txt", "02.txt"] {
+            fs::File::open(td.root.join(name))
+                .expect("open context-menu mtime fixture")
+                .set_times(
+                    fs::FileTimes::new()
+                        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(10)),
+                )
+                .expect("set context-menu fixture mtime");
+        }
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        let fm = app.state.file_manager.as_mut().expect("open FM");
+        assert!(fm.replace_selection(0));
+        assert!(fm.toggle_selection(1));
+        let bulk_paths = fm.multi_selection_paths().clone();
+        let before_entries = fs::read_dir(&td.root)
+            .expect("read context-menu fixture before clicks")
+            .map(|entry| entry.expect("fixture entry").file_name())
+            .collect::<Vec<_>>();
+        let selected_member = trail_row_by_path(&app, &td.root.join("01.txt"));
+
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Right),
+                selected_member.name_rect.x,
+                selected_member.name_rect.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+        assert_eq!(app.state.mode, Mode::ContextMenu);
+        let fm = app.state.file_manager.as_ref().expect("open FM");
+        assert_eq!(fm.cursor, 1, "right-click focuses the exact live row");
+        assert_eq!(fm.multi_selection_paths(), &bulk_paths);
+        let menu = app.state.context_menu.as_ref().expect("file context menu");
+        assert_eq!(
+            (menu.x, menu.y),
+            (selected_member.name_rect.x, selected_member.name_rect.y)
+        );
+        let ContextMenuKind::File { model } = &menu.kind else {
+            panic!("expected file context menu")
+        };
+        assert_eq!(
+            model.target_kind,
+            FileManagerContextMenuTargetKind::Multiple
+        );
+        assert_eq!(model.paths, bulk_paths.iter().cloned().collect::<Vec<_>>());
+
+        app.state.context_menu = None;
+        app.state.mode = Mode::Terminal;
+        let replacement = trail_row_by_path(&app, &td.root.join("02.txt"));
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Right),
+                replacement.name_rect.x,
+                replacement.name_rect.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+        let fm = app.state.file_manager.as_ref().expect("open FM");
+        assert_eq!(fm.cursor, 2);
+        assert_eq!(
+            fm.multi_selection_paths().iter().collect::<Vec<_>>(),
+            vec![&td.root.join("02.txt")]
+        );
+        let menu = app.state.context_menu.as_ref().expect("replacement menu");
+        let ContextMenuKind::File { model } = &menu.kind else {
+            panic!("expected replacement file context menu")
+        };
+        assert_eq!(model.target_kind, FileManagerContextMenuTargetKind::File);
+        assert_eq!(model.paths, vec![td.root.join("02.txt")]);
+        assert_eq!(
+            fs::read_dir(&td.root)
+                .expect("read context-menu fixture after clicks")
+                .map(|entry| entry.expect("fixture entry").file_name())
+                .collect::<Vec<_>>(),
+            before_entries,
+            "C3 routing performs no filesystem mutation"
+        );
+    }
+
+    // TP-C3.2-POPUP-GEOMETRY: the same Trail row geometry used by render/input
+    // opens the popup at every Miller-width breakpoint and clamps it onscreen.
+    #[test]
+    fn right_click_popup_is_bounded_at_all_miller_breakpoints() {
+        let td = TempDir::new("file-context-breakpoints");
+        for index in 0..12 {
+            td.file(&format!("{index:02}.txt"));
+        }
+
+        for width in [20, 30, 45] {
+            let mut app = runtime_app_with_fm(FmState::new(&td.root));
+            app.state.mobile_width_threshold = 0;
+            app.state.sidebar_collapsed = true;
+            compute_view(&mut app.state, Rect::new(0, 0, width, 12));
+            let rows = app
+                .state
+                .view
+                .file_manager_trail
+                .columns
+                .iter()
+                .flat_map(|column| &column.rows)
+                .cloned()
+                .collect::<Vec<_>>();
+            assert!(!rows.is_empty(), "width {width} exposes Trail rows");
+            let row_indices = [0, rows.len() / 2, rows.len() - 1];
+
+            for row_index in row_indices {
+                let row = &rows[row_index];
+                assert_eq!(
+                    app.handle_file_manager_mouse(mouse(
+                        MouseEventKind::Down(MouseButton::Right),
+                        row.name_rect.x,
+                        row.name_rect.y,
+                    )),
+                    FileManagerMouseDispatch::Consumed,
+                    "width {width}, visible row {row_index}"
+                );
+                let menu = app.state.context_menu.as_ref().expect("bounded file menu");
+                let ContextMenuKind::File { model } = &menu.kind else {
+                    panic!("expected file menu at width {width}")
+                };
+                assert_eq!(model.paths, vec![row.entry_path.clone()]);
+
+                let popup = app.state.context_menu_rect().expect("popup geometry");
+                let screen = app.state.screen_rect();
+                assert!(popup.x >= screen.x && popup.y >= screen.y);
+                assert!(popup.right() <= screen.right());
+                assert!(popup.bottom() <= screen.bottom());
+                assert_eq!(popup.height, 11, "nine complete rows plus borders");
+
+                app.state.context_menu = None;
+                app.state.mode = Mode::Terminal;
+            }
+        }
+    }
+
+    // TP-C3.2-POPUP-GEOMETRY / TP-TRAIL-T7-INPUT-05: stale Trail identity,
+    // non-row regions, modified right-click, and zero geometry fail closed.
+    #[test]
+    fn right_click_file_menu_fails_closed_for_stale_and_non_targets() {
+        let td = TempDir::new("file-context-stale");
+        td.file("00.txt");
+        td.file("01.txt");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        assert!(app
+            .state
+            .file_manager
+            .as_mut()
+            .expect("open FM")
+            .replace_selection(1));
+        let before_paths = app
+            .state
+            .file_manager
+            .as_ref()
+            .expect("open FM")
+            .multi_selection_paths()
+            .clone();
+        let stale = trail_row_by_index(&app, 0);
+        app.state
+            .view
+            .file_manager_trail
+            .columns
+            .iter_mut()
+            .flat_map(|column| &mut column.rows)
+            .find(|row| row.entry_index == 0)
+            .expect("first Trail row")
+            .entry_path = td.root.join("stale.txt");
+
+        for event in [
+            mouse(
+                MouseEventKind::Down(MouseButton::Right),
+                stale.name_rect.x,
+                stale.name_rect.y,
+            ),
+            mouse(MouseEventKind::Down(MouseButton::Right), 27, 0),
+            mouse(MouseEventKind::Down(MouseButton::Right), 27, 1),
+            mouse(MouseEventKind::Down(MouseButton::Right), 45, 5),
+            mouse_with_modifiers(
+                MouseEventKind::Down(MouseButton::Right),
+                27,
+                3,
+                KeyModifiers::CONTROL,
+            ),
+        ] {
+            assert_eq!(
+                app.handle_file_manager_mouse(event),
+                FileManagerMouseDispatch::Consumed
+            );
+            assert!(app.state.context_menu.is_none());
+        }
+        let fm = app.state.file_manager.as_ref().expect("open FM");
+        assert_eq!(fm.cursor, 1);
+        assert_eq!(fm.multi_selection_paths(), &before_paths);
+
+        app.state.view.terminal_area = Rect::default();
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(MouseEventKind::Down(MouseButton::Right), 27, 3,)),
+            FileManagerMouseDispatch::NotHandled
+        );
+        assert!(app.state.context_menu.is_none());
+    }
+
+    // TP-C3.2-POPUP-GEOMETRY: row-local action cells are still part of the
+    // exact current-row identity for right-click context, but no row action
+    // tag or side effect escapes.
+    #[test]
+    fn right_click_row_action_cell_opens_the_same_file_context() {
+        let td = TempDir::new("file-context-row-action");
+        td.file("00.txt");
+        td.file("01.txt");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        let expected = install_row_actions(&mut app, 1);
+        let action = trail_action(&app, 1, FileManagerRowAction::Rename);
+
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Right),
+                action.rect.x,
+                action.rect.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+        let menu = app
+            .state
+            .context_menu
+            .as_ref()
+            .expect("row action file menu");
+        let ContextMenuKind::File { model } = &menu.kind else {
+            panic!("expected file menu")
+        };
+        assert_eq!(model.paths, vec![expected]);
+    }
+
+    // TP-FSEND-TS-23: the WHOLE reported path — right-click opens the menu,
+    // Enter on "Send with Tailscale..." emits the intent, and the worker tick
+    // opens the picker. The layers were each green in isolation while the user
+    // saw the menu close and nothing appear, so the only honest test is the
+    // uncut journey.
+    #[test]
+    fn menu_enter_on_send_with_tailscale_opens_the_picker() {
+        let td = TempDir::new("file-context-tailscale-full");
+        td.file("photo.png");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        let row = trail_row_by_path(&app, &td.root.join("photo.png"));
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            row.name_rect.x,
+            row.name_rect.y,
+        ));
+        let menu = app.state.context_menu.as_ref().expect("file menu");
+        let ContextMenuKind::File { model } = &menu.kind else {
+            panic!("expected file menu")
+        };
+        let send_idx = model
+            .items
+            .iter()
+            .position(|item| item.action == FileManagerContextMenuAction::SendTailscale)
+            .expect("Send with Tailscale is in the menu");
+        assert!(
+            model.items[send_idx].enabled,
+            "a plain file must be sendable: {:?}",
+            model.items[send_idx]
+        );
+
+        for _ in 0..send_idx {
+            app.route_client_input(b"\x1b[B".to_vec());
+        }
+        app.route_client_input(b"\r".to_vec());
+        assert!(
+            app.state.request_file_manager_context_action.is_some(),
+            "the menu row must emit an intent"
+        );
+
+        assert!(app.sync_file_operations_for_test());
+        assert_eq!(app.state.mode, Mode::TailscaleSend, "the picker must open");
+        assert_eq!(
+            app.state
+                .tailscale_send
+                .as_ref()
+                .expect("picker state")
+                .paths,
+            vec![td.root.join("photo.png")]
+        );
+    }
+
+    // TP-FSEND-TS-24: the same journey by mouse — the click the user actually
+    // made. Keyboard and mouse take different routes to the same dispatch, and
+    // only the keyboard route was covered.
+    #[test]
+    fn menu_click_on_send_with_tailscale_opens_the_picker() {
+        let td = TempDir::new("file-context-tailscale-click");
+        td.file("photo.png");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        let row = trail_row_by_path(&app, &td.root.join("photo.png"));
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            row.name_rect.x,
+            row.name_rect.y,
+        ));
+        let menu = app.state.context_menu.as_ref().expect("file menu");
+        let ContextMenuKind::File { model } = &menu.kind else {
+            panic!("expected file menu")
+        };
+        let send_idx = model
+            .items
+            .iter()
+            .position(|item| item.action == FileManagerContextMenuAction::SendTailscale)
+            .expect("Send with Tailscale is in the menu");
+
+        // The same geometry the hit test uses: one border cell in, one row per
+        // item.
+        let popup = app.state.context_menu_rect().expect("menu rect");
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            popup.x + 1,
+            popup.y + 1 + send_idx as u16,
+        ));
+        assert!(
+            app.state.request_file_manager_context_action.is_some(),
+            "the clicked row must emit an intent"
+        );
+
+        assert!(app.sync_file_operations_for_test());
+        assert_eq!(app.state.mode, Mode::TailscaleSend, "the picker must open");
+    }
+
+    // TP-C3.2-POPUP-LIFECYCLE: ContextMenu keyboard routing owns focus even
+    // while the FM remains open. Down selects Copy without moving the FM
+    // cursor; Enter emits one exact client-local intent and no filesystem
+    // mutation.
+    #[test]
+    fn file_context_menu_keyboard_owns_focus_and_emits_exact_intent() {
+        let td = TempDir::new("file-context-keyboard-intent");
+        td.file("00.txt");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        let before_entries = fs::read_dir(&td.root)
+            .expect("read keyboard fixture before")
+            .count();
+        let row = trail_row_by_path(&app, &td.root.join("00.txt"));
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            row.name_rect.x,
+            row.name_rect.y,
+        ));
+        assert_eq!(app.state.mode, Mode::ContextMenu);
+        let cursor = app.state.file_manager.as_ref().expect("open FM").cursor;
+
+        app.route_client_input(b"\x1b[B".to_vec());
+        assert_eq!(
+            app.state
+                .context_menu
+                .as_ref()
+                .expect("menu after Down")
+                .list
+                .highlighted,
+            1
+        );
+        assert_eq!(
+            app.state.file_manager.as_ref().expect("open FM").cursor,
+            cursor,
+            "menu navigation cannot move the FM cursor"
+        );
+
+        // One more row: Enlarge is at index 1 and a text file cannot be
+        // enlarged, so Copy — the entry this test activates — is at index 2.
+        app.route_client_input(b"\x1b[B".to_vec());
+        app.route_client_input(b"\r".to_vec());
+        assert!(app.state.context_menu.is_none());
+        assert_ne!(app.state.mode, Mode::ContextMenu);
+        let intent = app
+            .state
+            .request_file_manager_context_action
+            .as_ref()
+            .expect("exact file action intent");
+        assert_eq!(intent.action, FileManagerContextMenuAction::Copy);
+        assert_eq!(intent.paths, vec![td.root.join("00.txt")]);
+        assert_eq!(
+            fs::read_dir(&td.root)
+                .expect("read keyboard fixture after")
+                .count(),
+            before_entries,
+            "C3 intent dispatch performs no filesystem mutation"
+        );
+    }
+
+    // TP-C3.3-PLUGIN-SURFACE: the actual right-click/input pipeline appends an
+    // enabled file action, emits only typed public invocation parameters, and
+    // revalidates plugin enabled state before activation.
+    #[test]
+    fn file_context_menu_plugin_action_is_typed_and_disable_race_fails_closed() {
+        let td = TempDir::new("file-context-plugin-intent");
+        td.file("00.txt");
+        let plugin_td = TempDir::new("file-context-plugin-manifest");
+        let manifest = plugin_td.root.join("herdr-plugin.toml");
+        fs::write(
+            &manifest,
+            r#"
+id = "example.files"
+name = "Example Files"
+version = "0.1.0"
+min_herdr_version = "0.6.10"
+
+[[actions]]
+id = "inspect"
+title = "Inspect file"
+contexts = ["file"]
+command = ["inspect"]
+"#,
+        )
+        .expect("write plugin manifest");
+        let plugin =
+            crate::app::api::plugins::load_plugin_manifest(&manifest.display().to_string(), true)
+                .expect("valid plugin manifest");
+
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        app.state
+            .installed_plugins
+            .insert(plugin.plugin_id.clone(), plugin);
+        let row = trail_row_by_path(&app, &td.root.join("00.txt"));
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            row.name_rect.x,
+            row.name_rect.y,
+        ));
+        let menu = app.state.context_menu.as_ref().expect("plugin file menu");
+        let ContextMenuKind::File { model } = &menu.kind else {
+            panic!("expected file menu")
+        };
+        // Nine built-ins, then the plugin entry last. Both the count and the
+        // number of Down presses move whenever a verb joins the built-ins
+        // (Send with Tailscale, then Open agent here); what is being asserted
+        // — that the plugin entry is last and keyboard-reachable — is
+        // unchanged.
+        assert_eq!(model.items.len(), 10);
+        assert_eq!(model.items[9].label, "Inspect file");
+        assert_eq!(
+            model.items[9].action,
+            FileManagerContextMenuAction::Plugin {
+                plugin_id: "example.files".into(),
+                action_id: "inspect".into(),
+            }
+        );
+
+        for _ in 0..9 {
+            app.route_client_input(b"\x1b[B".to_vec());
+        }
+        app.route_client_input(b"\r".to_vec());
+        let intent = app
+            .state
+            .request_file_manager_context_action
+            .as_ref()
+            .expect("typed plugin file intent");
+        let params = intent
+            .plugin_invocation_params()
+            .expect("public plugin invocation params");
+        assert_eq!(params.plugin_id.as_deref(), Some("example.files"));
+        assert_eq!(params.action_id, "inspect");
+        assert_eq!(
+            params.context.expect("file context").file_paths,
+            vec![td.root.join("00.txt").display().to_string()]
+        );
+        assert!(app.state.plugin_command_logs.is_empty());
+
+        app.state.request_file_manager_context_action = None;
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            row.name_rect.x,
+            row.name_rect.y,
+        ));
+        app.state
+            .installed_plugins
+            .get_mut("example.files")
+            .expect("installed plugin")
+            .enabled = false;
+        // Same shift as above: the plugin entry now sits one row further down.
+        // Stopping at seven would land on Send with Tailscale and this test
+        // would pass for the wrong reason.
+        for _ in 0..8 {
+            app.route_client_input(b"\x1b[B".to_vec());
+        }
+        app.route_client_input(b"\r".to_vec());
+        assert!(app.state.request_file_manager_context_action.is_none());
+        assert!(app.state.plugin_command_logs.is_empty());
+    }
+
+    // TP-C3.2-POPUP-LIFECYCLE: disabled activation stays open and emits
+    // nothing. Reorder, delete, and operation-in-flight changes after menu
+    // creation invalidate the snapshot before any intent can escape.
+    #[test]
+    fn disabled_and_stale_file_context_actions_fail_closed() {
+        let td = TempDir::new("file-context-disabled-stale");
+        td.file("00.txt");
+        td.file("01.txt");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        let fm = app.state.file_manager.as_mut().expect("open FM");
+        assert!(fm.replace_selection(0));
+        assert!(fm.toggle_selection(1));
+        let row = trail_row_by_path(&app, &td.root.join("00.txt"));
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            row.name_rect.x,
+            row.name_rect.y,
+        ));
+        app.route_client_input(b"\r".to_vec());
+        assert!(app.state.context_menu.is_some(), "disabled Open stays open");
+        assert!(app.state.request_file_manager_context_action.is_none());
+
+        // Two rows down: Enlarge sits between Open and Copy and is disabled
+        // for a text file, so Copy is the next enabled entry.
+        app.route_client_input(b"\x1b[B".to_vec());
+        app.route_client_input(b"\x1b[B".to_vec());
+        app.state
+            .file_manager
+            .as_mut()
+            .expect("open FM")
+            .entries
+            .swap(0, 1);
+        app.route_client_input(b"\r".to_vec());
+        assert!(app.state.context_menu.is_none(), "stale menu closes");
+        assert!(app.state.request_file_manager_context_action.is_none());
+
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        let row = trail_row_by_path(&app, &td.root.join("00.txt"));
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            row.name_rect.x,
+            row.name_rect.y,
+        ));
+        app.state.file_manager_operation = Some(crate::app::state::FileManagerOperationState {
+            generation: 1,
+            kind: crate::app::state::FileManagerOperationKind::Copy,
+            destination_directory: td.root.clone(),
+            total_items: 1,
+            completed_items: 0,
+            failed_items: 0,
+            status: crate::app::state::FileManagerOperationStatus::Running,
+            items: Vec::new(),
+        });
+        app.route_client_input(b"\r".to_vec());
+        assert!(app.state.request_file_manager_context_action.is_none());
+
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        let row = trail_row_by_path(&app, &td.root.join("00.txt"));
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            row.name_rect.x,
+            row.name_rect.y,
+        ));
+        fs::remove_file(td.root.join("00.txt")).expect("delete selected fixture path");
+        app.state.file_manager.as_mut().expect("open FM").reload();
+        app.route_client_input(b"\r".to_vec());
+        assert!(app.state.context_menu.is_none());
+        assert!(app.state.request_file_manager_context_action.is_none());
+    }
+
+    // TP-C3.2-POPUP-LIFECYCLE: mouse hover uses the existing global menu hit
+    // geometry. Disabled click stays open, enabled click emits exact intent,
+    // outside click closes, and closing FM clears its owned popup.
+    #[test]
+    fn file_context_menu_mouse_hover_click_outside_and_close_lifecycle() {
+        let td = TempDir::new("file-context-mouse-lifecycle");
+        td.file("00.txt");
+        td.file("01.txt");
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        let fm = app.state.file_manager.as_mut().expect("open FM");
+        assert!(fm.replace_selection(0));
+        assert!(fm.toggle_selection(1));
+        let row = trail_row_by_path(&app, &td.root.join("00.txt"));
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            row.name_rect.x,
+            row.name_rect.y,
+        ));
+        let popup = app.state.context_menu_rect().expect("popup");
+        let item_x = popup.x + 1;
+        let open_y = popup.y + 1;
+        // Enlarge sits at +2 and is disabled for a multiple selection, so
+        // Copy — the first enabled row — is at +3.
+        let copy_y = popup.y + 3;
+
+        app.handle_mouse(mouse(MouseEventKind::Moved, item_x, copy_y));
+        assert_eq!(
+            app.state
+                .context_menu
+                .as_ref()
+                .expect("hovered menu")
+                .list
+                .highlighted,
+            2
+        );
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            item_x,
+            open_y,
+        ));
+        assert!(
+            app.state.context_menu.is_some(),
+            "disabled mouse row stays open"
+        );
+        assert!(app.state.request_file_manager_context_action.is_none());
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            item_x,
+            copy_y,
+        ));
+        let intent = app
+            .state
+            .request_file_manager_context_action
+            .take()
+            .expect("enabled mouse intent");
+        assert_eq!(intent.action, FileManagerContextMenuAction::Copy);
+        assert_eq!(intent.paths.len(), 2);
+
+        app.state.mode = Mode::Terminal;
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            row.name_rect.x,
+            row.name_rect.y,
+        ));
+        let popup = app.state.context_menu_rect().expect("reopened popup");
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            popup.right(),
+            popup.bottom(),
+        ));
+        assert!(app.state.context_menu.is_none(), "outside click closes");
+
+        app.state.mode = Mode::Terminal;
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            row.name_rect.x,
+            row.name_rect.y,
+        ));
+        assert!(app.state.context_menu.is_some());
+        app.state.close_file_manager();
+        assert!(app.state.context_menu.is_none());
+        assert_ne!(app.state.mode, Mode::ContextMenu);
+    }
+
+    fn fcl_location_item(
+        label: impl Into<String>,
+        path: PathBuf,
+    ) -> crate::app::state::FileManagerLocationItem {
+        crate::app::state::FileManagerLocationItem {
+            label: label.into(),
+            path,
+            icon: crate::app::state::FileManagerLocationIcon::Pin,
+            accessible: true,
+            ejectable: false,
+        }
+    }
+
+    fn install_fcl_location_model(app: &mut crate::app::App, paths: &[PathBuf]) {
+        let favorites = paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| fcl_location_item(format!("Location {index:02}"), path.clone()))
+            .collect();
+        app.state.file_manager_locations_model =
+            crate::app::state::FileManagerLocationsModel::from_sources(
+                favorites,
+                Vec::new(),
+                Vec::new(),
+            );
+    }
+
+    // TP-FCL-INPUT-01: one fresh content-local row owns one exact navigation
+    // intent. Vertical wheel input over the rail changes only its visible
+    // window, leaving Trail presentation and filesystem state untouched.
+    #[test]
+    fn fcl_input_fresh_row_click_and_vertical_rail_scroll_are_content_owned() {
+        let td = TempDir::new("fcl-rail-input");
+        let paths = (0..12)
+            .map(|index| {
+                let name = format!("location-{index:02}");
+                td.dir(&name);
+                td.root.join(name)
+            })
+            .collect::<Vec<_>>();
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        install_fcl_location_model(&mut app, &paths);
+        let frame = Rect::new(0, 0, 80, 8);
+        compute_view(&mut app.state, frame);
+
+        let target = app
+            .state
+            .view
+            .file_manager_locations
+            .rows
+            .get(1)
+            .cloned()
+            .expect("second complete rail row");
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                target.rect.x,
+                target.rect.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+        assert_eq!(
+            app.state.request_file_manager_location_navigation,
+            Some(target.path.clone().into()),
+            "the fresh row must emit its exact prepared path once"
+        );
+        app.state.request_file_manager_location_navigation = None;
+
+        let first_before = app.state.view.file_manager_locations.rows[0].path.clone();
+        let trail_before = app
+            .state
+            .file_manager
+            .as_ref()
+            .expect("open Files")
+            .miller
+            .horizontal;
+        let rail = app
+            .state
+            .view
+            .file_manager_locations
+            .layout
+            .rail
+            .expect("persistent rail");
+        for _ in 0..2 {
+            assert_eq!(
+                app.handle_file_manager_mouse(mouse(MouseEventKind::ScrollDown, rail.x, rail.y,)),
+                FileManagerMouseDispatch::Consumed
+            );
+        }
+        compute_view(&mut app.state, frame);
+
+        assert_ne!(
+            app.state.view.file_manager_locations.rows[0].path, first_before,
+            "rail scrolling must advance the visible prepared rows"
+        );
+        assert_eq!(
+            app.state
+                .file_manager
+                .as_ref()
+                .expect("open Files")
+                .miller
+                .horizontal,
+            trail_before,
+            "vertical rail input must not mutate Trail horizontal authority"
+        );
+        assert!(app.state.request_file_manager_location_navigation.is_none());
+    }
+
+    // TP-FCL-INPUT-02: horizontal ownership is rectangle-local. The rail
+    // rejects native horizontal gestures, while the same gesture in Trail
+    // preserves the existing fractional one-third reducer. Existing
+    // TP-TRAIL-HSCROLL and TP-TRAIL-WHEEL-FALLBACK tests continue to cover
+    // Shift-wheel and plain-wheel host normalization byte-for-byte.
+    #[test]
+    fn fcl_input_trail_horizontal_scroll_never_moves_the_locations_rail() {
+        let td = TempDir::new("fcl-horizontal-ownership");
+        let root = td.root.join("root");
+        let mut current = root.clone();
+        for level in 0..9 {
+            current.push(format!("level-{level}"));
+        }
+        fs::create_dir_all(&current).expect("create deep Trail");
+        let locations = (0..10)
+            .map(|index| {
+                let path = td.root.join(format!("favorite-{index:02}"));
+                fs::create_dir_all(&path).expect("create favorite");
+                path
+            })
+            .collect::<Vec<_>>();
+        let mut file_manager =
+            FmState::open_trail_to(&root, &current, false).expect("open deep Trail");
+        for segment in &mut file_manager.miller.chain {
+            segment.preferred_width = 24;
+        }
+        let mut app = runtime_app_with_fm(file_manager);
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        install_fcl_location_model(&mut app, &locations);
+        let frame = Rect::new(0, 0, 82, 12);
+        compute_view(&mut app.state, frame);
+
+        let rail_rows_before = app
+            .state
+            .view
+            .file_manager_locations
+            .rows
+            .iter()
+            .map(|row| row.path.clone())
+            .collect::<Vec<_>>();
+        let offset_before = app.state.view.file_manager_trail.offset_cells;
+        assert!(offset_before > 0, "fixture needs hidden ancestor columns");
+        let rail = app
+            .state
+            .view
+            .file_manager_locations
+            .layout
+            .rail
+            .expect("persistent rail");
+
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(MouseEventKind::ScrollLeft, rail.x, rail.y,)),
+            FileManagerMouseDispatch::Consumed
+        );
+        assert_eq!(
+            app.state
+                .file_manager
+                .as_ref()
+                .expect("open Files")
+                .miller
+                .horizontal
+                .offset_cells,
+            offset_before,
+            "a rail cell cannot authorize Trail horizontal movement"
+        );
+
+        let trail_probe = app
+            .state
+            .view
+            .file_manager_trail
+            .columns
+            .first()
+            .map(|column| (column.rect.x, column.rect.bottom().saturating_sub(1)))
+            .expect("visible Trail column");
+        app.state.file_manager_locations.focus = crate::app::FileManagerLocationsFocus::Rail;
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::ScrollLeft,
+                trail_probe.0,
+                trail_probe.1,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+        assert_eq!(
+            app.state.file_manager_locations.focus,
+            crate::app::FileManagerLocationsFocus::Trail
+        );
+        let offset_after = app
+            .state
+            .file_manager
+            .as_ref()
+            .expect("open Files")
+            .miller
+            .horizontal
+            .offset_cells;
+        assert!(
+            offset_after < offset_before,
+            "Trail keeps its fractional left-scroll reducer"
+        );
+        compute_view(&mut app.state, frame);
+        assert_eq!(
+            app.state
+                .view
+                .file_manager_locations
+                .rows
+                .iter()
+                .map(|row| row.path.clone())
+                .collect::<Vec<_>>(),
+            rail_rows_before,
+            "Trail horizontal input must not move the rail window"
+        );
+    }
+
+    // TP-FCL-INPUT-03: non-row cells and stale identities are fail-closed.
+    // A current row is revalidated against both Files generation and prepared
+    // model revision before any exact path intent can be emitted.
+    #[test]
+    fn fcl_input_gaps_modifiers_compact_and_stale_rows_are_inert() {
+        let td = TempDir::new("fcl-inert-input");
+        td.dir("home");
+        td.dir("downloads");
+        let paths = vec![td.root.join("home"), td.root.join("downloads")];
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        install_fcl_location_model(&mut app, &paths);
+        let frame = Rect::new(0, 0, 80, 8);
+        compute_view(&mut app.state, frame);
+        let stale_row = app.state.view.file_manager_locations.rows[0].clone();
+
+        app.state.file_manager_locations_model.replace_with(
+            crate::app::state::FileManagerLocationsModel::from_sources(
+                vec![fcl_location_item("Replacement", paths[1].clone())],
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        app.handle_file_manager_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            stale_row.rect.x,
+            stale_row.rect.y,
+        ));
+        assert!(app.state.request_file_manager_location_navigation.is_none());
+
+        compute_view(&mut app.state, frame);
+        let fresh_row = app.state.view.file_manager_locations.rows[0].clone();
+        let separator = app
+            .state
+            .view
+            .file_manager_locations
+            .layout
+            .separator
+            .expect("separator");
+        for event in [
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                separator.x,
+                separator.y,
+            ),
+            mouse(MouseEventKind::ScrollDown, separator.x, separator.y),
+            mouse(MouseEventKind::Down(MouseButton::Left), 0, 0),
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                0,
+                frame.bottom().saturating_sub(1),
+            ),
+            mouse_with_modifiers(
+                MouseEventKind::Down(MouseButton::Left),
+                fresh_row.rect.x,
+                fresh_row.rect.y,
+                KeyModifiers::CONTROL,
+            ),
+        ] {
+            app.handle_file_manager_mouse(event);
+            assert!(app.state.request_file_manager_location_navigation.is_none());
+        }
+
+        compute_view(&mut app.state, Rect::new(0, 0, 10, 8));
+        assert!(
+            app.state.view.file_manager_locations.rows.is_empty(),
+            "compact mode publishes no hidden rail rows"
+        );
+        app.handle_file_manager_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            fresh_row.rect.x,
+            fresh_row.rect.y,
+        ));
+        assert!(app.state.request_file_manager_location_navigation.is_none());
+    }
+
+    fn compact_fcl_app(tag: &str) -> (TempDir, crate::app::App, Rect, Vec<PathBuf>) {
+        let td = TempDir::new(tag);
+        let paths = (0..6)
+            .map(|index| {
+                let name = format!("location-{index:02}");
+                td.dir(&name);
+                td.root.join(name)
+            })
+            .collect::<Vec<_>>();
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        app.state.sidebar_collapsed_mode = crate::config::SidebarCollapsedModeConfig::Hidden;
+        install_fcl_location_model(&mut app, &paths);
+        (td, app, Rect::new(0, 0, 30, 12), paths)
+    }
+
+    fn open_fcl_drawer(app: &mut crate::app::App, frame: Rect) -> Rect {
+        compute_view(&mut app.state, frame);
+        let action = app
+            .state
+            .view
+            .file_manager_locations
+            .locations_action_area
+            .unwrap_or_else(|| {
+                panic!(
+                    "complete compact Locations action: terminal={:?} locations={:?}",
+                    app.state.view.terminal_area, app.state.view.file_manager_locations
+                )
+            });
+        assert_eq!(
+            app.handle_file_manager_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                action.x,
+                action.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+        compute_view(&mut app.state, frame);
+        app.state
+            .view
+            .file_manager_locations
+            .drawer_area
+            .expect("open compact Locations drawer")
+    }
+
+    fn stage_flf_drawer_entry_for_test(app: &mut crate::app::App, io_generation: u64) {
+        let path = app
+            .state
+            .file_manager_locations
+            .cursor_path(&app.state.file_manager_locations_model)
+            .expect("drawer cursor")
+            .to_path_buf();
+        assert_eq!(
+            handle_file_manager_key(&mut app.state, key(KeyCode::Right)),
+            FileManagerKeyDispatch::DeferredLocationNavigation
+        );
+        assert_eq!(
+            app.state
+                .request_file_manager_location_navigation
+                .as_ref()
+                .map(|request| request.intent),
+            Some(FileManagerLocationNavigationIntent::EnterTrail)
+        );
+        app.state.file_manager_locations.begin_load(
+            path,
+            app.state.stage.active_instance_generation().unwrap(),
+            app.state.file_manager_locations_model.revision(),
+            io_generation,
+            FileManagerLocationNavigationIntent::EnterTrail,
+        );
+    }
+
+    // TP-FCL-DRAWER-01: the complete compact action opens a bounded top
+    // overlay, and one fresh prepared row emits its exact typed navigation
+    // request without authorizing any path from coordinates alone.
+    #[test]
+    fn fcl_drawer_compact_action_opens_and_exact_row_routes_once() {
+        let (_td, mut app, frame, _paths) = compact_fcl_app("fcl-drawer-select");
+        let drawer = open_fcl_drawer(&mut app, frame);
+        assert!(!drawer.is_empty());
+        assert!(drawer.right() <= app.state.view.terminal_area.right());
+        assert!(drawer.bottom() <= app.state.view.terminal_area.bottom());
+        assert_eq!(
+            app.state.file_manager_locations.focus,
+            crate::app::FileManagerLocationsFocus::Rail
+        );
+
+        let target = app
+            .state
+            .view
+            .file_manager_locations
+            .rows
+            .get(1)
+            .cloned()
+            .expect("second complete drawer row");
+        app.handle_file_manager_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            target.rect.x,
+            target.rect.y,
+        ));
+        assert_eq!(
+            app.state.request_file_manager_location_navigation,
+            Some(FileManagerLocationNavigationRequest {
+                path: target.path.clone(),
+                intent: FileManagerLocationNavigationIntent::EnterTrail,
+            })
+        );
+        assert_eq!(
+            app.state
+                .file_manager_locations
+                .cursor_path(&app.state.file_manager_locations_model),
+            Some(target.path.as_path())
+        );
+        assert!(
+            app.state.file_manager_locations.drawer_is_open(),
+            "the drawer remains authoritative until exact entry acceptance"
+        );
+    }
+
+    // TP-FCL-DRAWER-01: outside click and Esc close only the overlay and
+    // restore its prior Files focus. A resize out of compact mode retires the
+    // drawer, and returning to compact never reopens it implicitly.
+    #[test]
+    fn fcl_drawer_outside_escape_resize_and_reopen_restore_focus() {
+        let (_td, mut app, compact, _paths) = compact_fcl_app("fcl-drawer-lifecycle");
+        let drawer = open_fcl_drawer(&mut app, compact);
+        stage_flf_drawer_entry_for_test(&mut app, 41);
+        let trail = app.state.view.file_manager_locations.layout.trail;
+        let outside = (
+            trail.right().saturating_sub(1),
+            trail.bottom().saturating_sub(1),
+        );
+        assert!(!rect_contains(drawer, outside.0, outside.1));
+
+        app.handle_file_manager_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            outside.0,
+            outside.1,
+        ));
+        compute_view(&mut app.state, compact);
+        assert!(app.state.view.file_manager_locations.drawer_area.is_none());
+        assert!(
+            app.state.file_manager.is_some(),
+            "outside click keeps Files open"
+        );
+        assert_eq!(
+            app.state.file_manager_locations.focus,
+            crate::app::FileManagerLocationsFocus::Trail
+        );
+        assert!(app.state.request_file_manager_location_navigation.is_none());
+        assert!(app.state.file_manager_locations.pending.is_none());
+
+        let _ = open_fcl_drawer(&mut app, compact);
+        stage_flf_drawer_entry_for_test(&mut app, 42);
+        assert_eq!(
+            handle_file_manager_key(&mut app.state, key(KeyCode::Esc)),
+            FileManagerKeyDispatch::Consumed
+        );
+        compute_view(&mut app.state, compact);
+        assert!(
+            app.state.file_manager.is_some(),
+            "Esc closes only the drawer"
+        );
+        assert!(app.state.view.file_manager_locations.drawer_area.is_none());
+        assert!(app.state.request_file_manager_location_navigation.is_none());
+        assert!(app.state.file_manager_locations.pending.is_none());
+
+        let _ = open_fcl_drawer(&mut app, compact);
+        stage_flf_drawer_entry_for_test(&mut app, 43);
+        let wide = Rect::new(0, 0, 90, 12);
+        compute_view(&mut app.state, wide);
+        assert!(app.state.view.file_manager_locations.drawer_area.is_none());
+        assert!(app.state.request_file_manager_location_navigation.is_none());
+        assert!(app.state.file_manager_locations.pending.is_none());
+        assert_eq!(
+            app.state.file_manager_locations.focus,
+            crate::app::FileManagerLocationsFocus::Trail
+        );
+        compute_view(&mut app.state, compact);
+        assert!(
+            app.state.view.file_manager_locations.drawer_area.is_none(),
+            "compact return must not reopen a retired drawer"
+        );
+        let _ = open_fcl_drawer(&mut app, compact);
+    }
+
+    // TP-FCL-DRAWER-01: the open drawer is the top input owner. A stale
+    // projected row and a click in the Trail behind/outside the overlay can
+    // close or be consumed, but neither may mutate navigation or Trail state.
+    #[test]
+    fn fcl_drawer_stale_rows_and_background_trail_are_inert() {
+        let (_td, mut app, frame, paths) = compact_fcl_app("fcl-drawer-authority");
+        let drawer = open_fcl_drawer(&mut app, frame);
+        let stale = app.state.view.file_manager_locations.rows[0].clone();
+        app.state.file_manager_locations_model.replace_with(
+            crate::app::state::FileManagerLocationsModel::from_sources(
+                vec![fcl_location_item("Replacement", paths[1].clone())],
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        app.handle_file_manager_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            stale.rect.x,
+            stale.rect.y,
+        ));
+        assert!(app.state.request_file_manager_location_navigation.is_none());
+
+        compute_view(&mut app.state, frame);
+        let trail_before = app
+            .state
+            .file_manager
+            .as_ref()
+            .map(|file_manager| {
+                (
+                    file_manager.cwd.clone(),
+                    file_manager.cursor,
+                    file_manager.viewport_start,
+                    file_manager.miller.horizontal.offset_cells,
+                    file_manager.miller.horizontal.follow_active,
+                )
+            })
+            .expect("open Files");
+        let trail = app.state.view.file_manager_locations.layout.trail;
+        let outside = (
+            trail.right().saturating_sub(1),
+            trail.bottom().saturating_sub(1),
+        );
+        assert!(!rect_contains(drawer, outside.0, outside.1));
+        app.handle_file_manager_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            outside.0,
+            outside.1,
+        ));
+        let trail_after = app
+            .state
+            .file_manager
+            .as_ref()
+            .map(|file_manager| {
+                (
+                    file_manager.cwd.clone(),
+                    file_manager.cursor,
+                    file_manager.viewport_start,
+                    file_manager.miller.horizontal.offset_cells,
+                    file_manager.miller.horizontal.follow_active,
+                )
+            })
+            .expect("Files stays open");
+        assert_eq!(trail_after, trail_before);
+        assert!(app.state.request_file_manager_location_navigation.is_none());
+    }
+
+    fn wide_flf_app(tag: &str) -> (TempDir, crate::app::App, Rect, Vec<PathBuf>) {
+        let td = TempDir::new(tag);
+        let paths = (0..4)
+            .map(|index| {
+                let name = format!("location-{index:02}");
+                td.dir(&name);
+                td.root.join(name)
+            })
+            .collect::<Vec<_>>();
+        let mut app = runtime_app_with_fm(FmState::new(&td.root));
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        install_fcl_location_model(&mut app, &paths);
+        let frame = Rect::new(0, 0, 100, 16);
+        compute_view(&mut app.state, frame);
+        assert!(
+            app.state.view.file_manager_locations.layout.rail.is_some(),
+            "wide FLF fixture requires the persistent Locations Rail"
+        );
+        (td, app, frame, paths)
+    }
+
+    fn assert_flf_trail_unchanged(before: &FmState, after: &FmState) {
+        assert_eq!(after.cwd, before.cwd);
+        assert_eq!(after.entries, before.entries);
+        assert_eq!(after.cursor, before.cursor);
+        assert_eq!(after.viewport_start, before.viewport_start);
+        assert_eq!(after.trail, before.trail);
+        assert_eq!(after.trail_snapshots, before.trail_snapshots);
+        assert_eq!(after.directory_generation, before.directory_generation);
+        assert_eq!(after.preview_generation, before.preview_generation);
+    }
+
+    // TP-FLF-FOCUS-01: one Left beyond the resident Trail root transfers
+    // ownership to Rail without reading disk or inventing a Direct ancestor.
+    #[test]
+    fn flf_root_left_focuses_rail_with_exact_or_direct_fallback() {
+        let (_td, mut exact, _frame, paths) = wide_flf_app("flf-root-left-exact");
+        assert!(exact
+            .state
+            .file_manager_locations
+            .activate_location(&paths[1], &exact.state.file_manager_locations_model));
+        exact.state.file_manager_locations.focus_trail();
+        let exact_trail = exact.state.file_manager.as_ref().unwrap().clone();
+
+        let (dispatch, profile) = crate::render_prof::observe_for_test(|| {
+            handle_file_manager_key(&mut exact.state, key(KeyCode::Left))
+        });
+
+        assert_eq!(dispatch, FileManagerKeyDispatch::Consumed);
+        assert_eq!(
+            exact.state.file_manager_locations.focus,
+            crate::app::FileManagerLocationsFocus::Rail
+        );
+        assert_eq!(
+            exact
+                .state
+                .file_manager_locations
+                .cursor_path(&exact.state.file_manager_locations_model),
+            Some(paths[1].as_path())
+        );
+        assert_flf_trail_unchanged(
+            &exact_trail,
+            exact.state.file_manager.as_ref().expect("open exact Trail"),
+        );
+        assert_eq!(profile.counter("fm.filesystem.read"), 0);
+
+        let (_td, mut direct, _frame, paths) = wide_flf_app("flf-root-left-direct");
+        direct
+            .state
+            .file_manager_locations
+            .activate_direct(direct.state.file_manager.as_ref().unwrap().cwd.clone());
+        assert!(!direct
+            .state
+            .file_manager_locations
+            .normalize_cursor_for_rail(&direct.state.file_manager_locations_model));
+        assert!(matches!(
+            direct
+                .state
+                .file_manager_locations
+                .move_cursor(&direct.state.file_manager_locations_model, 1),
+            crate::app::file_manager_locations::FileManagerLocationCursorMove::Moved(_)
+        ));
+        assert_eq!(
+            handle_file_manager_key(&mut direct.state, key(KeyCode::Left)),
+            FileManagerKeyDispatch::Consumed
+        );
+        assert_eq!(
+            direct
+                .state
+                .file_manager_locations
+                .cursor_path(&direct.state.file_manager_locations_model),
+            Some(paths[1].as_path()),
+            "Direct origin preserves the prior valid cursor instead of inferring an ancestor"
+        );
+    }
+
+    // TP-FLF-STEP-01 + TP-FLF-PREVIEW-01: Rail vertical ownership advances
+    // exactly one accessible row and cannot mutate the resident Miller Trail.
+    #[test]
+    fn flf_rail_up_down_move_one_and_never_mutate_trail() {
+        let (_td, mut app, _frame, paths) = wide_flf_app("flf-rail-step");
+        assert_eq!(
+            app.state
+                .file_manager_locations
+                .cursor_path(&app.state.file_manager_locations_model),
+            Some(paths[0].as_path())
+        );
+        app.state.file_manager_locations.focus = crate::app::FileManagerLocationsFocus::Rail;
+        let trail_before = app.state.file_manager.as_ref().unwrap().clone();
+
+        assert_eq!(
+            handle_file_manager_key(&mut app.state, key(KeyCode::Down)),
+            FileManagerKeyDispatch::Consumed
+        );
+        assert_eq!(
+            app.state
+                .file_manager_locations
+                .cursor_path(&app.state.file_manager_locations_model),
+            Some(paths[1].as_path())
+        );
+        assert_eq!(
+            app.state.request_file_manager_location_navigation,
+            Some(FileManagerLocationNavigationRequest {
+                path: paths[1].clone(),
+                intent: FileManagerLocationNavigationIntent::FollowPreview,
+            })
+        );
+        assert_flf_trail_unchanged(
+            &trail_before,
+            app.state.file_manager.as_ref().expect("open Trail"),
+        );
+
+        assert_eq!(
+            handle_file_manager_key(&mut app.state, key(KeyCode::Up)),
+            FileManagerKeyDispatch::Consumed
+        );
+        assert_eq!(
+            app.state
+                .file_manager_locations
+                .cursor_path(&app.state.file_manager_locations_model),
+            Some(paths[0].as_path())
+        );
+    }
+
+    // TP-FLF-FOCUS-01: once Rail owns the keyboard, modified or unrelated
+    // keys are fail-closed and cannot leak into hidden Trail shortcuts.
+    #[test]
+    fn flf_rail_owner_swallows_shift_ctrl_and_hidden_trail_actions() {
+        let (_td, mut app, _frame, _paths) = wide_flf_app("flf-rail-owner");
+        assert!(app
+            .state
+            .file_manager_locations
+            .cursor_path(&app.state.file_manager_locations_model)
+            .is_some());
+        app.state.file_manager_locations.focus = crate::app::FileManagerLocationsFocus::Rail;
+        let before = app.state.file_manager.as_ref().unwrap().clone();
+
+        for event in [
+            key_with_modifiers(KeyCode::Down, KeyModifiers::SHIFT),
+            key_with_modifiers(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            key(KeyCode::Char('.')),
+            key(KeyCode::Char(' ')),
+            key(KeyCode::Char('x')),
+        ] {
+            assert_eq!(
+                handle_file_manager_key(&mut app.state, event),
+                FileManagerKeyDispatch::Inert
+            );
+        }
+        assert_flf_trail_unchanged(
+            &before,
+            app.state.file_manager.as_ref().expect("open Trail"),
+        );
+        assert!(app.state.request_file_manager_location_navigation.is_none());
+    }
+
+    // TP-FLF-ENTER-01: explicit entry is a typed deferred request. It cannot
+    // move Trail focus before the exact root has been accepted.
+    #[test]
+    fn flf_rail_right_and_enter_queue_enter_without_immediate_focus() {
+        for code in [KeyCode::Right, KeyCode::Char('l'), KeyCode::Enter] {
+            let (_td, mut app, _frame, paths) = wide_flf_app("flf-rail-enter");
+            assert_eq!(
+                app.state
+                    .file_manager_locations
+                    .cursor_path(&app.state.file_manager_locations_model),
+                Some(paths[0].as_path())
+            );
+            app.state.file_manager_locations.focus = crate::app::FileManagerLocationsFocus::Rail;
+            let before = app.state.file_manager.as_ref().unwrap().clone();
+            app.file_manager_key_render_override = None;
+
+            app.handle_focused_file_manager_key(key(code));
+
+            assert_eq!(
+                app.state.request_file_manager_location_navigation,
+                Some(FileManagerLocationNavigationRequest {
+                    path: paths[0].clone(),
+                    intent: FileManagerLocationNavigationIntent::EnterTrail,
+                })
+            );
+            assert_eq!(
+                app.state.file_manager_locations.focus,
+                crate::app::FileManagerLocationsFocus::Rail
+            );
+            assert_flf_trail_unchanged(
+                &before,
+                app.state.file_manager.as_ref().expect("open Trail"),
+            );
+            assert_eq!(app.file_manager_key_render_override, Some(false));
+        }
+    }
+
+    // TP-FLF-IO-02: once Follow owns an exact worker ticket, explicit entry
+    // upgrades that ticket synchronously before a scheduled result drain can
+    // observe the weaker intent. No second request crosses the App boundary.
+    #[test]
+    fn flf_rail_enter_promotes_pending_follow_before_scheduled_drain() {
+        let (_td, mut app, _frame, paths) = wide_flf_app("flf-rail-promote");
+        let path = paths[0].clone();
+        app.state.file_manager_locations.focus = crate::app::FileManagerLocationsFocus::Rail;
+        app.state.file_manager_locations.begin_load(
+            path.clone(),
+            app.state.stage.active_instance_generation().unwrap(),
+            app.state.file_manager_locations_model.revision(),
+            41,
+            FileManagerLocationNavigationIntent::FollowPreview,
+        );
+
+        assert_eq!(
+            handle_file_manager_key(&mut app.state, key(KeyCode::Right)),
+            FileManagerKeyDispatch::DeferredLocationNavigation
+        );
+        assert_eq!(
+            app.state
+                .file_manager_locations
+                .pending
+                .as_ref()
+                .map(|pending| pending.intent),
+            Some(FileManagerLocationNavigationIntent::EnterTrail)
+        );
+        assert!(
+            app.state.request_file_manager_location_navigation.is_none(),
+            "exact pending promotion must not enqueue a duplicate request"
+        );
+    }
+
+    // TP-FLF-COMPACT-01: root Left opens the compact Rail owner. Esc restores
+    // Trail and retires a deferred entry request that can no longer own focus.
+    #[test]
+    fn flf_compact_root_left_opens_drawer_and_escape_invalidates_entry() {
+        let (_td, mut app, frame, paths) = compact_fcl_app("flf-compact-left");
+        compute_view(&mut app.state, frame);
+
+        assert_eq!(
+            handle_file_manager_key(&mut app.state, key(KeyCode::Left)),
+            FileManagerKeyDispatch::Consumed
+        );
+        assert!(app.state.file_manager_locations.drawer_is_open());
+        assert_eq!(
+            app.state
+                .file_manager_locations
+                .cursor_path(&app.state.file_manager_locations_model),
+            Some(paths[0].as_path())
+        );
+        assert_eq!(
+            handle_file_manager_key(&mut app.state, key(KeyCode::Right)),
+            FileManagerKeyDispatch::DeferredLocationNavigation
+        );
+        assert_eq!(
+            app.state.request_file_manager_location_navigation,
+            Some(FileManagerLocationNavigationRequest {
+                path: paths[0].clone(),
+                intent: FileManagerLocationNavigationIntent::EnterTrail,
+            })
+        );
+
+        assert_eq!(
+            handle_file_manager_key(&mut app.state, key(KeyCode::Esc)),
+            FileManagerKeyDispatch::Consumed
+        );
+        assert!(!app.state.file_manager_locations.drawer_is_open());
+        assert_eq!(
+            app.state.file_manager_locations.focus,
+            crate::app::FileManagerLocationsFocus::Trail
+        );
+        assert!(app.state.request_file_manager_location_navigation.is_none());
+    }
+
+    // TP-FLF-COMPACT-01 + TP-FLF-PREVIEW-01: mouse uses the same exact Rail
+    // cursor but carries surface-specific Follow versus Enter intent.
+    #[test]
+    fn flf_mouse_location_click_synchronizes_cursor_and_typed_intent() {
+        let (_td, mut wide, _frame, paths) = wide_flf_app("flf-mouse-wide");
+        let target = wide.state.view.file_manager_locations.rows[1].clone();
+        assert_eq!(
+            wide.handle_file_manager_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                target.rect.x,
+                target.rect.y,
+            )),
+            FileManagerMouseDispatch::Consumed
+        );
+        assert_eq!(
+            wide.state
+                .file_manager_locations
+                .cursor_path(&wide.state.file_manager_locations_model),
+            Some(paths[1].as_path())
+        );
+        assert_eq!(
+            wide.state.request_file_manager_location_navigation,
+            Some(FileManagerLocationNavigationRequest {
+                path: paths[1].clone(),
+                intent: FileManagerLocationNavigationIntent::FollowPreview,
+            })
+        );
+
+        let (_td, mut compact, frame, _paths) = compact_fcl_app("flf-mouse-compact");
+        let _ = open_fcl_drawer(&mut compact, frame);
+        let target = compact.state.view.file_manager_locations.rows[1].clone();
+        compact.handle_file_manager_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            target.rect.x,
+            target.rect.y,
+        ));
+        assert_eq!(
+            compact
+                .state
+                .file_manager_locations
+                .cursor_path(&compact.state.file_manager_locations_model),
+            Some(target.path.as_path())
+        );
+        assert_eq!(
+            compact.state.request_file_manager_location_navigation,
+            Some(FileManagerLocationNavigationRequest {
+                path: target.path,
+                intent: FileManagerLocationNavigationIntent::EnterTrail,
+            })
+        );
+        assert!(
+            compact.state.file_manager_locations.drawer_is_open(),
+            "compact drawer closes only after an accepted entry transition"
+        );
+    }
+
+    // TP-FLF-STEP-01: a boundary key and a deferred activation are both
+    // render-neutral; a real cursor move retains the normal single render.
+    #[test]
+    fn flf_clamped_and_deferred_keys_decline_immediate_render() {
+        let (_td, mut app, _frame, paths) = wide_flf_app("flf-render-neutral");
+        assert_eq!(
+            app.state
+                .file_manager_locations
+                .cursor_path(&app.state.file_manager_locations_model),
+            Some(paths[0].as_path())
+        );
+        app.state.file_manager_locations.focus = crate::app::FileManagerLocationsFocus::Rail;
+
+        app.file_manager_key_render_override = None;
+        app.handle_focused_file_manager_key(key(KeyCode::Up));
+        assert_eq!(app.file_manager_key_render_override, Some(false));
+
+        app.file_manager_key_render_override = None;
+        app.handle_focused_file_manager_key(key(KeyCode::Right));
+        assert_eq!(app.file_manager_key_render_override, Some(false));
+
+        app.file_manager_key_render_override = None;
+        app.handle_focused_file_manager_key(key(KeyCode::Down));
+        assert_eq!(
+            app.file_manager_key_render_override, None,
+            "a visible one-row cursor move requests the normal single render"
+        );
+    }
+    fn state_with_fm_over(root: &std::path::Path) -> AppState {
+        let mut state = AppState::test_new();
+        state.workspaces = vec![crate::workspace::Workspace::test_new("fm")];
+        state.active = Some(0);
+        state.ensure_test_terminals();
+        state.file_manager = Some(crate::fm::FmState::new(root));
+        state
+    }
+
+    fn filter_tempdir(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-fm-filter-road-{}-{}",
+            std::process::id(),
+            tag
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        // Explicit, strictly ordered mtimes: dirs born in one syscall burst
+        // tie on the clock, and a tie leaves the order to readdir — which
+        // under a loaded parallel run really did flip apple/apricot. The
+        // iteration order below IS the visible order the tests step through.
+        for (age, name) in ["apple", "apricot", "banana"].iter().enumerate() {
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).expect("mk");
+            std::fs::File::open(&dir)
+                .expect("open filter fixture dir")
+                .set_times(std::fs::FileTimes::new().set_modified(
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(100 - age as u64),
+                ))
+                .expect("set filter fixture mtime");
+        }
+        root
+    }
+
+    // TP-FM-FILTER-03: `/` opens the editor, typed characters narrow the
+    // live projection, Enter keeps the filter with the keys handed back,
+    // and Esc-then-Esc first drops the filter and only then the selection.
+    #[test]
+    fn the_slash_road_types_a_filter_and_esc_walks_back_out() {
+        let root = filter_tempdir("slash");
+        let mut state = state_with_fm_over(&root);
+
+        assert!(matches!(
+            handle_file_manager_key(&mut state, key(KeyCode::Char('/'))),
+            FileManagerKeyDispatch::Consumed
+        ));
+        assert!(state.file_manager.as_ref().unwrap().trail_filter_editing);
+
+        for c in ['a', 'p'] {
+            handle_file_manager_key(&mut state, key(KeyCode::Char(c)));
+        }
+        {
+            let fm = state.file_manager.as_ref().unwrap();
+            let filter = fm.trail_filter().expect("the pattern is live");
+            assert_eq!(filter.pattern, "ap");
+            let col = &fm.trail_snapshots.cols()[0];
+            let allowed = fm
+                .trail_snapshots
+                .filtered_indices(col)
+                .expect("the active column is the filtered one");
+            let names: Vec<&str> = allowed
+                .iter()
+                .map(|&idx| col.entries()[idx].name.as_str())
+                .collect();
+            assert_eq!(names, ["apple", "apricot"], "typing narrows live");
+        }
+
+        handle_file_manager_key(&mut state, key(KeyCode::Enter));
+        {
+            let fm = state.file_manager.as_ref().unwrap();
+            assert!(!fm.trail_filter_editing, "Enter hands the keys back");
+            assert!(fm.trail_filter().is_some(), "and keeps the filter");
+        }
+
+        handle_file_manager_key(&mut state, key(KeyCode::Esc));
+        assert!(
+            state
+                .file_manager
+                .as_ref()
+                .unwrap()
+                .trail_filter()
+                .is_none(),
+            "the first Esc clears the filter"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // TP-FM-FILTER-01: after typing, the cursor stands on a MATCH — the
+    // zero-delta normalize walked it there — and arrows move within matches
+    // even while the editor is open.
+    #[test]
+    fn typing_normalizes_the_cursor_onto_a_match() {
+        let root = filter_tempdir("normalize");
+        let mut state = state_with_fm_over(&root);
+        // stand the cursor on "banana" first
+        handle_file_manager_key(&mut state, key(KeyCode::Down));
+        handle_file_manager_key(&mut state, key(KeyCode::Down));
+        {
+            let fm = state.file_manager.as_ref().unwrap();
+            assert_eq!(
+                fm.trail_snapshots
+                    .selected_entry(&fm.trail)
+                    .map(|e| e.name.as_str()),
+                Some("banana")
+            );
+        }
+        handle_file_manager_key(&mut state, key(KeyCode::Char('/')));
+        for c in ['a', 'p'] {
+            handle_file_manager_key(&mut state, key(KeyCode::Char(c)));
+        }
+        {
+            let fm = state.file_manager.as_ref().unwrap();
+            assert_eq!(
+                fm.trail_snapshots
+                    .selected_entry(&fm.trail)
+                    .map(|e| e.name.as_str()),
+                Some("apple"),
+                "the filtered-out cursor stepped to the first match"
+            );
+        }
+        handle_file_manager_key(&mut state, key(KeyCode::Down));
+        {
+            let fm = state.file_manager.as_ref().unwrap();
+            assert_eq!(
+                fm.trail_snapshots
+                    .selected_entry(&fm.trail)
+                    .map(|e| e.name.as_str()),
+                Some("apricot"),
+                "Down skips the non-match between"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// TP-SBS-FILES-03: `.` toggles hidden files on the beside half too.
+    ///
+    /// The key built its refresh request from a generation that asked who
+    /// owned the STAGE. Beside a terminal that is nobody, so the request was
+    /// never built and the key died silently — the one Files key that looked
+    /// broken rather than absent.
+    #[test]
+    fn the_hidden_toggle_answers_on_a_files_surface_beside_the_terminal() {
+        let dir = TempDir::new("hidden-beside");
+        dir.file("visible.txt");
+        let mut state = AppState::test_new();
+        state.workspaces = vec![crate::workspace::Workspace::test_new("left")];
+        state.active = Some(0);
+        state.selected = 0;
+        state
+            .try_open_file_manager_with(|_| Some(FmState::new(&dir.root)))
+            .expect("Files activation");
+        state.show_terminal_workspace();
+        state.enter_files_beside();
+        assert!(state.files_beside_active(), "the pairing is up");
+
+        let dispatch = handle_file_manager_key(
+            &mut state,
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('.'),
+                KeyModifiers::NONE,
+            ),
+        );
+        assert!(
+            matches!(dispatch, FileManagerKeyDispatch::Refresh(_)),
+            "the hidden toggle must queue its refresh while Files rides the right half"
+        );
+    }
+}

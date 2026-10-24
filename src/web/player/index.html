@@ -1,0 +1,18 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>herdr pane player</title>
+<style>
+  html, body { margin: 0; background: #0d1117; color: #c9d1d9; font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  #stage { position: relative; margin: 14px; background: #161b22; border: 1px solid #30363d; }
+  .pane { position: absolute; box-sizing: border-box; border: 1px solid #30363d; overflow: hidden; }
+  .pane.focus { border-color: #58a6ff; }
+  .pane .tag { position: absolute; left: 4px; top: 2px; font-size: 10px; color: #8b949e; z-index: 2; }
+  .pane canvas { position: absolute; background: #000; }
+  #hud { position: fixed; right: 10px; bottom: 10px; background: #161b22e6; border: 1px solid #2a3038; border-radius: 6px; padding: 8px 10px; font-size: 11px; white-space: pre; z-index: 9; }
+  #start { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); z-index: 10; padding: 14px 22px; font: inherit; font-size: 14px; background: #238636; color: #fff; border: 0; border-radius: 6px; cursor: pointer; }
+  #start[hidden] { display: none; }
+</style>
+<div id="stage"></div>
+<button id="start">▶ sesi başlat</button>
+<div id="hud">bağlanıyor…</div>
+<script type="module" src="./player/player.mjs"></script>

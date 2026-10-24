@@ -1,0 +1,78 @@
+{
+  "note": "Five pictures from ffmpeg's MPEG-TS muxer with -omit_video_pes_length 0. Described by scripts/pane_video_ts_fixture.py, an independent demuxer written from ISO 13818-1, so that the Rust reader (src/server/headless/mpegts.rs) is measured against the standard and the muxer rather than against itself.",
+  "packet_bytes": 188,
+  "total_bytes": 9212,
+  "packets": 49,
+  "pictures": [
+    {
+      "index": 0,
+      "size": 1959,
+      "length_written": true,
+      "completed_by": "length",
+      "nal_types": [
+        9,
+        7,
+        8,
+        6,
+        5
+      ],
+      "starts_with_aud": true,
+      "key": true,
+      "pts_90k": 0
+    },
+    {
+      "index": 1,
+      "size": 1056,
+      "length_written": true,
+      "completed_by": "length",
+      "nal_types": [
+        9,
+        1
+      ],
+      "starts_with_aud": true,
+      "key": false,
+      "pts_90k": 9000
+    },
+    {
+      "index": 2,
+      "size": 635,
+      "length_written": true,
+      "completed_by": "length",
+      "nal_types": [
+        9,
+        1
+      ],
+      "starts_with_aud": true,
+      "key": false,
+      "pts_90k": 18000
+    },
+    {
+      "index": 3,
+      "size": 663,
+      "length_written": true,
+      "completed_by": "length",
+      "nal_types": [
+        9,
+        1
+      ],
+      "starts_with_aud": true,
+      "key": false,
+      "pts_90k": 27000
+    },
+    {
+      "index": 4,
+      "size": 2276,
+      "length_written": true,
+      "completed_by": "length",
+      "nal_types": [
+        9,
+        7,
+        8,
+        5
+      ],
+      "starts_with_aud": true,
+      "key": true,
+      "pts_90k": 36000
+    }
+  ]
+}

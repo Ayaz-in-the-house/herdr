@@ -1,0 +1,1568 @@
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::thread::JoinHandle;
+
+use tokio::sync::Notify;
+
+use crate::fm::image_preview::{read_image_preview, ImagePreviewLimits};
+use crate::fm::pdf_preview::{read_pdf_page_preview, PdfPreviewError, PdfPreviewLimits};
+use crate::fm::{
+    FmFilePreview, FmImagePreviewState, FmPdfPreviewState, FmPreview, ImagePreviewError,
+    ImagePreviewTarget, PreparedImagePreview,
+};
+use crate::kitty_graphics::file_manager_image_target;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImagePreviewKey {
+    path: PathBuf,
+    model_generation: u64,
+    target: ImagePreviewTarget,
+    /// Which page to rasterise, for the documents that have pages.
+    ///
+    /// Part of the key rather than a side channel: turning a page has to
+    /// invalidate the slot exactly as changing file or panel size does, or the
+    /// worker would consider the new request identical to the one already
+    /// running and never start it.
+    page: Option<usize>,
+}
+
+impl ImagePreviewKey {
+    fn image(path: &Path, model_generation: u64, target: ImagePreviewTarget) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            model_generation,
+            target,
+            page: None,
+        }
+    }
+
+    fn pdf_page(
+        path: &Path,
+        model_generation: u64,
+        target: ImagePreviewTarget,
+        page: usize,
+    ) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            model_generation,
+            target,
+            page: Some(page),
+        }
+    }
+}
+
+/// Ready pixels, and what the page track additionally learned while producing
+/// them.
+#[derive(Debug)]
+enum RasterOutput {
+    Image(PreparedImagePreview),
+    PdfPage {
+        total_pages: usize,
+        prepared: PreparedImagePreview,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RasterFailure {
+    Image(ImagePreviewError),
+    Pdf(PdfPreviewError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImagePreviewSync {
+    Unchanged,
+    Started { generation: u64 },
+    Stopped,
+}
+
+#[derive(Debug, Default)]
+struct ImagePreviewSlot {
+    generation: u64,
+    active: Option<ImagePreviewKey>,
+    /// Whether `active`'s result has already been handed back.
+    delivered: bool,
+}
+
+impl ImagePreviewSlot {
+    /// `awaiting`: the screen still shows this preview as not yet drawn
+    /// (`Pending` or `Loading`).
+    ///
+    /// Unlike text, an image key stays the target after its pixels are
+    /// `Ready`, so the key alone cannot tell a finished picture from one put
+    /// back to loading. A delivered key the screen is STILL awaiting was put
+    /// back — a refresh installed a copy of the file manager taken while the
+    /// decode was in flight — and is decoded again; a delivered key the
+    /// screen shows as drawn (or failed) is left alone.
+    /// TP-FMW-REFRESH-06
+    fn sync(&mut self, target: Option<ImagePreviewKey>, awaiting: bool) -> ImagePreviewSync {
+        let put_back = self.delivered && awaiting && target.is_some();
+        if self.active == target && !put_back {
+            return ImagePreviewSync::Unchanged;
+        }
+        self.generation = self.generation.wrapping_add(1).max(1);
+        self.active = target;
+        self.delivered = false;
+        if self.active.is_some() {
+            ImagePreviewSync::Started {
+                generation: self.generation,
+            }
+        } else {
+            ImagePreviewSync::Stopped
+        }
+    }
+
+    fn accepts(&self, generation: u64, key: &ImagePreviewKey) -> bool {
+        self.generation == generation && self.active.as_ref() == Some(key)
+    }
+}
+
+#[derive(Debug)]
+struct ImagePreviewRequest {
+    generation: u64,
+    key: ImagePreviewKey,
+}
+
+#[derive(Debug)]
+struct ImagePreviewResult {
+    generation: u64,
+    key: ImagePreviewKey,
+    output: Result<RasterOutput, RasterFailure>,
+}
+
+#[derive(Debug, Default)]
+struct ImagePreviewDrain {
+    current: Option<ImagePreviewResult>,
+    disconnected: bool,
+}
+
+#[derive(Debug)]
+struct ImagePreviewWorkerState {
+    pending: Option<ImagePreviewRequest>,
+    result: Option<ImagePreviewResult>,
+    alive: bool,
+    closed: bool,
+}
+
+impl Default for ImagePreviewWorkerState {
+    fn default() -> Self {
+        Self {
+            pending: None,
+            result: None,
+            alive: true,
+            closed: false,
+        }
+    }
+}
+
+type SharedImageWorkerState = Arc<(Mutex<ImagePreviewWorkerState>, Condvar)>;
+
+struct ImageWorkerAliveGuard {
+    shared: SharedImageWorkerState,
+    wake: Arc<Notify>,
+}
+
+impl Drop for ImageWorkerAliveGuard {
+    fn drop(&mut self) {
+        let (state, _) = &*self.shared;
+        lock_image_state(state).alive = false;
+        self.wake.notify_one();
+    }
+}
+
+pub(super) struct ImagePreviewWorker {
+    slot: ImagePreviewSlot,
+    shared: SharedImageWorkerState,
+    handle: Option<JoinHandle<()>>,
+    disconnect_reported: bool,
+}
+
+impl ImagePreviewWorker {
+    pub(super) fn new(wake: Arc<Notify>) -> Self {
+        Self::with_processor(wake, |path, target, page| match page {
+            None => read_image_preview(path, target, ImagePreviewLimits::default())
+                .map(RasterOutput::Image)
+                .map_err(RasterFailure::Image),
+            Some(page) => read_pdf_page_preview(path, page, target, PdfPreviewLimits::default())
+                .map(|rendered| RasterOutput::PdfPage {
+                    total_pages: rendered.total_pages,
+                    prepared: rendered.image,
+                })
+                .map_err(RasterFailure::Pdf),
+        })
+    }
+
+    fn with_processor<F>(wake: Arc<Notify>, processor: F) -> Self
+    where
+        F: Fn(&Path, ImagePreviewTarget, Option<usize>) -> Result<RasterOutput, RasterFailure>
+            + Send
+            + 'static,
+    {
+        let shared = Arc::new((
+            Mutex::new(ImagePreviewWorkerState::default()),
+            Condvar::new(),
+        ));
+        let worker_shared = shared.clone();
+        let handle = std::thread::spawn(move || {
+            let _alive_guard = ImageWorkerAliveGuard {
+                shared: worker_shared.clone(),
+                wake: wake.clone(),
+            };
+            while let Some(request) = take_next_image_request(&worker_shared) {
+                let panicked = if request.key.page.is_some() {
+                    RasterFailure::Pdf(PdfPreviewError::RendererPanicked)
+                } else {
+                    RasterFailure::Image(ImagePreviewError::DecoderPanicked)
+                };
+                let output = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    processor(&request.key.path, request.key.target, request.key.page)
+                }))
+                .unwrap_or(Err(panicked));
+                let result = ImagePreviewResult {
+                    generation: request.generation,
+                    key: request.key,
+                    output,
+                };
+                let (state, _) = &*worker_shared;
+                let mut state = lock_image_state(state);
+                if state.closed {
+                    break;
+                }
+                state.result = Some(result);
+                drop(state);
+                wake.notify_one();
+            }
+        });
+
+        Self {
+            slot: ImagePreviewSlot::default(),
+            shared,
+            handle: Some(handle),
+            disconnect_reported: false,
+        }
+    }
+
+    fn sync_target(&mut self, target: Option<ImagePreviewKey>, awaiting: bool) -> ImagePreviewSync {
+        let sync = self.slot.sync(target.clone(), awaiting);
+        let (state, pending) = &*self.shared;
+        let mut state = lock_image_state(state);
+        match sync {
+            ImagePreviewSync::Started { generation } => {
+                if let Some(key) = target {
+                    state.pending = Some(ImagePreviewRequest { generation, key });
+                    crate::render_prof::event("fm.image_worker.submitted");
+                    pending.notify_one();
+                }
+            }
+            ImagePreviewSync::Stopped => {
+                state.pending = None;
+                state.result = None;
+            }
+            ImagePreviewSync::Unchanged => {}
+        }
+        sync
+    }
+
+    fn drain(&mut self) -> ImagePreviewDrain {
+        let (state, _) = &*self.shared;
+        let mut state = lock_image_state(state);
+        let result = state.result.take();
+        let disconnected = !state.alive && !state.closed && !self.disconnect_reported;
+        self.disconnect_reported |= disconnected;
+        drop(state);
+
+        let current = result.and_then(|result| {
+            if self.slot.accepts(result.generation, &result.key) {
+                crate::render_prof::event("fm.image_worker.completed");
+                self.slot.delivered = true;
+                Some(result)
+            } else {
+                crate::render_prof::event("fm.image_worker.rejected");
+                None
+            }
+        });
+        ImagePreviewDrain {
+            current,
+            disconnected,
+        }
+    }
+}
+
+impl Drop for ImagePreviewWorker {
+    fn drop(&mut self) {
+        let (state, pending) = &*self.shared;
+        let mut state = lock_image_state(state);
+        state.closed = true;
+        state.pending = None;
+        state.result = None;
+        drop(state);
+        pending.notify_one();
+
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn take_next_image_request(shared: &SharedImageWorkerState) -> Option<ImagePreviewRequest> {
+    let (state, pending) = &**shared;
+    let mut state = lock_image_state(state);
+    while state.pending.is_none() && !state.closed {
+        state = match pending.wait(state) {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+    }
+    if state.closed {
+        return None;
+    }
+    state.pending.take()
+}
+
+fn lock_image_state(
+    state: &Mutex<ImagePreviewWorkerState>,
+) -> MutexGuard<'_, ImagePreviewWorkerState> {
+    match state.lock() {
+        Ok(state) => state,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+impl super::App {
+    #[cfg(test)]
+    pub(in crate::app) fn image_preview_worker_generation_for_test(&mut self) -> u64 {
+        self.image_worker().slot.generation
+    }
+
+    /// Drive the bounded image preview worker one step.
+    ///
+    /// `pub(crate)` rather than `pub(super)`: the headless server schedules this
+    /// too, and `crate::server` is not a descendant of `crate::app`.
+    pub(crate) fn sync_image_preview_worker(&mut self) -> bool {
+        if self.state.view.file_manager_miller.resize_preview_active {
+            return false;
+        }
+
+        let target = self.state.file_manager.as_ref().and_then(|file_manager| {
+            let target = || file_manager_image_target(&self.state, self.image_preview_cell_size);
+            match &file_manager.preview {
+                FmPreview::File(FmFilePreview::Image(preview)) => {
+                    // A format with no decoder is settled before any work
+                    // starts, and must stay settled: handing it to the worker
+                    // would read the file only to rediscover what its extension
+                    // already said, and would then overwrite a stated
+                    // limitation with a decode failure.
+                    if matches!(preview.state, FmImagePreviewState::Unsupported) {
+                        return None;
+                    }
+                    Some(ImagePreviewKey::image(
+                        &preview.source_path,
+                        preview.generation,
+                        target()?,
+                    ))
+                }
+                FmPreview::File(FmFilePreview::Pdf(preview)) => Some(ImagePreviewKey::pdf_page(
+                    &preview.source_path,
+                    preview.generation,
+                    target()?,
+                    preview.page,
+                )),
+                _ => None,
+            }
+        });
+        // What the screen shows, not what the key says: see
+        // `ImagePreviewSlot::sync` (TP-FMW-REFRESH-06).
+        let awaiting = self
+            .state
+            .file_manager
+            .as_ref()
+            .is_some_and(|file_manager| match &file_manager.preview {
+                FmPreview::File(FmFilePreview::Image(preview)) => matches!(
+                    preview.state,
+                    FmImagePreviewState::Pending | FmImagePreviewState::Loading { .. }
+                ),
+                FmPreview::File(FmFilePreview::Pdf(preview)) => matches!(
+                    preview.state,
+                    FmPdfPreviewState::Pending | FmPdfPreviewState::Loading { .. }
+                ),
+                _ => false,
+            });
+
+        match self.image_worker().sync_target(target.clone(), awaiting) {
+            ImagePreviewSync::Started { .. } => {
+                return target.is_some_and(|key| {
+                    crate::render_prof::event("fm.image_target.refresh");
+                    set_loading_state(&mut self.state, &key)
+                });
+            }
+            ImagePreviewSync::Stopped => {
+                return set_pending_raster_state(&mut self.state);
+            }
+            ImagePreviewSync::Unchanged => {}
+        }
+
+        let drained = self.image_worker().drain();
+        let mut changed = false;
+        if drained.disconnected {
+            tracing::warn!("fm: image preview worker stopped; using explicit failure fallback");
+            if let Some(key) = target.as_ref() {
+                changed |= set_failed_state(
+                    &mut self.state,
+                    key,
+                    if key.page.is_some() {
+                        RasterFailure::Pdf(PdfPreviewError::Unreadable)
+                    } else {
+                        RasterFailure::Image(ImagePreviewError::DecodeFailed)
+                    },
+                );
+            }
+        }
+        if let Some(result) = drained.current {
+            changed |= match result.output {
+                Ok(output) => set_ready_state(&mut self.state, &result.key, output),
+                Err(failure) => set_failed_state(&mut self.state, &result.key, failure),
+            };
+        }
+        changed
+    }
+}
+
+fn set_pending_raster_state(state: &mut crate::app::state::AppState) -> bool {
+    let Some(file_manager) = state.file_manager.as_mut() else {
+        return false;
+    };
+    match &mut file_manager.preview {
+        FmPreview::File(FmFilePreview::Image(preview)) => {
+            if preview.state == FmImagePreviewState::Pending {
+                return false;
+            }
+            preview.state = FmImagePreviewState::Pending;
+            true
+        }
+        FmPreview::File(FmFilePreview::Pdf(preview)) => {
+            if preview.state == FmPdfPreviewState::Pending {
+                return false;
+            }
+            preview.state = FmPdfPreviewState::Pending;
+            true
+        }
+        _ => false,
+    }
+}
+
+fn set_image_state(
+    state: &mut crate::app::state::AppState,
+    key: &ImagePreviewKey,
+    next: FmImagePreviewState,
+) -> bool {
+    let Some(file_manager) = state.file_manager.as_mut() else {
+        return false;
+    };
+    let FmPreview::File(FmFilePreview::Image(preview)) = &mut file_manager.preview else {
+        return false;
+    };
+    if preview.source_path != key.path || preview.generation != key.model_generation {
+        return false;
+    }
+    if preview.state == next {
+        return false;
+    }
+    preview.state = next;
+    true
+}
+
+/// Install a PDF page state, if the selection still wants this exact page.
+///
+/// The page is checked alongside the path and generation: a render that lands
+/// after the reader turned the page belongs to a view nobody is looking at, and
+/// installing it would show the wrong page with no further event to correct it.
+fn set_pdf_state(
+    state: &mut crate::app::state::AppState,
+    key: &ImagePreviewKey,
+    next: FmPdfPreviewState,
+    total_pages: Option<usize>,
+) -> bool {
+    let Some(file_manager) = state.file_manager.as_mut() else {
+        return false;
+    };
+    let FmPreview::File(FmFilePreview::Pdf(preview)) = &mut file_manager.preview else {
+        return false;
+    };
+    if preview.source_path != key.path
+        || preview.generation != key.model_generation
+        || Some(preview.page) != key.page
+    {
+        return false;
+    }
+    // The document length is learned by rendering a page but belongs to the
+    // document, so it is recorded outside the page state and survives the next
+    // page turn.
+    let learned_total = total_pages.filter(|total| preview.total_pages != Some(*total));
+    if let Some(total) = learned_total {
+        preview.total_pages = Some(total);
+    }
+    if preview.state == next {
+        return learned_total.is_some();
+    }
+    preview.state = next;
+    true
+}
+
+fn set_loading_state(state: &mut crate::app::state::AppState, key: &ImagePreviewKey) -> bool {
+    match key.page {
+        None => set_image_state(
+            state,
+            key,
+            FmImagePreviewState::Loading { target: key.target },
+        ),
+        Some(_) => set_pdf_state(
+            state,
+            key,
+            FmPdfPreviewState::Loading { target: key.target },
+            None,
+        ),
+    }
+}
+
+fn set_ready_state(
+    state: &mut crate::app::state::AppState,
+    key: &ImagePreviewKey,
+    output: RasterOutput,
+) -> bool {
+    match output {
+        RasterOutput::Image(prepared) => set_image_state(
+            state,
+            key,
+            FmImagePreviewState::Ready {
+                target: key.target,
+                prepared,
+            },
+        ),
+        RasterOutput::PdfPage {
+            total_pages,
+            prepared,
+        } => set_pdf_state(
+            state,
+            key,
+            FmPdfPreviewState::Ready {
+                target: key.target,
+                prepared,
+            },
+            Some(total_pages),
+        ),
+    }
+}
+
+fn set_failed_state(
+    state: &mut crate::app::state::AppState,
+    key: &ImagePreviewKey,
+    failure: RasterFailure,
+) -> bool {
+    match failure {
+        RasterFailure::Image(error) => set_image_state(
+            state,
+            key,
+            FmImagePreviewState::Unavailable {
+                target: key.target,
+                error,
+            },
+        ),
+        RasterFailure::Pdf(error) => set_pdf_state(
+            state,
+            key,
+            FmPdfPreviewState::Unavailable {
+                target: key.target,
+                error,
+            },
+            None,
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::test_wait::LoadAwareDeadline;
+    use crate::fm::image_preview::{ImagePreviewError, ImagePreviewTarget, PreparedImagePreview};
+    use crate::fm::{FmFilePreview, FmImagePreviewState, FmPreview, FmState};
+    use crate::kitty_graphics::HostCellSize;
+    use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
+    use ratatui::layout::Rect;
+    use std::io::Cursor;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+    use tokio::sync::Notify;
+
+    fn target(width_px: u32, height_px: u32) -> ImagePreviewTarget {
+        ImagePreviewTarget {
+            width_px,
+            height_px,
+        }
+    }
+
+    fn key(path: &str, model_generation: u64, target: ImagePreviewTarget) -> ImagePreviewKey {
+        ImagePreviewKey::image(Path::new(path), model_generation, target)
+    }
+
+    #[test]
+    fn image_slot_rejects_stale_path_generation_and_resize_results() {
+        let first = key("alpha.png", 1, target(80, 40));
+        let same = first.clone();
+        let resized = key("alpha.png", 1, target(40, 20));
+        let reloaded = key("alpha.png", 2, target(40, 20));
+        let navigated = key("beta.png", 3, target(40, 20));
+        let mut slot = ImagePreviewSlot::default();
+
+        let ImagePreviewSync::Started {
+            generation: first_worker_generation,
+        } = slot.sync(Some(first.clone()), true)
+        else {
+            panic!("first target must start")
+        };
+        assert_eq!(slot.sync(Some(same), true), ImagePreviewSync::Unchanged);
+
+        let ImagePreviewSync::Started {
+            generation: resize_worker_generation,
+        } = slot.sync(Some(resized.clone()), true)
+        else {
+            panic!("resize target must rebind")
+        };
+        assert!(!slot.accepts(first_worker_generation, &first));
+        assert!(slot.accepts(resize_worker_generation, &resized));
+
+        let ImagePreviewSync::Started {
+            generation: reload_worker_generation,
+        } = slot.sync(Some(reloaded.clone()), true)
+        else {
+            panic!("model reload must rebind")
+        };
+        assert!(!slot.accepts(resize_worker_generation, &resized));
+        assert!(slot.accepts(reload_worker_generation, &reloaded));
+
+        let ImagePreviewSync::Started {
+            generation: navigation_worker_generation,
+        } = slot.sync(Some(navigated.clone()), true)
+        else {
+            panic!("navigation must rebind")
+        };
+        assert!(!slot.accepts(reload_worker_generation, &reloaded));
+        assert!(slot.accepts(navigation_worker_generation, &navigated));
+        assert_eq!(slot.sync(None, false), ImagePreviewSync::Stopped);
+        assert!(!slot.accepts(navigation_worker_generation, &navigated));
+    }
+
+    // TP-FMW-REFRESH-06: the image rule on its own. The key of a drawn
+    // picture stays the target, so only what the screen shows can ask again.
+    #[test]
+    fn image_slot_asks_again_only_while_the_screen_still_awaits_a_delivered_key() {
+        let current = key("alpha.png", 1, target(40, 20));
+        let mut slot = ImagePreviewSlot::default();
+        let first = match slot.sync(Some(current.clone()), true) {
+            ImagePreviewSync::Started { generation } => generation,
+            other => panic!("target must start, got {other:?}"),
+        };
+        assert_eq!(
+            slot.sync(Some(current.clone()), true),
+            ImagePreviewSync::Unchanged,
+            "in flight: never a second decode for the same key"
+        );
+
+        assert!(slot.accepts(first, &current));
+        slot.delivered = true;
+        for _ in 0..3 {
+            assert_eq!(
+                slot.sync(Some(current.clone()), false),
+                ImagePreviewSync::Unchanged,
+                "a drawn picture is never decoded again"
+            );
+        }
+
+        let again = match slot.sync(Some(current.clone()), true) {
+            ImagePreviewSync::Started { generation } => generation,
+            other => {
+                panic!("a delivered key put back to loading must be decoded again, got {other:?}")
+            }
+        };
+        assert_ne!(again, first);
+        assert!(slot.accepts(again, &current));
+        assert_eq!(
+            slot.sync(Some(current), true),
+            ImagePreviewSync::Unchanged,
+            "the repeat is in flight: decoded once, not every turn"
+        );
+    }
+
+    #[test]
+    fn image_worker_converts_processor_panic_to_typed_failure_and_stays_alive() {
+        let mut worker = ImagePreviewWorker::with_processor(
+            Arc::new(Notify::new()),
+            |_path, _target, _page| -> Result<RasterOutput, RasterFailure> {
+                panic!("simulated image processor panic")
+            },
+        );
+        let current_key = key("panic.png", 1, target(8, 8));
+        assert!(matches!(
+            worker.sync_target(Some(current_key.clone()), true),
+            ImagePreviewSync::Started { .. }
+        ));
+
+        let wait = LoadAwareDeadline::new(2, "the panicking worker's result");
+        loop {
+            let drained = worker.drain();
+            assert!(
+                !drained.disconnected,
+                "panic boundary must keep worker alive"
+            );
+            if let Some(result) = drained.current {
+                assert_eq!(result.key, current_key);
+                assert!(matches!(
+                    result.output,
+                    Err(RasterFailure::Image(ImagePreviewError::DecoderPanicked))
+                ));
+                break;
+            }
+            wait.check();
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn image_worker_profile_counts_submitted_completed_and_rejected() {
+        let (started_tx, started_rx) = mpsc::channel::<ImagePreviewTarget>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let mut worker = ImagePreviewWorker::with_processor(
+            Arc::new(Notify::new()),
+            move |_path, target, _page| {
+                started_tx
+                    .send(target)
+                    .map_err(|_| RasterFailure::Image(ImagePreviewError::DecodeFailed))?;
+                release_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .map_err(|_| RasterFailure::Image(ImagePreviewError::DecodeFailed))?;
+                Ok(RasterOutput::Image(PreparedImagePreview {
+                    width: 1,
+                    height: 1,
+                    data_fingerprint: u64::from(target.width_px),
+                    rgba: vec![0, 0, 0, 0xff],
+                }))
+            },
+        );
+        let first_target = target(80, 40);
+        let second_target = target(40, 20);
+
+        let (_, profile) = crate::render_prof::observe_for_test(|| {
+            assert!(matches!(
+                worker.sync_target(Some(key("sample.png", 1, first_target)), true),
+                ImagePreviewSync::Started { .. }
+            ));
+            assert_eq!(
+                started_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("first image request starts"),
+                first_target
+            );
+            let second_key = key("sample.png", 1, second_target);
+            assert!(matches!(
+                worker.sync_target(Some(second_key.clone()), true),
+                ImagePreviewSync::Started { .. }
+            ));
+
+            release_tx.send(()).expect("release stale image request");
+            assert_eq!(
+                started_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("second image request starts"),
+                second_target
+            );
+            let stale = worker.drain();
+            assert!(
+                stale.current.is_none(),
+                "the first completion is rejected after the target changes"
+            );
+            assert!(!stale.disconnected);
+
+            release_tx.send(()).expect("release current image request");
+            let wait = LoadAwareDeadline::new(2, "the current image result");
+            loop {
+                let drained = worker.drain();
+                assert!(!drained.disconnected);
+                if let Some(current) = drained.current {
+                    assert_eq!(current.key, second_key);
+                    assert!(current.output.is_ok());
+                    break;
+                }
+                wait.check();
+                std::thread::yield_now();
+            }
+        });
+
+        assert_eq!(profile.counter("fm.image_worker.submitted"), 2);
+        assert_eq!(profile.counter("fm.image_worker.rejected"), 1);
+        assert_eq!(profile.counter("fm.image_worker.completed"), 1);
+    }
+
+    struct TempDir {
+        root: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "herdr-image-worker-{}-{tag}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&root).expect("create image worker temp directory");
+            Self { root }
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn encoded_png(width: u32, height: u32) -> Vec<u8> {
+        let rgba = RgbaImage::from_fn(width, height, |x, y| {
+            Rgba([
+                u8::try_from(x % 256).expect("x channel"),
+                u8::try_from(y % 256).expect("y channel"),
+                0x7f,
+                0xff,
+            ])
+        });
+        let mut output = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(rgba)
+            .write_to(&mut output, ImageFormat::Png)
+            .expect("encode PNG fixture");
+        output.into_inner()
+    }
+
+    fn test_app() -> crate::app::App {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        crate::app::App::new(
+            &crate::config::Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        )
+    }
+
+    fn current_image_state(app: &crate::app::App) -> &FmImagePreviewState {
+        match &app
+            .state
+            .file_manager
+            .as_ref()
+            .expect("open file manager")
+            .preview
+        {
+            FmPreview::File(FmFilePreview::Image(preview)) => &preview.state,
+            other => panic!("expected image preview, got {other:?}"),
+        }
+    }
+
+    fn wait_for_worker_result_generation(app: &mut crate::app::App, generation: u64) {
+        let wait = LoadAwareDeadline::new(2, "the image worker to reach a generation");
+        loop {
+            let has_result = {
+                let (state, _) = &*app.image_worker().shared;
+                lock_image_state(state)
+                    .result
+                    .as_ref()
+                    .is_some_and(|result| result.generation == generation)
+            };
+            if has_result {
+                return;
+            }
+            // The generation is which run this was, and a fixed name would have
+            // lost it.
+            wait.check_with(format_args!("generation {generation}"));
+            std::thread::yield_now();
+        }
+    }
+
+    fn wait_for_ready(app: &mut crate::app::App) -> (ImagePreviewTarget, u32, u32) {
+        let wait = LoadAwareDeadline::new(5, "the image preview to arrive");
+        loop {
+            let _ = app.sync_image_preview_worker();
+            if let FmImagePreviewState::Ready { target, prepared } = current_image_state(app) {
+                return (*target, prepared.width, prepared.height);
+            }
+            wait.check();
+            std::thread::yield_now();
+        }
+    }
+
+    // An image format with no decoder settles without the file being opened.
+    //
+    // The state is decided from the extension, so the worker must leave it
+    // alone. If it did not, selecting a large SVG would read it from disk to
+    // learn what its name already said, and the stated limitation would be
+    // overwritten by a decode failure — the user would see an error where
+    // there is only a boundary.
+    //
+    // TP-FIP-FORMAT-05
+    #[test]
+    fn an_undecodable_image_format_never_reaches_the_decoder() {
+        let temp = TempDir::new("unsupported");
+        // Real SVG bytes: if anything did try to decode this, it would be a
+        // decode failure rather than a trivially-rejected empty file.
+        std::fs::write(
+            temp.root.join("diagram.svg"),
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"></svg>"#,
+        )
+        .expect("write SVG fixture");
+        let mut app = test_app();
+        let frame = Rect::new(0, 0, 115, 16);
+        app.image_preview_cell_size = HostCellSize {
+            width_px: 8,
+            height_px: 16,
+        };
+        app.state
+            .try_open_file_manager_with(|_| Some(FmState::new(&temp.root)))
+            .expect("Files activation");
+        crate::ui::compute_view(&mut app.state, frame);
+
+        assert_eq!(
+            current_image_state(&app),
+            &FmImagePreviewState::Unsupported,
+            "an SVG is an image herdr has no decoder for, and says so"
+        );
+
+        // Several rounds, because a worker that was going to pick this up
+        // would do so within one and settle on Unavailable soon after.
+        for _ in 0..8 {
+            assert!(
+                !app.sync_image_preview_worker(),
+                "a settled unsupported format gives the frame nothing to redraw"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            current_image_state(&app),
+            &FmImagePreviewState::Unsupported,
+            "the stated limitation must not decay into a decode failure"
+        );
+    }
+
+    #[test]
+    fn app_clears_ready_pixels_on_resize_and_applies_only_the_new_target() {
+        let temp = TempDir::new("resize");
+        std::fs::write(temp.root.join("sample.png"), encoded_png(160, 80))
+            .expect("write PNG fixture");
+        let mut app = test_app();
+        // Preserve the original 64-cell Trail viewport after FCL-3 reserves
+        // the 24-cell content rail and one-cell separator.
+        let frame = Rect::new(0, 0, 115, 16);
+        app.image_preview_cell_size = HostCellSize {
+            width_px: 8,
+            height_px: 16,
+        };
+        app.state
+            .try_open_file_manager_with(|_| Some(FmState::new(&temp.root)))
+            .expect("Files activation");
+        crate::ui::compute_view(&mut app.state, frame);
+        let content = app
+            .state
+            .view
+            .file_manager_trail
+            .detail_panel
+            .as_ref()
+            .expect("Trail image detail panel")
+            .content_rect;
+        let first_target = target(
+            u32::from(content.width) * app.image_preview_cell_size.width_px,
+            u32::from(content.height) * app.image_preview_cell_size.height_px,
+        );
+
+        assert!(
+            app.sync_image_preview_worker(),
+            "Pending -> Loading dirties frame"
+        );
+        assert_eq!(
+            current_image_state(&app),
+            &FmImagePreviewState::Loading {
+                target: first_target,
+            }
+        );
+        let (ready_target, ready_width, ready_height) = wait_for_ready(&mut app);
+        assert_eq!(ready_target, first_target);
+        assert!(ready_width <= first_target.width_px);
+        assert!(ready_height <= first_target.height_px);
+
+        app.image_preview_cell_size = HostCellSize {
+            width_px: 4,
+            height_px: 8,
+        };
+        let resized_target = target(
+            u32::from(content.width) * app.image_preview_cell_size.width_px,
+            u32::from(content.height) * app.image_preview_cell_size.height_px,
+        );
+        assert!(
+            app.sync_image_preview_worker(),
+            "resize must clear old pixels immediately"
+        );
+        assert_eq!(
+            current_image_state(&app),
+            &FmImagePreviewState::Loading {
+                target: resized_target,
+            }
+        );
+        let (ready_target, ready_width, ready_height) = wait_for_ready(&mut app);
+        assert_eq!(ready_target, resized_target);
+        assert!(ready_width <= resized_target.width_px);
+        assert!(ready_height <= resized_target.height_px);
+
+        app.state.file_manager = None;
+        assert!(!app.sync_image_preview_worker());
+        assert!(app.state.file_manager.is_none());
+    }
+
+    /// TP-FMW-REFRESH-06, image track: the same revert as the text
+    /// track. The watcher's reconcile installs a refreshed clone taken while
+    /// the decode was in flight, the picture goes back to `Loading` under the
+    /// same key, and a slot that only compares keys never decodes it again.
+    /// Unlike text, the image key stays the target after `Ready` too — so the
+    /// ask-again rule must depend on what the screen shows, not on the key.
+    #[test]
+    fn a_delivered_image_put_back_by_a_stale_trail_refresh_is_decoded_again() {
+        use crate::app::file_manager_io_worker::{FileManagerIoRequest, FileManagerIoSource};
+
+        let temp = TempDir::new("stale-refresh");
+        std::fs::write(temp.root.join("sample.png"), encoded_png(160, 80))
+            .expect("write PNG fixture");
+        let mut app = test_app();
+        let frame = Rect::new(0, 0, 115, 16);
+        app.image_preview_cell_size = HostCellSize {
+            width_px: 8,
+            height_px: 16,
+        };
+        app.state
+            .try_open_file_manager_with(|_| Some(FmState::new(&temp.root)))
+            .expect("Files activation");
+        crate::ui::compute_view(&mut app.state, frame);
+        assert!(
+            app.sync_image_preview_worker(),
+            "Pending -> Loading dirties frame"
+        );
+        assert!(matches!(
+            current_image_state(&app),
+            FmImagePreviewState::Loading { .. }
+        ));
+
+        // The watcher's reconcile takes its copy while the decode is in flight.
+        let files_generation = app
+            .state
+            .on_screen_files_generation()
+            .expect("Files is on screen");
+        let snapshot = app.state.file_manager.clone().expect("open Files");
+        let stale_refresh = FileManagerIoRequest::TrailRefresh {
+            files_generation,
+            source: FileManagerIoSource::from_file_manager(&snapshot),
+            expected_directory: snapshot
+                .active_trail_directory()
+                .expect("an active Trail directory")
+                .to_path_buf(),
+            file_manager: Box::new(snapshot),
+        };
+
+        // The decode lands first; the older copy lands after it.
+        let (first_target, _, _) = wait_for_ready(&mut app);
+        let _ = app.io_worker().submit(stale_refresh);
+        app.io_worker().wait_for_result_for_test();
+        let _ = app.sync_file_manager_io_results();
+        assert!(
+            matches!(
+                current_image_state(&app),
+                FmImagePreviewState::Loading { target } if *target == first_target
+            ),
+            "precondition: the stale refresh put the in-flight state back"
+        );
+
+        // The screen shows a picture still loading under a key whose result was
+        // already delivered: decode it again.
+        let (ready_target, _, _) = wait_for_ready(&mut app);
+        assert_eq!(ready_target, first_target);
+
+        // And a picture that IS ready is never decoded again, whatever the key
+        // says — the rule is level-triggered on what the screen shows.
+        let generation = app.image_worker().slot.generation;
+        for _ in 0..8 {
+            assert!(
+                !app.sync_image_preview_worker(),
+                "a ready picture gives the frame nothing to redraw"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            app.image_worker().slot.generation,
+            generation,
+            "a ready picture must not be re-requested"
+        );
+    }
+
+    // TP-TRAIL-T7-IMAGE-01: image decode size is owned by the committed Trail
+    // detail panel, never by the retired Miller PREVIEW column.
+    #[test]
+    fn image_worker_targets_exact_trail_detail_panel_content_rect() {
+        let temp = TempDir::new("trail-detail-target");
+        std::fs::write(temp.root.join("sample.png"), encoded_png(160, 80))
+            .expect("write PNG fixture");
+        let mut app = test_app();
+        app.image_preview_cell_size = HostCellSize {
+            width_px: 8,
+            height_px: 16,
+        };
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        app.state
+            .try_open_file_manager_with(|_| Some(FmState::new(&temp.root)))
+            .expect("Files activation");
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 120, 30));
+        let content = app
+            .state
+            .view
+            .file_manager_trail
+            .detail_panel
+            .as_ref()
+            .expect("image selection opens Trail detail")
+            .content_rect;
+        let expected = target(
+            u32::from(content.width) * app.image_preview_cell_size.width_px,
+            u32::from(content.height) * app.image_preview_cell_size.height_px,
+        );
+
+        assert!(
+            app.sync_image_preview_worker(),
+            "Pending -> Loading dirties the committed Trail frame"
+        );
+        assert_eq!(
+            current_image_state(&app),
+            &FmImagePreviewState::Loading { target: expected }
+        );
+    }
+
+    #[test]
+    fn preview_error_states_render_without_retry_loop() {
+        let temp = TempDir::new("stable-preview-error");
+        std::fs::write(temp.root.join("broken.png"), b"not an encoded image")
+            .expect("write invalid image fixture");
+        let mut app = test_app();
+        app.state.kitty_graphics_enabled = true;
+        app.image_preview_cell_size = HostCellSize {
+            width_px: 8,
+            height_px: 16,
+        };
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        app.state
+            .try_open_file_manager_with(|_| Some(FmState::new(&temp.root)))
+            .expect("Files activation");
+        let frame = Rect::new(0, 0, 120, 40);
+        crate::ui::compute_view(&mut app.state, frame);
+
+        assert!(
+            app.sync_image_preview_worker(),
+            "Pending must transition once to Loading"
+        );
+        let generation = app.image_preview_worker_generation_for_test();
+        let wait = LoadAwareDeadline::new(2, "the image failure to settle");
+        loop {
+            let _ = app.sync_image_preview_worker();
+            if matches!(
+                current_image_state(&app),
+                FmImagePreviewState::Unavailable {
+                    error: ImagePreviewError::UnsupportedFormat | ImagePreviewError::DecodeFailed,
+                    ..
+                }
+            ) {
+                break;
+            }
+            wait.check();
+            std::thread::yield_now();
+        }
+
+        for _ in 0..100 {
+            assert!(
+                !app.sync_image_preview_worker(),
+                "a stable failure cannot dirty another frame or retry work"
+            );
+        }
+        assert_eq!(
+            app.image_preview_worker_generation_for_test(),
+            generation,
+            "a stable failure cannot allocate another worker generation"
+        );
+
+        let (first, _) = crate::server::render_stream::render_virtual(&mut app.state, frame, false);
+        let (second, _) =
+            crate::server::render_stream::render_virtual(&mut app.state, frame, false);
+        assert_eq!(
+            first, second,
+            "stable failures must render deterministically"
+        );
+        let rendered = first
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            rendered.contains("(unsupported image)") || rendered.contains("(image decode failed)"),
+            "the stable failure must render one explicit fallback: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn committed_cell_geometry_change_requests_exactly_one_image_target() {
+        let temp = TempDir::new("committed-cell-target");
+        std::fs::write(temp.root.join("sample.png"), encoded_png(160, 80))
+            .expect("write PNG fixture");
+        let mut app = test_app();
+        app.image_preview_cell_size = HostCellSize {
+            width_px: 8,
+            height_px: 16,
+        };
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        app.state
+            .try_open_file_manager_with(|_| Some(FmState::new(&temp.root)))
+            .expect("Files activation");
+        let frame = Rect::new(0, 0, 90, 16);
+        crate::ui::compute_view(&mut app.state, frame);
+
+        assert!(
+            app.sync_image_preview_worker(),
+            "initial committed geometry starts one target"
+        );
+        let (original_target, _, _) = wait_for_ready(&mut app);
+        let generation_before = app.image_worker().slot.generation;
+
+        app.image_preview_cell_size = HostCellSize {
+            width_px: 4,
+            height_px: 8,
+        };
+        let (started, committed_profile) =
+            crate::render_prof::observe_for_test(|| app.sync_image_preview_worker());
+        assert!(
+            started,
+            "the committed host-cell geometry starts one replacement target"
+        );
+        assert_eq!(
+            committed_profile.counter("fm.image_target.refresh"),
+            1,
+            "the first committed frame refreshes the target exactly once"
+        );
+        assert_eq!(
+            app.image_worker().slot.generation,
+            generation_before + 1,
+            "one committed geometry change requests one target generation"
+        );
+        let (committed_target, _, _) = wait_for_ready(&mut app);
+        assert_ne!(
+            committed_target, original_target,
+            "host-cell geometry changes the Trail panel pixel target"
+        );
+        assert_eq!(
+            app.image_worker().slot.generation,
+            generation_before + 1,
+            "completion cannot create another target generation"
+        );
+        assert!(
+            !app.sync_image_preview_worker(),
+            "the committed Ready target remains stable"
+        );
+    }
+
+    fn current_pdf_preview(app: &crate::app::App) -> &crate::fm::FmPdfPreview {
+        match &app
+            .state
+            .file_manager
+            .as_ref()
+            .expect("open file manager")
+            .preview
+        {
+            FmPreview::File(FmFilePreview::Pdf(preview)) => preview,
+            other => panic!("expected pdf preview, got {other:?}"),
+        }
+    }
+
+    /// An app whose file manager is previewing a PDF, with a processor that
+    /// reports which page it was asked for instead of rendering one.
+    fn pdf_preview_app(
+        total_pages: usize,
+    ) -> (
+        crate::app::App,
+        TempDir,
+        mpsc::Receiver<Option<usize>>,
+        mpsc::Sender<()>,
+    ) {
+        let temp = TempDir::new("pdf-page-turn");
+        std::fs::write(temp.root.join("manual.pdf"), b"%PDF-1.7\n").expect("write pdf fixture");
+        let mut app = test_app();
+        app.image_preview_cell_size = HostCellSize {
+            width_px: 8,
+            height_px: 16,
+        };
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        app.state
+            .try_open_file_manager_with(|_| Some(FmState::new(&temp.root)))
+            .expect("Files activation");
+
+        let (started_tx, started_rx) = mpsc::channel::<Option<usize>>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        *app.image_worker() = ImagePreviewWorker::with_processor(
+            app.render_notify.clone(),
+            move |_path, _target, page| {
+                started_tx
+                    .send(page)
+                    .map_err(|_| RasterFailure::Pdf(PdfPreviewError::Unreadable))?;
+                release_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .map_err(|_| RasterFailure::Pdf(PdfPreviewError::Unreadable))?;
+                let page = page.unwrap_or(0);
+                let marker = u8::try_from(page % 256).expect("page marker");
+                Ok(RasterOutput::PdfPage {
+                    total_pages,
+                    prepared: PreparedImagePreview {
+                        width: 1,
+                        height: 1,
+                        data_fingerprint: u64::try_from(page).expect("page fingerprint"),
+                        rgba: vec![marker, marker, marker, 0xff],
+                    },
+                })
+            },
+        );
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 90, 16));
+        (app, temp, started_rx, release_tx)
+    }
+
+    // TP-FPDF-25: turning a page submits a render for the new page, and the
+    // document length learned from the first render outlives it. Held inside
+    // the ready state the length was lost on the first turn, so the forward
+    // bound disappeared and a second turn was refused while the first was still
+    // rasterising — a reader could only move one page per completed render.
+    #[test]
+    fn turning_a_page_rasterises_it_without_forgetting_the_document_length() {
+        let (mut app, _fixture, started_rx, release_tx) = pdf_preview_app(10);
+
+        assert!(app.sync_image_preview_worker(), "the first page is queued");
+        assert_eq!(
+            started_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("first page job starts"),
+            Some(0)
+        );
+        release_tx.send(()).expect("finish the first page");
+        wait_for_worker_result_generation(&mut app, 1);
+        assert!(app.sync_image_preview_worker(), "the first page is ready");
+        assert_eq!(current_pdf_preview(&app).total_pages, Some(10));
+
+        assert!(app
+            .state
+            .file_manager
+            .as_mut()
+            .expect("open FM")
+            .turn_pdf_page(crate::fm::PdfPageStep::Next));
+        assert!(
+            app.sync_image_preview_worker(),
+            "the turned-to page is queued"
+        );
+        assert_eq!(
+            started_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("second page job starts"),
+            Some(1),
+            "the worker is asked for the page the reader turned to"
+        );
+
+        let preview = current_pdf_preview(&app);
+        assert_eq!(preview.page, 1);
+        assert_eq!(
+            preview.total_pages,
+            Some(10),
+            "the document length survives a page turn that is still rasterising"
+        );
+        assert!(matches!(preview.state, FmPdfPreviewState::Loading { .. }));
+
+        assert!(
+            app.state
+                .file_manager
+                .as_mut()
+                .expect("open FM")
+                .turn_pdf_page(crate::fm::PdfPageStep::Next),
+            "a further turn does not wait for the pending render"
+        );
+        assert_eq!(current_pdf_preview(&app).page, 2);
+        release_tx.send(()).expect("release the pending page");
+    }
+
+    // TP-FPDF-26: a render that lands after the reader has turned the page
+    // belongs to a view nobody is looking at, and installing it would show the
+    // wrong page with no further event to correct it.
+    #[test]
+    fn a_page_render_that_lands_after_a_turn_is_rejected() {
+        let (mut app, _fixture, started_rx, release_tx) = pdf_preview_app(10);
+
+        assert!(app.sync_image_preview_worker(), "the first page is queued");
+        assert_eq!(
+            started_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("first page job starts"),
+            Some(0)
+        );
+        release_tx.send(()).expect("finish the first page");
+        wait_for_worker_result_generation(&mut app, 1);
+        assert!(app.sync_image_preview_worker(), "the first page is ready");
+
+        // Turn to page 1 and queue its render, then answer with the page-0
+        // result the reader has already moved past.
+        assert!(app
+            .state
+            .file_manager
+            .as_mut()
+            .expect("open FM")
+            .turn_pdf_page(crate::fm::PdfPageStep::Next));
+        assert!(app.sync_image_preview_worker(), "page one is queued");
+        assert_eq!(
+            started_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("second page job starts"),
+            Some(1)
+        );
+
+        let stale_key = ImagePreviewKey::pdf_page(
+            &current_pdf_preview(&app).source_path.clone(),
+            current_pdf_preview(&app).generation,
+            match current_pdf_preview(&app).state {
+                FmPdfPreviewState::Loading { target } => target,
+                ref other => panic!("expected a loading page, got {other:?}"),
+            },
+            0,
+        );
+        assert!(
+            !set_ready_state(
+                &mut app.state,
+                &stale_key,
+                RasterOutput::PdfPage {
+                    total_pages: 10,
+                    prepared: PreparedImagePreview {
+                        width: 1,
+                        height: 1,
+                        data_fingerprint: 0,
+                        rgba: vec![0, 0, 0, 0xff],
+                    },
+                },
+            ),
+            "a completed render for the previous page must not be installed"
+        );
+        assert!(matches!(
+            current_pdf_preview(&app).state,
+            FmPdfPreviewState::Loading { .. }
+        ));
+        release_tx.send(()).expect("release the pending page");
+    }
+
+    #[test]
+    fn stale_prior_geometry_image_completion_is_rejected() {
+        let temp = TempDir::new("stale-prior-geometry");
+        std::fs::write(temp.root.join("sample.png"), encoded_png(160, 80))
+            .expect("write PNG fixture");
+        let mut app = test_app();
+        app.image_preview_cell_size = HostCellSize {
+            width_px: 8,
+            height_px: 16,
+        };
+        app.state.mobile_width_threshold = 0;
+        app.state.sidebar_collapsed = true;
+        app.state
+            .try_open_file_manager_with(|_| Some(FmState::new(&temp.root)))
+            .expect("Files activation");
+
+        let (started_tx, started_rx) = mpsc::channel::<ImagePreviewTarget>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        *app.image_worker() = ImagePreviewWorker::with_processor(
+            app.render_notify.clone(),
+            move |_path, target, _page| {
+                started_tx
+                    .send(target)
+                    .map_err(|_| RasterFailure::Image(ImagePreviewError::DecodeFailed))?;
+                release_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .map_err(|_| RasterFailure::Image(ImagePreviewError::DecodeFailed))?;
+                let marker = u8::try_from(target.width_px % 256).expect("target marker");
+                Ok(RasterOutput::Image(PreparedImagePreview {
+                    width: 1,
+                    height: 1,
+                    data_fingerprint: u64::from(target.width_px)
+                        .wrapping_shl(32)
+                        .wrapping_add(u64::from(target.height_px)),
+                    rgba: vec![marker, marker, marker, 0xff],
+                }))
+            },
+        );
+
+        let frame = Rect::new(0, 0, 90, 16);
+        crate::ui::compute_view(&mut app.state, frame);
+        assert!(
+            app.sync_image_preview_worker(),
+            "the initial committed target starts generation one"
+        );
+        let original_target = started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first image job starts");
+
+        app.image_preview_cell_size = HostCellSize {
+            width_px: 4,
+            height_px: 8,
+        };
+        assert!(
+            app.sync_image_preview_worker(),
+            "new host-cell geometry immediately retires generation one"
+        );
+        assert_eq!(app.image_worker().slot.generation, 2);
+
+        release_tx.send(()).expect("finish the prior-geometry job");
+        wait_for_worker_result_generation(&mut app, 1);
+        let committed_target = started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("replacement image job starts");
+        assert_ne!(committed_target, original_target);
+        assert!(
+            !app.sync_image_preview_worker(),
+            "generation one completion is rejected against generation two"
+        );
+        assert_eq!(
+            current_image_state(&app),
+            &FmImagePreviewState::Loading {
+                target: committed_target,
+            },
+            "the replacement target remains authoritative"
+        );
+
+        release_tx.send(()).expect("finish the replacement job");
+        wait_for_worker_result_generation(&mut app, 2);
+        assert!(
+            app.sync_image_preview_worker(),
+            "only the committed generation may become Ready"
+        );
+        let FmImagePreviewState::Ready { target, prepared } = current_image_state(&app) else {
+            panic!("committed image result must become Ready");
+        };
+        assert_eq!(*target, committed_target);
+        assert_eq!(
+            prepared.data_fingerprint,
+            u64::from(committed_target.width_px)
+                .wrapping_shl(32)
+                .wrapping_add(u64::from(committed_target.height_px))
+        );
+        assert!(
+            !app.sync_image_preview_worker(),
+            "the committed Ready target remains stable"
+        );
+    }
+}

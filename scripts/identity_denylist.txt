@@ -1,0 +1,12 @@
+# Denied words for scripts/personal_identifier_check.py — one SHA-256 of a
+# lowercased word per line; comments and blank lines are ignored. A word listed
+# here is refused wherever it appears whole in a tracked file (paths and branch
+# names included), whatever its case. The tree carries only the digests.
+#
+# Add one:   python3 -c 'from scripts.personal_identifier_check import hash_word; print(hash_word("word"))'
+# Machine-local words that must never ship go to
+# $XDG_CONFIG_HOME/herdr-fork/identity_denylist.txt instead (same format).
+#
+# Note the limit of the scheme: a digest of a short, guessable word is a
+# confirmation oracle, not a secret. It stops a name from re-entering the tree;
+# it does not hide that the name was once worth denying.

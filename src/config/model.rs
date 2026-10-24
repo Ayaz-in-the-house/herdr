@@ -1,0 +1,4279 @@
+use std::{collections::BTreeSet, num::NonZeroUsize, path::Path};
+
+use crossterm::event::KeyModifiers;
+use serde::{de, Deserialize, Deserializer, Serialize};
+
+use super::{
+    ActionKeybinds, BindingConfig, CommandKeybindConfig, IndexedKeybind, Keybinds, SidebarConfig,
+    SoundConfig, TabBarRightEntryConfig, ThemeConfig, DEFAULT_MOBILE_WIDTH_THRESHOLD,
+    DEFAULT_MOUSE_SCROLL_LINES, DEFAULT_SCROLLBACK_LIMIT_BYTES,
+};
+
+pub const MAX_TOAST_DELAY_SECONDS: u64 = 3600;
+
+/// How many chats must open the same way before the repetition is treated as
+/// a routine. Two is how often a person repeats themselves; three is where
+/// the measured automations start — the smallest repeated opening on the
+/// machine this was designed against appeared six times, and the largest
+/// seventy-three.
+pub const DEFAULT_ROUTINE_CHAT_REPEAT_THRESHOLD: usize = 3;
+
+/// The one label the daily section hides by default. Named once here so the
+/// config default and the classifier cannot drift into two spellings.
+pub const ROUTINE_CHAT_LABEL: &str = "routine";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdateChannelConfig {
+    #[default]
+    Stable,
+    Preview,
+}
+
+impl UpdateChannelConfig {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Preview => "preview",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(default)]
+pub struct UpdateConfig {
+    pub channel: UpdateChannelConfig,
+    pub version_check: bool,
+    pub manifest_check: bool,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            channel: default_update_channel(),
+            version_check: true,
+            manifest_check: true,
+        }
+    }
+}
+
+fn default_update_channel() -> UpdateChannelConfig {
+    default_update_channel_for_build(cfg!(windows), crate::build_info::is_preview())
+}
+
+fn default_update_channel_for_build(is_windows: bool, is_preview: bool) -> UpdateChannelConfig {
+    if is_windows && is_preview {
+        UpdateChannelConfig::Preview
+    } else {
+        UpdateChannelConfig::Stable
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ToastDelivery {
+    #[default]
+    Off,
+    Herdr,
+    Terminal,
+    System,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema, Default,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum ToastHerdrPosition {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    #[default]
+    BottomRight,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ToastClipboardPosition {
+    TopLeft,
+    TopCenter,
+    TopRight,
+    BottomLeft,
+    #[default]
+    BottomCenter,
+    BottomRight,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentPanelSortConfig {
+    #[default]
+    #[serde(alias = "workspaces")]
+    Spaces,
+    Priority,
+}
+
+impl AgentPanelSortConfig {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Spaces => "spaces",
+            Self::Priority => "priority",
+        }
+    }
+}
+
+/// How workspace chat drawers decide to be open.
+///
+/// `all-active` derives an open drawer for every workspace with a live agent,
+/// `focused` follows the active workspace around, and `manual` only ever
+/// obeys the disclosure clicks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ChatDrawerModeConfig {
+    #[default]
+    AllActive,
+    Focused,
+    Manual,
+}
+
+/// When the vertical wheel claims host scrollback over a pane that asked for
+/// mouse reporting.
+///
+/// `mobile` is the phone shell only, where a swipe is the sole scroll gesture
+/// there is. `scrollable` extends the same claim to every surface, so an agent
+/// that reports the wheel and then discards it no longer leaves the content
+/// area looking frozen — at the cost of panes that genuinely act on the wheel
+/// without an alternate screen. `never` hands the wheel to the pane
+/// everywhere, honouring the reporting contract without exception.
+///
+/// No mode overrides the scrollback guard: a pane the host cannot scroll for
+/// keeps its wheel in every mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MouseWheelHostScrollConfig {
+    #[default]
+    Mobile,
+    Scrollable,
+    Never,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum LegacyAgentPanelScopeConfig {
+    Current,
+    All,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum StatusIndicatorStyle {
+    #[default]
+    Dots,
+    Symbols,
+}
+
+impl StatusIndicatorStyle {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Dots => "dots",
+            Self::Symbols => "symbols",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HostCursorModeConfig {
+    #[default]
+    Auto,
+    Native,
+    Drawn,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SidebarCollapsedModeConfig {
+    #[default]
+    Compact,
+    Hidden,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RightClickPassthroughModifierConfig(Option<KeyModifiers>);
+
+impl RightClickPassthroughModifierConfig {
+    pub fn modifiers(self) -> Option<KeyModifiers> {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for RightClickPassthroughModifierConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        parse_right_click_passthrough_modifier(&value)
+            .map(Self)
+            .ok_or_else(|| {
+                de::Error::custom(
+                    "right_click_passthrough_modifier must be empty, off, none, disabled, ctrl/control, alt/option, cmd/command/super, meta, hyper, or a + separated combination without shift",
+                )
+            })
+    }
+}
+
+fn parse_right_click_passthrough_modifier(value: &str) -> Option<Option<KeyModifiers>> {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("off")
+        || trimmed.eq_ignore_ascii_case("none")
+        || trimmed.eq_ignore_ascii_case("disabled")
+    {
+        return Some(None);
+    }
+
+    let mut modifiers = KeyModifiers::empty();
+    for token in trimmed.split('+') {
+        let token = token.trim().to_ascii_lowercase();
+        let modifier = match token.as_str() {
+            "ctrl" | "control" => KeyModifiers::CONTROL,
+            "alt" | "option" => KeyModifiers::ALT,
+            "cmd" | "command" | "super" => KeyModifiers::SUPER,
+            "meta" => KeyModifiers::META,
+            "hyper" => KeyModifiers::HYPER,
+            "shift" => return None,
+            _ => return None,
+        };
+        modifiers |= modifier;
+    }
+
+    (!modifiers.is_empty()).then_some(Some(modifiers))
+}
+
+#[derive(Debug, Clone)]
+pub struct ToastConfig {
+    pub delivery: ToastDelivery,
+    pub delay_seconds: u64,
+    pub herdr: HerdrToastConfig,
+    pub clipboard: ClipboardToastConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct HerdrToastConfig {
+    pub position: ToastHerdrPosition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ClipboardToastConfig {
+    pub enabled: bool,
+    pub position: ToastClipboardPosition,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum NewTerminalCwdConfig {
+    #[default]
+    Follow,
+    Home,
+    Current,
+    Path(String),
+}
+
+impl<'de> Deserialize<'de> for NewTerminalCwdConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        match value.trim() {
+            "" | "follow" => Ok(Self::Follow),
+            "home" => Ok(Self::Home),
+            "current" => Ok(Self::Current),
+            _ => Ok(Self::Path(value)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellModeConfig {
+    #[default]
+    Auto,
+    Login,
+    NonLogin,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct TerminalConfig {
+    /// Executable used for new interactive panes. Empty means SHELL, then /bin/sh.
+    pub default_shell: String,
+    /// Startup mode for new interactive pane shells.
+    pub shell_mode: ShellModeConfig,
+    /// CWD policy for new interactive panes, tabs, and workspaces.
+    pub new_cwd: NewTerminalCwdConfig,
+    /// Render Kitty graphics in compatible outer terminals. Default: true.
+    pub kitty_graphics: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct SessionConfig {
+    /// Resume supported AI-agent panes into their native conversation sessions
+    /// when restoring a Herdr session. Default: true.
+    pub resume_agents_on_restore: bool,
+    /// Let each attached display hold its own workspace, tab and focused pane
+    /// so several monitors can watch different tabs of one session at the same
+    /// time. Set to false to mirror one view onto every display, which is the
+    /// behaviour for pairing or a demo. Default: true.
+    pub per_display_focus: bool,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            resume_agents_on_restore: true,
+            per_display_focus: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigReloadStatus {
+    Applied,
+    Partial,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ConfigReloadReport {
+    pub status: ConfigReloadStatus,
+    pub diagnostics: Vec<String>,
+}
+
+/// Validate `[ui]` sidebar bound configuration.
+///
+/// Returns `Some((min, max))` when `min <= max`, `None` otherwise. The two
+/// values are funneled through this helper before they reach any
+/// `u16::clamp(min, max)` call site (`u16::clamp` panics when `min > max`).
+pub fn validated_sidebar_bounds(min: u16, max: u16) -> Option<(u16, u16)> {
+    if min <= max {
+        Some((min, max))
+    } else {
+        None
+    }
+}
+
+/// Projects sidebar tab configuration.
+///
+/// Holds the directories pinned to the Projects tab. Entries are user-authored,
+/// so blank and non-absolute values are tolerated instead of failing the whole
+/// config load: they are dropped from the usable set and reported by
+/// [`ProjectsConfig::diagnostics`]. The usable-path accessor is added with the
+/// Projects render that consumes it.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct ProjectsConfig {
+    /// Absolute (or `~`-rooted) project directories pinned to the Projects tab.
+    pub pinned: Vec<String>,
+    /// Agent CLI id for NEW chats opened from the Projects tab (one of the
+    /// built-in chat agents; unknown values fall back to claude at launch, so
+    /// a stale entry can never break the "+" button).
+    pub default_chat_agent: Option<String>,
+    /// Whether the Projects tab lists only chats that are open as tabs
+    /// (the footer "actives" toggle). Defaults to on when absent.
+    pub actives_only: Option<bool>,
+}
+
+impl ProjectsConfig {
+    /// Usable pinned directories, in config order: non-blank entries that are
+    /// absolute or `~`-rooted, each trimmed of surrounding whitespace. Blank and
+    /// non-absolute entries are dropped (they are surfaced by
+    /// [`Self::diagnostics`] instead of failing the whole config load). Returned
+    /// values may still start with `~` — callers expand it before use.
+    pub fn pinned_paths(&self) -> Vec<String> {
+        self.pinned
+            .iter()
+            .filter_map(|raw| {
+                let trimmed = raw.trim();
+                pinned_entry_is_usable(trimmed).then(|| trimmed.to_string())
+            })
+            .collect()
+    }
+
+    /// Human-readable diagnostics for pinned entries that are unusable (blank,
+    /// or a non-absolute path). Usable entries produce no diagnostic.
+    pub fn diagnostics(&self) -> Vec<String> {
+        self.pinned
+            .iter()
+            .filter_map(|raw| {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    Some(format!("projects.pinned entry {raw:?} is blank; ignoring"))
+                } else if !pinned_entry_is_usable(trimmed) {
+                    Some(format!(
+                        "projects.pinned entry {trimmed:?} is not an absolute path; ignoring"
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+}
+
+/// `[files]` — the native file manager.
+///
+/// One key so far. The per-row action buttons (`>` send-to-agent, `r` rename,
+/// `x` delete) default to hidden: they read as line noise at the end of every
+/// row — the user mistook them for permission bits — and all three actions
+/// remain reachable from the row's context menu.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct FilesConfig {
+    /// Show the `>`/`r`/`x` action buttons at the right edge of file rows.
+    /// Default: false.
+    pub show_row_actions: bool,
+}
+
+/// Space partitioning configuration: the `[[spaces.split]]` rules that move
+/// some of a repository's checkouts into their own sidebar space.
+///
+/// Entries are user-authored, so an unusable one is dropped and reported rather
+/// than failing the whole config load — the same tolerance [`ProjectsConfig`]
+/// applies to `pinned`. An empty list reproduces stock grouping exactly.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct SpacesConfig {
+    pub split: Vec<SpaceSplitEntry>,
+    /// `[[spaces.project]]` umbrellas gathering repositories and spaces under
+    /// one top-level header.
+    pub project: Vec<SpaceProjectEntry>,
+    /// `[[spaces.node]]` containers: named tree nodes that hang under each
+    /// other by `parent`, giving the sidebar its N-level shape.
+    pub node: Vec<SpaceNodeEntry>,
+    /// `[[spaces.display]]` renames: a name laid over whatever the rule above
+    /// resolved to, keyed by that rule's own key.
+    pub display: Vec<SpaceDisplayEntry>,
+    /// `[spaces.icons]` row-kind icon defaults for the Spaces tree.
+    pub icons: SpaceIconsConfig,
+    /// TP-MOD-41: whether a declared rule that claims no open checkout still
+    /// draws its header (dim, with the empty row beneath). `true` by default —
+    /// the modules a person named are their map, and a map that forgets a
+    /// room whenever its door closes reads as data loss. `false` restores the
+    /// old ghost-header-free tree (TP-MOD-15's original shape).
+    #[serde(default = "default_spaces_show_empty")]
+    pub show_empty: bool,
+}
+
+fn default_spaces_show_empty() -> bool {
+    true
+}
+
+impl Default for SpacesConfig {
+    fn default() -> Self {
+        Self {
+            split: Vec::new(),
+            project: Vec::new(),
+            node: Vec::new(),
+            display: Vec::new(),
+            icons: SpaceIconsConfig::default(),
+            show_empty: default_spaces_show_empty(),
+        }
+    }
+}
+
+/// One authored `[[spaces.display]]` table: a rename that is only a name.
+///
+/// TP-MOD-34. Renaming used to be offered on machine-owned modules alone,
+/// because the obvious implementation — rewrite the rule — cannot work for the
+/// others. A second `[[spaces.node]]` carrying an existing key is dropped as a
+/// duplicate, and a second `[[spaces.split]]` carrying one loses at first-match
+/// to the hand-written rule it was meant to rename. So the modules a person
+/// actually authors, and every bucket without exception, had no rename at all.
+///
+/// A display entry sidesteps that by not being a rule. It takes no part in
+/// resolution — no repo, no patterns, no parent — so it cannot claim a
+/// checkout, cannot reorder first-match, and cannot silently steal a branch
+/// from the rule that owns it today. It is applied after resolution has already
+/// decided everything, and the only thing it can change is what the header
+/// reads.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct SpaceDisplayEntry {
+    /// The node or bucket key being renamed.
+    pub key: String,
+    /// The name its header wears. Blank is ignored: a nameless header is worse
+    /// than a badly named one, and it would also read as "reset", which is a
+    /// different verb than the one that wrote this.
+    pub name: String,
+}
+
+/// One authored `[[spaces.split]]` table, before validation.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct SpaceSplitEntry {
+    /// Repository root the rule applies to. Absolute or `~`-rooted.
+    pub repo: String,
+    /// Globs claiming checkouts, matched against branch then directory name.
+    #[serde(rename = "match")]
+    pub patterns: Vec<String>,
+    /// Space key the claimed checkouts group under.
+    pub key: String,
+    /// Group header label. Falls back to `key` when blank.
+    pub label: String,
+    /// Glyph drawn before the label. Blank means no icon of its own.
+    pub icon: String,
+    /// Node key this bucket hangs under. Blank keeps today's placement
+    /// (a claiming project, or top level).
+    pub parent: String,
+    /// The ink passive agent names under this module wear. Blank inherits
+    /// `ui.sidebar.agents.passive_color`; a bar-colour token or `#rrggbb`
+    /// literal overrides it for this module alone (TP-AGPANEL-51).
+    pub passive_color: String,
+}
+
+/// One authored `[[spaces.project]]` table, before validation.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct SpaceProjectEntry {
+    /// Header title. Falls back to `key` when blank.
+    pub name: String,
+    /// Collapse-state key. Must be unique per project.
+    pub key: String,
+    /// Glyph drawn before the name; blank uses `[spaces.icons] project`.
+    pub icon: String,
+    /// Repository roots whose spaces all join this project. Absolute or
+    /// `~`-rooted.
+    pub repos: Vec<String>,
+    /// Individual space keys joining this project.
+    pub spaces: Vec<String>,
+    /// Node key this project hangs under. A project IS a node (the sugar is
+    /// complete), so it may sit below another node like any other.
+    pub parent: String,
+}
+
+/// One authored `[[spaces.node]]` table, before validation.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct SpaceNodeEntry {
+    /// Tree identity and collapse-state key. Must be unique per node.
+    pub key: String,
+    /// Header title. Falls back to `key` when blank.
+    pub name: String,
+    /// Glyph drawn before the name; blank uses `[spaces.icons] project`.
+    pub icon: String,
+    /// Node key this node hangs under. Blank means top level.
+    pub parent: String,
+    /// Working directory this module stands in. Blank means it has none.
+    ///
+    /// TP-MOD-33: a container is a place in the tree, not a checkout, so it
+    /// carries no directory of its own — and a chat filed into one had nowhere
+    /// to reopen. The alternative was to invent a directory at revival time,
+    /// which is precisely how #46 ended up spawning agents in `$HOME`. Naming
+    /// the directory here makes it a fact the person stated rather than one
+    /// the machine guessed.
+    pub dir: String,
+}
+
+/// Row-kind icons for the Spaces tree. Every field carries a working default,
+/// so the table is only written to change taste, not to enable the feature.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct SpaceIconsConfig {
+    /// Project header rows without an `icon` of their own.
+    pub project: String,
+    /// Workspace (branch/checkout) rows.
+    pub branch: String,
+    /// Chat drawer rows.
+    pub chat: String,
+    /// The daily area's header — the chats no checkout claims. A home rather
+    /// than a speech bubble: that row names a place, not a conversation, and
+    /// it is the one place on this sidebar that is always yours.
+    pub daily: String,
+}
+
+impl Default for SpaceIconsConfig {
+    fn default() -> Self {
+        Self {
+            project: "📁".to_string(),
+            branch: "".to_string(),
+            chat: "💬".to_string(),
+            daily: "🏠".to_string(),
+        }
+    }
+}
+
+impl SpacesConfig {
+    /// Validated rules in config order, `~` expanded. Unusable entries are
+    /// dropped (see [`Self::diagnostics`]).
+    /// The name laid over `key` by a `[[spaces.display]]` entry, if any.
+    ///
+    /// TP-MOD-34: the LAST entry wins, which is the opposite of the first-match
+    /// rule the split table follows — and deliberately so. First-match exists
+    /// because two rules may both want the same checkout and only one can have
+    /// it; renaming has no such contest. What it has instead is a history: the
+    /// managed overlay is appended after the user's own file, so the last entry
+    /// is simply the most recent decision, and reading it any other way would
+    /// pin a module to the first name it was ever given.
+    pub fn display_name_for(&self, key: &str) -> Option<&str> {
+        self.display
+            .iter()
+            .map(|entry| (entry.key.trim(), entry.name.trim()))
+            .rfind(|(entry_key, name)| *entry_key == key && !name.is_empty())
+            .map(|(_, name)| name)
+    }
+
+    pub fn rules(&self) -> Vec<crate::spaces::SpaceSplitRule> {
+        self.split
+            .iter()
+            .filter(|entry| space_split_entry_problem(entry).is_none())
+            .map(|entry| {
+                let key = entry.key.trim();
+                let label = entry.label.trim();
+                let icon = entry.icon.trim();
+                crate::spaces::SpaceSplitRule {
+                    repo_root: crate::worktree::expand_tilde_absolute_path(entry.repo.trim()),
+                    patterns: entry
+                        .patterns
+                        .iter()
+                        .map(|pattern| pattern.trim().to_string())
+                        .filter(|pattern| !pattern.is_empty())
+                        .collect(),
+                    key: key.to_string(),
+                    // TP-MOD-34: applied here, after the rule has resolved
+                    // everything else, so the rename cannot reach `patterns`,
+                    // `repo_root` or the rule's position in first-match.
+                    label: if let Some(name) = self.display_name_for(key) {
+                        name.to_string()
+                    } else if label.is_empty() {
+                        key.to_string()
+                    } else {
+                        label.to_string()
+                    },
+                    icon: (!icon.is_empty()).then(|| icon.to_string()),
+                    parent: {
+                        let parent = entry.parent.trim();
+                        (!parent.is_empty()).then(|| parent.to_string())
+                    },
+                    passive_color: {
+                        let ink = entry.passive_color.trim();
+                        (!ink.is_empty()).then(|| ink.to_string())
+                    },
+                }
+            })
+            .collect()
+    }
+
+    /// Validated tree nodes in config order: the `[[spaces.node]]` tables
+    /// first, then every `[[spaces.project]]` doubled as a node — a project
+    /// IS a node, so the tree walker has one vocabulary (TP-NODE-02).
+    /// Unusable entries are dropped (see [`Self::diagnostics`]). The forest
+    /// shape itself (cycles, unknown parents, depth) is validated later by
+    /// [`crate::spaces::validate_node_forest`].
+    pub fn nodes(&self) -> Vec<crate::spaces::SpaceNode> {
+        let own = self
+            .node
+            .iter()
+            .filter(|entry| space_node_entry_problem(entry).is_none())
+            .map(|entry| {
+                let key = entry.key.trim();
+                let name = entry.name.trim();
+                let icon = entry.icon.trim();
+                let parent = entry.parent.trim();
+                let dir = entry.dir.trim();
+                crate::spaces::SpaceNode {
+                    key: key.to_string(),
+                    // TP-MOD-34: a rename cannot reach `parent` or `dir`, so it
+                    // cannot lift a module to the top level or take away the
+                    // place it stands — the two things TP-MOD-33 had to guard
+                    // against when a rename rewrote the whole entry.
+                    name: if let Some(display) = self.display_name_for(key) {
+                        display.to_string()
+                    } else if name.is_empty() {
+                        key.to_string()
+                    } else {
+                        name.to_string()
+                    },
+                    icon: (!icon.is_empty()).then(|| icon.to_string()),
+                    parent: (!parent.is_empty()).then(|| parent.to_string()),
+                    // TP-MOD-33: `~` is expanded here, at the edge, so every
+                    // reader downstream holds a path it can actually open.
+                    dir: (!dir.is_empty()).then(|| crate::worktree::expand_tilde_path(dir)),
+                }
+            });
+        let from_projects = self
+            .project
+            .iter()
+            .filter(|entry| space_project_entry_problem(entry).is_none())
+            .map(|entry| {
+                let key = entry.key.trim();
+                let name = entry.name.trim();
+                let icon = entry.icon.trim();
+                let parent = entry.parent.trim();
+                crate::spaces::SpaceNode {
+                    key: key.to_string(),
+                    // TP-MOD-34: a project IS a node (TP-NODE-02), so it wears
+                    // the same rename. Leaving it out would make the one header
+                    // a person cannot rename the one at the top of their tree.
+                    name: if let Some(display) = self.display_name_for(key) {
+                        display.to_string()
+                    } else if name.is_empty() {
+                        key.to_string()
+                    } else {
+                        name.to_string()
+                    },
+                    icon: (!icon.is_empty()).then(|| icon.to_string()),
+                    parent: (!parent.is_empty()).then(|| parent.to_string()),
+                    // A project is an umbrella, not a place; it never stands
+                    // in a directory of its own.
+                    dir: None,
+                }
+            });
+        own.chain(from_projects).collect()
+    }
+
+    /// Validated projects in config order, `~` expanded. Unusable entries are
+    /// dropped (see [`Self::diagnostics`]).
+    pub fn projects(&self) -> Vec<crate::spaces::SpaceProject> {
+        self.project
+            .iter()
+            .filter(|entry| space_project_entry_problem(entry).is_none())
+            .map(|entry| {
+                let name = entry.name.trim();
+                let icon = entry.icon.trim();
+                crate::spaces::SpaceProject {
+                    key: entry.key.trim().to_string(),
+                    name: if name.is_empty() {
+                        entry.key.trim().to_string()
+                    } else {
+                        name.to_string()
+                    },
+                    icon: (!icon.is_empty()).then(|| icon.to_string()),
+                    repo_roots: entry
+                        .repos
+                        .iter()
+                        .map(|repo| repo.trim())
+                        .filter(|repo| !repo.is_empty())
+                        .map(crate::worktree::expand_tilde_absolute_path)
+                        .collect(),
+                    space_keys: entry
+                        .spaces
+                        .iter()
+                        .map(|space| space.trim().to_string())
+                        .filter(|space| !space.is_empty())
+                        .collect(),
+                }
+            })
+            .collect()
+    }
+
+    /// Human-readable diagnostics for dropped entries, plus duplicate keys
+    /// (TP-SPLIT-CONF-01, TP-SPLIT-CONF-02, TP-PROJ-CONF-01, TP-PROJ-CONF-02).
+    pub fn diagnostics(&self) -> Vec<String> {
+        let mut seen_keys = std::collections::HashSet::new();
+        let mut diagnostics: Vec<String> = self
+            .split
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                space_split_entry_problem(entry)
+                    .map(|problem| format!("spaces.split[{index}] {problem}; ignoring"))
+            })
+            .collect();
+        // A duplicate key inside one repository would silently merge two of
+        // its modules, which looks like a grouping bug rather than a config
+        // typo. Across repositories the same key is deliberate: it gathers
+        // several repositories' checkouts into one module (TP-SPLIT-CONF-04).
+        for (index, entry) in self.split.iter().enumerate() {
+            let key = entry.key.trim();
+            let repo = crate::worktree::expand_tilde_absolute_path(entry.repo.trim());
+            if !key.is_empty() && !seen_keys.insert((repo, key.to_string())) {
+                diagnostics.push(format!(
+                    "spaces.split[{index}] key {key:?} is already used by an earlier rule \
+                     for the same repository; both rules will share one space"
+                ));
+            }
+        }
+        diagnostics.extend(
+            self.project
+                .iter()
+                .enumerate()
+                .filter_map(|(index, entry)| {
+                    space_project_entry_problem(entry)
+                        .map(|problem| format!("spaces.project[{index}] {problem}; ignoring"))
+                }),
+        );
+        diagnostics.extend(self.node.iter().enumerate().filter_map(|(index, entry)| {
+            space_node_entry_problem(entry)
+                .map(|problem| format!("spaces.node[{index}] {problem}; ignoring"))
+        }));
+        // Forest-shape problems (cycles, unknown parents, depth) surface with
+        // the same voice as entry problems, so one diagnostics reader sees
+        // the whole story (TP-NODE-03).
+        diagnostics.extend(
+            crate::spaces::validate_node_forest(
+                self.nodes(),
+                &crate::spaces::split_parent_map(&self.rules()),
+            )
+            .1,
+        );
+        // Same reasoning as duplicate rule keys: two projects sharing a key
+        // share one collapse state, which reads as a folding bug.
+        let mut seen_project_keys = std::collections::HashSet::new();
+        for (index, entry) in self.project.iter().enumerate() {
+            let key = entry.key.trim();
+            if !key.is_empty() && !seen_project_keys.insert(key.to_string()) {
+                diagnostics.push(format!(
+                    "spaces.project[{index}] key {key:?} is already used by an earlier project; \
+                     both will share one collapse state"
+                ));
+            }
+        }
+        diagnostics
+    }
+}
+
+/// Why a node entry cannot be used, or `None` when it is usable. A node needs
+/// nothing but a key: an empty container is a legitimate place to move things
+/// under later.
+fn space_node_entry_problem(entry: &SpaceNodeEntry) -> Option<&'static str> {
+    if entry.key.trim().is_empty() {
+        return Some("has no key");
+    }
+    None
+}
+
+/// Why a project entry cannot be used, or `None` when it is usable
+/// (TP-PROJ-CONF-01).
+fn space_project_entry_problem(entry: &SpaceProjectEntry) -> Option<&'static str> {
+    if entry.key.trim().is_empty() {
+        return Some("has no key");
+    }
+    // A relative repo drops the whole entry rather than being skipped: a
+    // half-applied project reads as a grouping bug, not as a config typo.
+    if entry.repos.iter().any(|repo| {
+        let trimmed = repo.trim();
+        !trimmed.is_empty() && !pinned_entry_is_usable(trimmed)
+    }) {
+        return Some("has a repo that is not an absolute path");
+    }
+    let has_repo_member = entry
+        .repos
+        .iter()
+        .any(|repo| pinned_entry_is_usable(repo.trim()));
+    let has_space_member = entry.spaces.iter().any(|space| !space.trim().is_empty());
+    if !has_repo_member && !has_space_member {
+        return Some("has no usable repos or spaces member");
+    }
+    None
+}
+
+/// Why an entry cannot be used, or `None` when it is usable
+/// (TP-SPLIT-CONF-01).
+fn space_split_entry_problem(entry: &SpaceSplitEntry) -> Option<&'static str> {
+    let repo = entry.repo.trim();
+    if repo.is_empty() {
+        return Some("has no repo");
+    }
+    if !pinned_entry_is_usable(repo) {
+        return Some("repo is not an absolute path");
+    }
+    if entry.key.trim().is_empty() {
+        return Some("has no key");
+    }
+    if entry
+        .patterns
+        .iter()
+        .all(|pattern| pattern.trim().is_empty())
+    {
+        return Some("has no usable match pattern");
+    }
+    None
+}
+
+/// A pinned entry is usable when it is non-blank and points at an absolute or
+/// `~`-rooted location. `~` is accepted because Herdr config paths conventionally
+/// use it (e.g. `worktrees.directory` defaults to `~/.herdr/worktrees`).
+fn pinned_entry_is_usable(trimmed: &str) -> bool {
+    !trimmed.is_empty() && (Path::new(trimmed).is_absolute() || trimmed.starts_with('~'))
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct Config {
+    pub onboarding: Option<bool>,
+    pub theme: ThemeConfig,
+    pub terminal: TerminalConfig,
+    pub session: SessionConfig,
+    pub server: ServerConfig,
+    pub update: UpdateConfig,
+    pub keys: KeysConfig,
+    pub ui: UiConfig,
+    pub worktrees: WorktreesConfig,
+    pub advanced: AdvancedConfig,
+    pub experimental: ExperimentalConfig,
+    pub web: WebConfig,
+    pub remote: RemoteConfig,
+    pub projects: ProjectsConfig,
+    pub spaces: SpacesConfig,
+    pub files: FilesConfig,
+    pub preview: PreviewConfig,
+    pub tailscale: TailscaleConfig,
+    pub shell: ShellConfig,
+}
+
+/// `[shell]` — the outer composition around the panes.
+///
+/// Nothing here is on by default. Most people never want an edge bar, and the
+/// ones who do should not have to pay for it with a changed screen until they
+/// ask; every field below is inert until it is set.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct ShellConfig {
+    pub bars: ShellBarsConfig,
+    /// Whether a bar section may draw its `glyph` icon.
+    ///
+    /// A glyph is only a picture on a machine whose font has that codepoint.
+    /// herdr cannot ask: there is no capability probe, so a terminal without
+    /// the font draws tofu, and tofu reads as broken chrome rather than as a
+    /// missing icon. This switch is the declaration that stands in for the
+    /// question nobody can ask, which is why it is a plain on/off and not an
+    /// `auto`: an `auto` would be pretending to detect something.
+    ///
+    /// Off, a section with a glyph draws its `text` instead. Pictures made of
+    /// cells — `art` and `pixels` — are untouched, because a half block carries
+    /// no font risk and turning those off would destroy information for nothing.
+    ///
+    /// Defaults on: shipping this must not change a screen anyone already has.
+    #[serde(default = "ShellConfig::glyph_icons_default")]
+    pub glyph_icons: bool,
+    /// How often a `resource` or `meter` section re-reads the machine, in
+    /// milliseconds.
+    ///
+    /// Two seconds by default: slow enough that the cost is unmeasurable next to
+    /// a single keystroke's worth of terminal work, fast enough that a build
+    /// starting is visible before it finishes. Nothing is read at all unless a
+    /// section asks for it, so a bar without one pays nothing whatever this
+    /// says.
+    ///
+    /// Not per edge, because the machine's counters do not differ by edge. It
+    /// sits beside `glyph_icons` for the same reason that one does: outside the
+    /// bars, changing what a bar may do.
+    ///
+    /// Bounded rather than free. A CPU percentage is the difference between two
+    /// cumulative readings, and the kernel counts in jiffies — a hundred a
+    /// second, so ten milliseconds each. At 250 ms a single-core machine has
+    /// twenty-five of them to tell apart, which is about four per cent of
+    /// granularity; at a hundred it has ten, and the number on screen starts
+    /// reporting the counter's resolution rather than the machine's load. The
+    /// ceiling is a typo guard: a reading once a minute describes history.
+    #[serde(default = "ShellConfig::resource_interval_ms_default")]
+    pub resource_interval_ms: u64,
+}
+
+impl ShellConfig {
+    fn glyph_icons_default() -> bool {
+        true
+    }
+
+    pub(crate) const fn resource_interval_ms_default() -> u64 {
+        2_000
+    }
+
+    /// The narrowest window in which a CPU percentage still measures the machine
+    /// rather than the counter's resolution. See `resource_interval_ms`.
+    pub(crate) const RESOURCE_INTERVAL_MS_MIN: u64 = 250;
+
+    /// A typo guard rather than a judgement about slow bars: a number this far
+    /// out is nearly always a digit too many.
+    pub(crate) const RESOURCE_INTERVAL_MS_MAX: u64 = 60_000;
+}
+
+// Written out rather than derived: `bool`'s own default is `false`, and a
+// derived `Default` here would turn every existing bar's glyphs off through
+// whichever of serde's two default rules applies to a missing field. The
+// neighbouring `[shell.bars]` fields are spelled out for the same reason.
+impl Default for ShellConfig {
+    fn default() -> Self {
+        Self {
+            bars: ShellBarsConfig::default(),
+            glyph_icons: Self::glyph_icons_default(),
+            resource_interval_ms: Self::resource_interval_ms_default(),
+        }
+    }
+}
+
+/// `[shell.bars]` — one optional strip per edge of the frame.
+///
+/// The four edges are named rather than listed so that a typo cannot silently
+/// become a fifth bar, and so each edge keeps its own default size: a row is a
+/// sensible top bar, a row is a useless side bar.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct ShellBarsConfig {
+    pub top: ShellBarConfig,
+    pub bottom: ShellBarConfig,
+    // Named per field rather than through the struct's own `Default`, because
+    // `serde(default)` fills each *missing field* from that field's type: with
+    // only the struct default, writing `[shell.bars.top]` would quietly give
+    // the side bars a one-column default they never asked for.
+    #[serde(default = "ShellBarConfig::vertical")]
+    pub left: ShellBarConfig,
+    #[serde(default = "ShellBarConfig::vertical")]
+    pub right: ShellBarConfig,
+}
+
+impl Default for ShellBarsConfig {
+    fn default() -> Self {
+        Self {
+            top: ShellBarConfig::horizontal(),
+            bottom: ShellBarConfig::horizontal(),
+            left: ShellBarConfig::vertical(),
+            right: ShellBarConfig::vertical(),
+        }
+    }
+}
+
+/// `[shell.bars.<edge>]` — whether that edge has a strip, and how thick it is.
+///
+/// `size` counts terminal cells along the edge's own axis: rows for the top and
+/// bottom bars, columns for the left and right ones.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct ShellBarConfig {
+    pub enabled: bool,
+    pub size: u16,
+    /// Which look this bar wears when its parts do not say otherwise.
+    ///
+    /// A preset over the primitives, never a replacement for them: `"framed"`
+    /// (the default, and what an unwritten style means) draws the bar's own
+    /// panel and leaves sections bare; `"islands"` drops the outer panel and
+    /// frames each section; `"plain"` draws neither. It only fills in
+    /// *unwritten* `border` keys — anything written explicitly, on the bar or
+    /// on a section, wins over the style in both directions. Changing the
+    /// whole look is therefore one line, and disagreeing with it is one more.
+    pub style: String,
+    /// Draw the strip as a bordered panel rather than a bare band.
+    ///
+    /// Unwritten means "whatever the style says" — `framed` says yes, because
+    /// a bar that is only a gap reads as a rendering fault rather than a
+    /// surface. A border costs one cell on each side, so a bordered bar needs
+    /// `size >= 3` to have anything left to put inside it.
+    pub border: Option<bool>,
+    /// Border tone. A palette token (`accent`, `mauve`, `blue`, …) follows the
+    /// active theme; anything else is read as a literal colour. Empty means the
+    /// subdued separator tone.
+    pub color: String,
+    /// What the strip itself is painted on.
+    ///
+    /// Empty means the theme's own general background, so a bar belongs to the
+    /// surface it sits in and follows a theme change without being edited. A
+    /// palette token (`bg`, `surface`, `accent`, …) follows the theme; anything
+    /// else is read as a literal colour; `reset` leaves the terminal's own
+    /// background showing through. TP-CHROME-147.
+    pub background: String,
+    /// Two or more stops to fade the border between, along the bar's long
+    /// axis. Both ends have to resolve to real channel values, so named
+    /// terminal colours fall back to `color` rather than being guessed at.
+    pub gradient: Vec<String>,
+    /// The parts this bar is divided into, in the order they appear along it.
+    ///
+    /// Empty means one undivided strip, which is what every bar is until
+    /// somebody writes sections. A section is an address: what fills it and
+    /// what a click on it does are answered elsewhere, so that adding either
+    /// later does not have to reopen the division itself.
+    pub sections: Vec<ShellBarSectionConfig>,
+    /// How many parts anything may put on this bar. Defaults to 8; anything
+    /// outside `1..=16` is refused rather than clamped.
+    ///
+    /// A budget rather than a description. Today it bounds what the person
+    /// typed, which they could bound by typing less — but once something other
+    /// than the person can place a section, this is the number that decides how
+    /// much of their bar a plugin may take. Writing it now means the store
+    /// lands against a limit that already exists.
+    ///
+    /// The default lives on the field, not on the struct: `#[serde(default)]`
+    /// above fills a missing field from its **type's** default, which for a
+    /// number is zero — and a bar allowed zero parts is a bar that silently
+    /// stopped dividing.
+    #[serde(default = "default_max_bar_sections")]
+    pub max_sections: u16,
+    /// Whether focus mode quiets this edge.
+    ///
+    /// Focus narrows the display to what is being worked in; a bar that exists
+    /// to be glanced at is exactly what that mode is asking to be rid of. Off
+    /// by default, so every bar written before this key keeps its behaviour,
+    /// and per edge, because the reason to quiet a status strip is not a reason
+    /// to quiet the strip holding the controls being used.
+    #[serde(default)]
+    pub hide_when_focused: bool,
+}
+
+/// The section budget a bar has when nobody says otherwise.
+///
+/// Eight, because that is what every bar written before this key existed was
+/// bounded by: the value is a promise that those files keep meaning what they
+/// meant, not a preference.
+pub(crate) const fn default_max_bar_sections() -> u16 {
+    8
+}
+
+impl ShellBarConfig {
+    fn horizontal() -> Self {
+        Self {
+            enabled: false,
+            size: 3,
+            style: String::new(),
+            border: None,
+            color: String::new(),
+            background: String::new(),
+            gradient: Vec::new(),
+            sections: Vec::new(),
+            max_sections: default_max_bar_sections(),
+            hide_when_focused: false,
+        }
+    }
+
+    fn vertical() -> Self {
+        Self {
+            enabled: false,
+            size: 12,
+            style: String::new(),
+            border: None,
+            color: String::new(),
+            background: String::new(),
+            gradient: Vec::new(),
+            sections: Vec::new(),
+            max_sections: default_max_bar_sections(),
+            hide_when_focused: false,
+        }
+    }
+}
+
+/// `[[shell.bars.<edge>.sections]]` — how much of the bar one part asks for.
+///
+/// Deliberately a plain table rather than an expression language: the request
+/// is a choice among named sizing behaviours the layout solver already speaks,
+/// so the config carries data and the meaning stays in one place.
+///
+/// - `fixed` — exactly `cells` cells, whatever else happens.
+/// - `fill` — share whatever is left, in proportion to `weight`.
+/// - `content` — at least `min`, at most `max`, as much as there is room for.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default)]
+pub struct ShellBarSectionConfig {
+    /// A hand-chosen stable name for this section. Empty means unnamed. The
+    /// managed overlay's `section_overrides` bind by this id — never by
+    /// index — so reordering the hand-written file cannot re-aim an
+    /// override, and a section without an id simply cannot be overridden.
+    pub id: String,
+    pub kind: String,
+    pub cells: u16,
+    pub weight: u16,
+    pub min: u16,
+    pub max: u16,
+    /// Draw this one part as its own framed island rather than as a stretch of
+    /// the bar.
+    ///
+    /// Unwritten means "whatever the bar's `style` says" — `islands` frames
+    /// every section that does not opt out, everything else leaves them bare —
+    /// so every section written before this key keeps the shape it had. The
+    /// numbers above keep describing what goes *inside*: a frame costs one
+    /// cell on each side and that cost is charged on top of them, because a
+    /// `cells = 10` section that was showing a ten-cell picture must not start
+    /// clipping it the moment somebody asks for a box around it.
+    pub border: Option<bool>,
+    /// Which island this section belongs to, by name.
+    ///
+    /// Adjacent sections naming the same group share one frame: cpu, mem and
+    /// swap can sit inside a single box instead of three. Empty means the
+    /// section stands alone. A grouped section's own `border` key is refused —
+    /// its frame comes from the group — and the same name split apart by an
+    /// ungrouped neighbour is refused too, because a frame is one rectangle.
+    pub group: String,
+    /// This island's frame tone. A palette token (`accent`, `mauve`, `teal`, …)
+    /// follows the active theme; anything else is read as a literal colour.
+    ///
+    /// Empty inherits the bar's own tone rather than the global default: an
+    /// island belongs to the strip it sits in unless somebody says otherwise,
+    /// and falling back past the bar would paint a peach box inside a mauve
+    /// bar for nobody's reason.
+    ///
+    /// No `gradient` here on purpose — a fade needs a run of cells to happen
+    /// across and an island is a handful of them, so it would finish inside
+    /// the first one.
+    pub color: String,
+    /// The backdrop this section's chrome sits on — the pill's band when the
+    /// run paints as a pill, the frame's inner fill when it paints as an
+    /// island. Takes what `color` takes: a palette token, a literal, or
+    /// `reset`. Empty means the style's answer: `pills` derives a dusty tone
+    /// from the run's own colour, everything else leaves the bar's backdrop
+    /// showing. Refused on a `fill` — a spacer carries no chrome to backdrop.
+    pub background: String,
+    /// What a click on this part does. Absent means the part is an indicator
+    /// rather than a button: a surface nobody asked to be clickable should not
+    /// answer clicks, because the person cannot know what it would do.
+    pub action: ShellBarSectionActionConfig,
+    /// What this part shows. Absent means it shows nothing, which is what every
+    /// section did before widgets existed.
+    pub widget: ShellBarSectionWidgetConfig,
+}
+
+/// `[[shell.bars.<edge>.sections]].widget` — what one part shows.
+///
+/// - absent / empty `kind` — the part is empty.
+/// - `label` — draw `text`, clipped to the part by display width.
+///
+/// A widget never changes how wide its part is. Letting text size a part would
+/// put that text into the geometry cache key and make editing a label re-lay
+/// out the whole bar for a change that moves nothing.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default)]
+pub struct ShellBarSectionWidgetConfig {
+    pub kind: String,
+    pub text: String,
+    /// Which machine counter a `resource` widget shows: `cpu`, `mem` or `swap`.
+    /// Ignored by every other kind, and refused when the kind is `resource` and
+    /// this names nothing the build knows.
+    pub metric: String,
+    /// How a `meter` widget draws its fill: `bar` (the default), `blocks`,
+    /// `braille`, `gradient` or `dots`. Empty means `bar`; an unknown name is
+    /// refused rather than drawn blank. Ignored by every other kind.
+    pub display: String,
+    /// One grapheme an `icon` widget draws, for the case where the font already
+    /// has the picture.
+    pub glyph: String,
+    /// A bundled picture an `icon` widget draws, by name.
+    pub art: String,
+    /// Pixel rows for an `icon` widget drawn from scratch. Each character
+    /// indexes `palette`; `.` and a space are transparent. Two pixel rows
+    /// occupy one cell row.
+    pub pixels: Vec<String>,
+    /// Single-character keys mapped to colour specs, in the same grammar as
+    /// `shell.bars.<edge>.color`.
+    pub palette: std::collections::BTreeMap<String, String>,
+    /// How a `clock` widget writes the time: `%H:%M` and its neighbours, with
+    /// everything else carried through as written. Empty means `%H:%M`.
+    ///
+    /// The format also decides how often the clock is redrawn — a format naming
+    /// seconds is refreshed every second, one without them once a minute — so
+    /// there is no separate interval key that could disagree with it.
+    pub format: String,
+}
+
+/// `[[shell.bars.<edge>.sections]].action` — what clicking one part does.
+///
+/// Kept separate from the sizing fields above because the two questions are
+/// independent: what fills a part and what a click on it does are answered by
+/// different layers, and folding them into one field would make every new kind
+/// of content reopen the click question.
+///
+/// - absent / empty `kind` — the part is an indicator and consumes clicks inertly.
+/// - `popup` — run `argv` in a herdr popup pane.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default)]
+pub struct ShellBarSectionActionConfig {
+    pub kind: String,
+    pub argv: Vec<String>,
+    /// The plugin action a `plugin` action invokes: `"<plugin-id>.<action-id>"`,
+    /// or a bare action id when only one installed plugin declares it.
+    ///
+    /// A field of its own rather than a reuse of `argv` above. `argv` means a
+    /// program and the arguments handed to it; an action id is neither, and
+    /// bending the field would leave whoever reads this file next believing
+    /// `argv[1]` is an argument that gets passed somewhere.
+    ///
+    /// The spelling is copied, deliberately and exactly, from the keybind that
+    /// already does this — `[[keys.command]]` with `type = "plugin_action"` and
+    /// `command = "jt.command-palette.open"`. A second syntax for the same idea
+    /// is a second thing to learn and a second thing to get wrong, and the
+    /// resolver on the other end already accepts both the qualified and the
+    /// bare form.
+    pub command: String,
+    /// How a secondary press presents the same command: `tab` opens it in a new
+    /// tab of the current workspace, at full size. Absent means a secondary
+    /// press is consumed and does nothing.
+    ///
+    /// A presentation rather than a second command, and deliberately so. The
+    /// argv above is written once, so the two gestures can never drift into
+    /// running different programs — and the right press stays what its name
+    /// says it is, a choice *about* the action rather than another action.
+    pub secondary: String,
+    /// Outer popup width, in cells or as a percentage string like `"80%"`.
+    ///
+    /// Same spelling as the popup size on a custom command keybind, and read by
+    /// the same parser: a second syntax for the same idea is a second thing to
+    /// learn and a second thing to get wrong. Absent means the popup keeps its
+    /// default half-of-the-terminal size.
+    pub width: Option<crate::popup_size::PopupSize>,
+    /// Outer popup height, in cells or as a percentage string like `"60%"`.
+    pub height: Option<crate::popup_size::PopupSize>,
+    /// Which workspace a `workspace` action goes to, by the name shown in the
+    /// sidebar. Refused on every other kind, and refused when empty: a
+    /// destination nobody named is a button that cannot go anywhere.
+    pub name: String,
+}
+
+impl Default for ShellBarConfig {
+    fn default() -> Self {
+        Self::horizontal()
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct TailscaleConfig {
+    /// Devices the user put at the top of the send picker, in their order.
+    ///
+    /// Stored as the tailnet DNS name rather than the host name, because host
+    /// names repeat and a pin has to name one machine. Order is the reader's:
+    /// the first entry sorts above the second.
+    pub pinned_devices: Vec<String>,
+}
+
+/// `[preview]` — how the wired browser preview places itself when a chat tab
+/// gains focus. Only the default mode is implemented today; the other modes
+/// are announced ("soon") so the setting surface is stable before the
+/// backends land, and any of them behaves like the default at runtime.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct PreviewConfig {
+    pub placement: PreviewPlacement,
+}
+
+/// Preview window placement mode. Runtime consumers must check
+/// [`PreviewPlacement::is_available`] and fall back to the default for the
+/// announced-but-unimplemented modes (a hand-edited config must never change
+/// behavior silently or break the app).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PreviewPlacement {
+    /// Half screen on the display the window is already on (single- and
+    /// multi-monitor). The only implemented mode — the default.
+    #[default]
+    SameScreenHalf,
+    /// Other display, shared browser window with one tab per preview (soon).
+    OtherMonitorSharedTabs,
+    /// Other display, a dedicated window per chat (soon).
+    OtherMonitorPerChat,
+    /// User-defined placement matrix (soon).
+    CustomMatrix,
+}
+
+impl PreviewPlacement {
+    pub const ALL: &[Self] = &[
+        Self::SameScreenHalf,
+        Self::OtherMonitorSharedTabs,
+        Self::OtherMonitorPerChat,
+        Self::CustomMatrix,
+    ];
+
+    /// Whether the mode's backend exists. Everything except the default is
+    /// announced-only for now.
+    pub fn is_available(self) -> bool {
+        matches!(self, Self::SameScreenHalf)
+    }
+
+    /// The kebab-case config value (used when persisting the selection).
+    pub fn config_value(self) -> &'static str {
+        match self {
+            Self::SameScreenHalf => "same-screen-half",
+            Self::OtherMonitorSharedTabs => "other-monitor-shared-tabs",
+            Self::OtherMonitorPerChat => "other-monitor-per-chat",
+            Self::CustomMatrix => "custom-matrix",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct LoadedConfig {
+    pub config: Config,
+    pub diagnostics: Vec<String>,
+    pub invalid_sections: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct KeysConfig {
+    /// Prefix key to enter prefix mode (e.g. "ctrl+b", "f12", "esc").
+    pub prefix: String,
+    /// Open keybinding help. Default: "prefix+?"
+    pub help: BindingConfig,
+    /// Open settings. Default: "prefix+s"
+    pub settings: BindingConfig,
+    /// Create a new workspace. Default: "prefix+shift+n"
+    pub new_workspace: BindingConfig,
+    /// Create a Git worktree from the selected workspace. Default: "prefix+shift+g"
+    pub new_worktree: BindingConfig,
+    /// Open an existing Git worktree from the selected workspace. Unset by default.
+    pub open_worktree: BindingConfig,
+    /// Delete the selected managed worktree checkout after confirmation. Unset by default.
+    pub remove_worktree: BindingConfig,
+    /// Rename the selected workspace. Default: "prefix+shift+w"
+    pub rename_workspace: BindingConfig,
+    /// Close the selected workspace. Default: "prefix+shift+d"
+    pub close_workspace: BindingConfig,
+    /// Open the workspace navigation surface. Default: "prefix+w"
+    pub workspace_picker: BindingConfig,
+    /// Open the session navigator. Default: "prefix+g"
+    pub goto: BindingConfig,
+    /// Move workspace selection up in navigate mode. Default: "up".
+    pub navigate_workspace_up: BindingConfig,
+    /// Move workspace selection down in navigate mode. Default: "down".
+    pub navigate_workspace_down: BindingConfig,
+    /// Focus the pane to the left in navigate mode. Default: "h". Left arrow is always an alias.
+    pub navigate_pane_left: BindingConfig,
+    /// Focus the pane below in navigate mode. Default: "j".
+    pub navigate_pane_down: BindingConfig,
+    /// Focus the pane above in navigate mode. Default: "k".
+    pub navigate_pane_up: BindingConfig,
+    /// Focus the pane to the right in navigate mode. Default: "l". Right arrow is always an alias.
+    pub navigate_pane_right: BindingConfig,
+    /// Detach the current client from its Herdr server. Default: "prefix+q".
+    pub detach: BindingConfig,
+    /// Reload config.toml in the running app/server. Default: "prefix+shift+r".
+    pub reload_config: BindingConfig,
+    /// Focus the currently visible notification target. Default: "prefix+o".
+    pub open_notification_target: BindingConfig,
+    /// Select the previous workspace. Unset by default.
+    pub previous_workspace: BindingConfig,
+    /// Select the next workspace. Unset by default.
+    pub next_workspace: BindingConfig,
+    /// Focus the previous agent shown in the agent panel. Unset by default.
+    pub previous_agent: BindingConfig,
+    /// Focus the next agent shown in the agent panel. Unset by default.
+    pub next_agent: BindingConfig,
+    /// Focus an agent by index 1-9. Unset by default.
+    pub focus_agent: BindingConfig,
+    /// Local-client shortcut that sends a clipboard image to a remote Herdr session. Default: "ctrl+v".
+    pub remote_image_paste: String,
+    /// Create a new tab in the active workspace. Default: "prefix+c"
+    pub new_tab: BindingConfig,
+    /// Open a new chat tab in the home directory with the default chat agent. Unset by default.
+    pub new_chat_tab: BindingConfig,
+    /// Rename the active tab. Default: "prefix+shift+t".
+    pub rename_tab: BindingConfig,
+    /// Select the previous tab. Default: "prefix+p".
+    pub previous_tab: BindingConfig,
+    /// Select the next tab. Default: "prefix+n".
+    pub next_tab: BindingConfig,
+    /// Move the active tab one position toward the front. Unset by default.
+    pub move_tab_previous: BindingConfig,
+    /// Move the active tab one position toward the back. Unset by default.
+    pub move_tab_next: BindingConfig,
+    /// Switch to tab 1-9. Default: "prefix+1..9".
+    pub switch_tab: BindingConfig,
+    /// Switch to workspace 1-9 from prefix mode. Unset by default.
+    pub switch_workspace: BindingConfig,
+    /// Close the active tab. Default: "prefix+shift+x".
+    pub close_tab: BindingConfig,
+    /// Rename the focused pane. Default: "prefix+shift+p".
+    pub rename_pane: BindingConfig,
+    /// Open the focused pane scrollback in $EDITOR. Default: "prefix+e".
+    pub edit_scrollback: BindingConfig,
+    /// Enter keyboard copy mode for the focused pane. Default: "prefix+[".
+    pub copy_mode: BindingConfig,
+    /// Focus the pane to the left. Default: "prefix+h".
+    pub focus_pane_left: BindingConfig,
+    /// Focus the pane below. Default: "prefix+j".
+    pub focus_pane_down: BindingConfig,
+    /// Focus the pane above. Default: "prefix+k".
+    pub focus_pane_up: BindingConfig,
+    /// Focus the pane to the right. Default: "prefix+l".
+    pub focus_pane_right: BindingConfig,
+    /// Swap the focused pane with the pane to the left. Default: "prefix+shift+h".
+    pub swap_pane_left: BindingConfig,
+    /// Swap the focused pane with the pane below. Default: "prefix+shift+j".
+    pub swap_pane_down: BindingConfig,
+    /// Swap the focused pane with the pane above. Default: "prefix+shift+k".
+    pub swap_pane_up: BindingConfig,
+    /// Swap the focused pane with the pane to the right. Default: "prefix+shift+l".
+    pub swap_pane_right: BindingConfig,
+    /// Cycle to the next pane. Default: "prefix+tab".
+    pub cycle_pane_next: BindingConfig,
+    /// Cycle to the previous pane. Default: "prefix+shift+tab".
+    pub cycle_pane_previous: BindingConfig,
+    /// Focus the last focused pane across workspaces and tabs. Unset by default.
+    pub last_pane: BindingConfig,
+    /// Split pane vertically (side by side). Default: "prefix+v"
+    pub split_vertical: BindingConfig,
+    /// Split pane horizontally (stacked). Default: "prefix+minus"
+    pub split_horizontal: BindingConfig,
+    /// Open a browser pane beside the focused pane — the strip's browser
+    /// button, on a key (TP-TAB-BROWSER-02). Unset by default.
+    pub open_web_pane: BindingConfig,
+    /// Close the focused pane. Default: "prefix+x"
+    pub close_pane: BindingConfig,
+    /// Toggle zoom for the focused pane. Default: "prefix+z"
+    #[serde(alias = "fullscreen")]
+    pub zoom: BindingConfig,
+    /// Enter resize mode. Default: "prefix+r"
+    pub resize_mode: BindingConfig,
+    /// Resize the focused pane toward the left. Unset by default.
+    pub resize_pane_left: BindingConfig,
+    /// Resize the focused pane downward. Unset by default.
+    pub resize_pane_down: BindingConfig,
+    /// Resize the focused pane upward. Unset by default.
+    pub resize_pane_up: BindingConfig,
+    /// Resize the focused pane toward the right. Unset by default.
+    pub resize_pane_right: BindingConfig,
+    /// Toggle sidebar collapse. Default: "prefix+b"
+    pub toggle_sidebar: BindingConfig,
+    pub toggle_bars: BindingConfig,
+    /// Toggle the native file manager. Default: "prefix+f"
+    pub toggle_file_manager: BindingConfig,
+    /// Open the focused-agent attachment picker. Default: "prefix+a"
+    pub agent_attachment_picker: BindingConfig,
+    /// Optional indexed shortcuts expanded over number keys 1-9.
+    pub indexed: IndexedKeysConfig,
+    /// Prefix-mode custom command bindings.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub command: Vec<CommandKeybindConfig>,
+    #[serde(skip_serializing)]
+    pub(crate) user_fields: BTreeSet<&'static str>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub(crate) struct KeysConfigOverlay {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prefix: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    help: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    settings: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    new_workspace: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    new_worktree: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    open_worktree: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remove_worktree: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rename_workspace: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    close_workspace: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace_picker: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    goto: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    navigate_workspace_up: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    navigate_workspace_down: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    navigate_pane_left: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    navigate_pane_down: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    navigate_pane_up: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    navigate_pane_right: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detach: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reload_config: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    open_notification_target: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_workspace: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_workspace: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_agent: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_agent: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    focus_agent: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remote_image_paste: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    new_tab: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    new_chat_tab: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rename_tab: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_tab: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_tab: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    move_tab_previous: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    move_tab_next: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    switch_tab: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    switch_workspace: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    close_tab: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rename_pane: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    edit_scrollback: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    copy_mode: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    focus_pane_left: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    focus_pane_down: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    focus_pane_up: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    focus_pane_right: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    swap_pane_left: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    swap_pane_down: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    swap_pane_up: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    swap_pane_right: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cycle_pane_next: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cycle_pane_previous: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_pane: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    split_vertical: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    split_horizontal: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    open_web_pane: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    close_pane: Option<BindingConfig>,
+    #[serde(alias = "fullscreen", skip_serializing_if = "Option::is_none")]
+    zoom: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resize_mode: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resize_pane_left: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resize_pane_down: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resize_pane_up: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resize_pane_right: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    toggle_sidebar: Option<BindingConfig>,
+    toggle_bars: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    toggle_file_manager: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_attachment_picker: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    indexed: Option<IndexedKeysConfig>,
+    #[serde(skip_serializing)]
+    command: Option<Vec<CommandKeybindConfig>>,
+}
+
+impl KeysConfigOverlay {
+    pub(crate) fn set_prefix(&mut self, prefix: String) {
+        self.prefix = Some(prefix);
+    }
+}
+
+impl<'de> Deserialize<'de> for KeysConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let input = KeysConfigOverlay::deserialize(deserializer)?;
+        let mut keys = KeysConfig::default();
+
+        macro_rules! apply_field {
+            ($field:ident) => {
+                if let Some(value) = input.$field {
+                    keys.$field = value;
+                    keys.user_fields.insert(stringify!($field));
+                }
+            };
+        }
+
+        apply_field!(prefix);
+        apply_field!(help);
+        apply_field!(settings);
+        apply_field!(new_workspace);
+        apply_field!(new_worktree);
+        apply_field!(open_worktree);
+        apply_field!(remove_worktree);
+        apply_field!(rename_workspace);
+        apply_field!(close_workspace);
+        apply_field!(workspace_picker);
+        apply_field!(goto);
+        apply_field!(navigate_workspace_up);
+        apply_field!(navigate_workspace_down);
+        apply_field!(navigate_pane_left);
+        apply_field!(navigate_pane_down);
+        apply_field!(navigate_pane_up);
+        apply_field!(navigate_pane_right);
+        apply_field!(detach);
+        apply_field!(reload_config);
+        apply_field!(open_notification_target);
+        apply_field!(previous_workspace);
+        apply_field!(next_workspace);
+        apply_field!(previous_agent);
+        apply_field!(next_agent);
+        apply_field!(focus_agent);
+        apply_field!(remote_image_paste);
+        apply_field!(new_tab);
+        apply_field!(new_chat_tab);
+        apply_field!(rename_tab);
+        apply_field!(previous_tab);
+        apply_field!(next_tab);
+        apply_field!(move_tab_previous);
+        apply_field!(move_tab_next);
+        apply_field!(switch_tab);
+        apply_field!(switch_workspace);
+        apply_field!(close_tab);
+        apply_field!(rename_pane);
+        apply_field!(edit_scrollback);
+        apply_field!(copy_mode);
+        apply_field!(focus_pane_left);
+        apply_field!(focus_pane_down);
+        apply_field!(focus_pane_up);
+        apply_field!(focus_pane_right);
+        apply_field!(swap_pane_left);
+        apply_field!(swap_pane_down);
+        apply_field!(swap_pane_up);
+        apply_field!(swap_pane_right);
+        apply_field!(cycle_pane_next);
+        apply_field!(cycle_pane_previous);
+        apply_field!(last_pane);
+        apply_field!(split_vertical);
+        apply_field!(split_horizontal);
+        apply_field!(open_web_pane);
+        apply_field!(close_pane);
+        apply_field!(zoom);
+        apply_field!(resize_mode);
+        apply_field!(resize_pane_left);
+        apply_field!(resize_pane_down);
+        apply_field!(resize_pane_up);
+        apply_field!(resize_pane_right);
+        apply_field!(toggle_sidebar);
+        apply_field!(toggle_bars);
+        apply_field!(toggle_file_manager);
+        apply_field!(agent_attachment_picker);
+        apply_field!(indexed);
+        apply_field!(command);
+
+        Ok(keys)
+    }
+}
+
+impl KeysConfig {
+    pub(crate) fn key_field_is_user_configured(&self, field: &str) -> bool {
+        self.user_fields.contains(field)
+    }
+
+    pub(crate) fn local_profile(&self, keybinds: &Keybinds) -> KeysConfigOverlay {
+        let mut profile = KeysConfigOverlay::default();
+
+        macro_rules! copy_user_field {
+            ($field:ident) => {
+                if self.user_fields.contains(stringify!($field)) {
+                    profile.$field = Some(self.$field.clone());
+                }
+            };
+        }
+        macro_rules! copy_effective_action_field {
+            ($field:ident, $target:expr) => {
+                if self.user_fields.contains(stringify!($field)) {
+                    profile.$field = Some(self.$field.clone());
+                } else if binding_config_is_effective(&self.$field, &$target) {
+                    profile.$field = Some(self.$field.clone());
+                } else if binding_config_has_values(&self.$field) {
+                    profile.$field = Some(BindingConfig::empty());
+                }
+            };
+        }
+        macro_rules! copy_effective_indexed_field {
+            ($field:ident, $target:expr) => {
+                if self.user_fields.contains(stringify!($field)) {
+                    profile.$field = Some(self.$field.clone());
+                } else if let Some(effective) = effective_indexed_config(&self.$field, &$target) {
+                    profile.$field = Some(effective);
+                } else if binding_config_has_values(&self.$field) {
+                    profile.$field = Some(BindingConfig::empty());
+                }
+            };
+        }
+
+        profile.prefix = Some(self.prefix.clone());
+        copy_effective_action_field!(help, keybinds.help);
+        copy_effective_action_field!(settings, keybinds.settings);
+        copy_effective_action_field!(new_workspace, keybinds.new_workspace);
+        copy_effective_action_field!(new_worktree, keybinds.new_worktree);
+        copy_effective_action_field!(open_worktree, keybinds.open_worktree);
+        copy_effective_action_field!(remove_worktree, keybinds.remove_worktree);
+        copy_effective_action_field!(rename_workspace, keybinds.rename_workspace);
+        copy_effective_action_field!(close_workspace, keybinds.close_workspace);
+        copy_effective_action_field!(workspace_picker, keybinds.workspace_picker);
+        copy_effective_action_field!(goto, keybinds.goto);
+        copy_effective_action_field!(navigate_workspace_up, keybinds.navigate.workspace_up);
+        copy_effective_action_field!(navigate_workspace_down, keybinds.navigate.workspace_down);
+        copy_effective_action_field!(navigate_pane_left, keybinds.navigate.pane_left);
+        copy_effective_action_field!(navigate_pane_down, keybinds.navigate.pane_down);
+        copy_effective_action_field!(navigate_pane_up, keybinds.navigate.pane_up);
+        copy_effective_action_field!(navigate_pane_right, keybinds.navigate.pane_right);
+        copy_effective_action_field!(detach, keybinds.detach);
+        copy_effective_action_field!(reload_config, keybinds.reload_config);
+        copy_effective_action_field!(open_notification_target, keybinds.open_notification_target);
+        copy_effective_action_field!(previous_workspace, keybinds.previous_workspace);
+        copy_effective_action_field!(next_workspace, keybinds.next_workspace);
+        copy_effective_action_field!(previous_agent, keybinds.previous_agent);
+        copy_effective_action_field!(next_agent, keybinds.next_agent);
+        copy_effective_indexed_field!(focus_agent, keybinds.focus_agent);
+        copy_user_field!(remote_image_paste);
+        copy_effective_action_field!(new_tab, keybinds.new_tab);
+        copy_effective_action_field!(new_chat_tab, keybinds.new_chat_tab);
+        copy_effective_action_field!(rename_tab, keybinds.rename_tab);
+        copy_effective_action_field!(previous_tab, keybinds.previous_tab);
+        copy_effective_action_field!(next_tab, keybinds.next_tab);
+        copy_effective_action_field!(move_tab_previous, keybinds.move_tab_previous);
+        copy_effective_action_field!(move_tab_next, keybinds.move_tab_next);
+        copy_effective_indexed_field!(switch_tab, keybinds.switch_tab);
+        copy_effective_indexed_field!(switch_workspace, keybinds.switch_workspace);
+        copy_effective_action_field!(close_tab, keybinds.close_tab);
+        copy_effective_action_field!(rename_pane, keybinds.rename_pane);
+        copy_effective_action_field!(edit_scrollback, keybinds.edit_scrollback);
+        copy_effective_action_field!(copy_mode, keybinds.copy_mode);
+        copy_effective_action_field!(focus_pane_left, keybinds.focus_pane_left);
+        copy_effective_action_field!(focus_pane_down, keybinds.focus_pane_down);
+        copy_effective_action_field!(focus_pane_up, keybinds.focus_pane_up);
+        copy_effective_action_field!(focus_pane_right, keybinds.focus_pane_right);
+        copy_effective_action_field!(swap_pane_left, keybinds.swap_pane_left);
+        copy_effective_action_field!(swap_pane_down, keybinds.swap_pane_down);
+        copy_effective_action_field!(swap_pane_up, keybinds.swap_pane_up);
+        copy_effective_action_field!(swap_pane_right, keybinds.swap_pane_right);
+        copy_effective_action_field!(cycle_pane_next, keybinds.cycle_pane_next);
+        copy_effective_action_field!(cycle_pane_previous, keybinds.cycle_pane_previous);
+        copy_effective_action_field!(last_pane, keybinds.last_pane);
+        copy_effective_action_field!(split_vertical, keybinds.split_vertical);
+        copy_effective_action_field!(split_horizontal, keybinds.split_horizontal);
+        copy_effective_action_field!(open_web_pane, keybinds.open_web_pane);
+        copy_effective_action_field!(close_pane, keybinds.close_pane);
+        copy_effective_action_field!(zoom, keybinds.zoom);
+        copy_effective_action_field!(resize_mode, keybinds.resize_mode);
+        copy_effective_action_field!(resize_pane_left, keybinds.resize_pane_left);
+        copy_effective_action_field!(resize_pane_down, keybinds.resize_pane_down);
+        copy_effective_action_field!(resize_pane_up, keybinds.resize_pane_up);
+        copy_effective_action_field!(resize_pane_right, keybinds.resize_pane_right);
+        copy_effective_action_field!(toggle_sidebar, keybinds.toggle_sidebar);
+        copy_effective_action_field!(toggle_bars, keybinds.toggle_bars);
+        copy_effective_action_field!(toggle_file_manager, keybinds.toggle_file_manager);
+        copy_effective_action_field!(agent_attachment_picker, keybinds.agent_attachment_picker);
+        copy_user_field!(indexed);
+
+        profile
+    }
+}
+
+fn binding_config_has_values(config: &BindingConfig) -> bool {
+    config.has_values()
+}
+
+fn binding_config_is_effective(config: &BindingConfig, keybinds: &ActionKeybinds) -> bool {
+    !binding_config_has_values(config) || !keybinds.bindings.is_empty()
+}
+
+fn effective_indexed_config(
+    config: &BindingConfig,
+    keybinds: &[IndexedKeybind],
+) -> Option<BindingConfig> {
+    if !binding_config_has_values(config) {
+        return Some(config.clone());
+    }
+
+    let expected_labels = config.indexed_labels();
+    if expected_labels.is_empty() {
+        return None;
+    }
+
+    let effective_labels: Vec<String> = expected_labels
+        .iter()
+        .filter(|expected| {
+            keybinds
+                .iter()
+                .any(|binding| binding.label.as_str() == expected.as_str())
+        })
+        .cloned()
+        .collect();
+
+    if effective_labels.is_empty() {
+        None
+    } else if effective_labels.len() == expected_labels.len() {
+        Some(config.clone())
+    } else {
+        Some(BindingConfig::Many(effective_labels))
+    }
+}
+
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct IndexedKeysConfig {
+    /// Modifier combo for tab shortcuts 1-9. Unset by default.
+    pub tabs: String,
+    /// Modifier combo for workspace shortcuts 1-9. Unset by default.
+    pub workspaces: String,
+    /// Modifier combo for agent shortcuts 1-9. Unset by default.
+    pub agents: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct WorktreesConfig {
+    /// Root directory under which Herdr creates <repo>/<branch-slug> checkouts.
+    pub directory: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TabBarPositionConfig {
+    #[default]
+    Top,
+    Bottom,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct UiConfig {
+    pub sidebar_width: u16,
+    /// Minimum sidebar width (columns) when expanded. Default: 18.
+    pub sidebar_min_width: u16,
+    /// Maximum sidebar width (columns) when expanded. Default: 36.
+    pub sidebar_max_width: u16,
+    /// Start with the sidebar collapsed. Default: false.
+    pub sidebar_start_collapsed: bool,
+    /// Collapsed sidebar presentation. Default: compact.
+    pub sidebar_collapsed_mode: SidebarCollapsedModeConfig,
+    /// Terminal width at or below which Herdr uses the mobile single-column layout. Default: 64.
+    pub mobile_width_threshold: u16,
+    /// Capture mouse input for Herdr's mouse UI. Default: true.
+    pub mouse_capture: bool,
+    /// Copy text selected with the mouse. Default: true.
+    pub copy_on_select: bool,
+    /// Host cursor policy. Default: auto.
+    pub host_cursor: HostCursorModeConfig,
+    /// Modifier that lets right-click gestures pass through to pane apps. Empty disables it.
+    pub right_click_passthrough_modifier: RightClickPassthroughModifierConfig,
+    /// Force a full host-terminal redraw when the outer terminal regains focus. Default: true.
+    pub redraw_on_focus_gained: bool,
+    /// Lines to scroll per mouse wheel notch. Default: 3.
+    pub mouse_scroll_lines: Option<NonZeroUsize>,
+    /// Where the vertical wheel scrolls Herdr's own viewport instead of being
+    /// reported to a pane that asked for mouse reporting. Saved values are
+    /// "mobile", "scrollable", or "never". Default: "mobile".
+    pub mouse_wheel_host_scroll: MouseWheelHostScrollConfig,
+    /// Ask for confirmation before closing a workspace. Default: true.
+    pub confirm_close: bool,
+    /// Ask for a tab name before creating a new tab. Default: true.
+    pub prompt_new_tab_name: bool,
+    /// Ask for a workspace name before interactive creation. Default: false.
+    pub prompt_new_workspace_name: bool,
+    /// Draw borders around split panes. Default: true.
+    pub pane_borders: bool,
+    /// Draw borders along the outside edge of the pane area. Default: true.
+    pub pane_outer_borders: bool,
+    /// Draw interactive scrollbars beside terminal panes. Default: true.
+    pub pane_scrollbars: bool,
+    /// Keep split panes visually separated instead of sharing divider borders. Default: true.
+    pub pane_gaps: bool,
+    /// Show agent labels in split pane borders when no manual pane label is set. Default: false.
+    pub show_agent_labels_on_pane_borders: bool,
+    /// Hide the tab row when the workspace has one tab. Default: false.
+    pub hide_tab_bar_when_single_tab: bool,
+    /// Desktop tab row placement. Default: top.
+    pub tab_bar_position: TabBarPositionConfig,
+    /// Ordered entries shown at the right edge of the desktop tab row. Empty by default.
+    pub tab_bar_right: Vec<TabBarRightEntryConfig>,
+    /// Text inserted between visible right-side tab bar entries. Default: one space.
+    pub tab_bar_right_separator: String,
+    /// Format for the outer terminal window title. Empty leaves the title alone.
+    /// Default: "{hostname}: {workspace}".
+    pub window_title: String,
+    /// Agent sidebar ordering. Saved values are "spaces" or "priority". Default: "spaces".
+    pub agent_panel_sort: AgentPanelSortConfig,
+    /// How workspace chat drawers open and close. Saved values are
+    /// "all-active", "focused", or "manual". Default: "all-active".
+    pub chat_drawer_mode: ChatDrawerModeConfig,
+    /// Structural markers that say a chat was opened by an automation rather
+    /// than by a person, matched against the START of the chat's first
+    /// message: a marker that only appears mid-sentence is a mention, not a
+    /// declaration. Default: ["<scheduled-task", "<command-name>"].
+    pub routine_chat_markers: Vec<String>,
+    /// Further openings that mark a chat as routine, matched as a prefix of
+    /// the first message once case and spacing are normalised. Which chores
+    /// repeat is a fact about your work rather than about Herdr, so this list
+    /// ships empty. Default: empty.
+    pub routine_chat_prompt_patterns: Vec<String>,
+    /// How many chats must share one opening before the repetition alone
+    /// marks them routine. 0 turns that rule off and leaves the markers and
+    /// patterns working. Default: 3.
+    pub routine_chat_repeat_threshold: usize,
+    /// Labels the daily chat section leaves out. Accepted labels are
+    /// "context", "project", and "routine"; an empty list brings every chat
+    /// back. Default: ["routine"].
+    pub hidden_chat_labels: Vec<String>,
+    /// Retired setting that Herdr wrote before the workspace filter was removed.
+    #[serde(rename = "agent_panel_scope")]
+    _legacy_agent_panel_scope: Option<LegacyAgentPanelScopeConfig>,
+    /// Agent status indicator style. Saved values are "dots" or "symbols". Default: "dots".
+    pub status_indicators: StatusIndicatorStyle,
+    /// Expanded sidebar row composition.
+    pub sidebar: SidebarConfig,
+    /// Accent color for highlights, borders, and navigation UI.
+    /// Accepts hex (#89b4fa), named colors (cyan, blue), or RGB (rgb(137,180,250)).
+    pub accent: String,
+    /// Optional visual toast notifications for background workspace events.
+    pub toast: ToastConfig,
+    /// Play sounds when agents change state in background workspaces.
+    pub sound: SoundConfig,
+}
+
+/// Cursor shape (DECSCUSR) used for the forced IME anchor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImeCursorShape {
+    Block,
+    #[default]
+    SteadyBlock,
+    Underline,
+    SteadyUnderline,
+    Bar,
+    SteadyBar,
+}
+
+impl ImeCursorShape {
+    /// Convert to DECSCUSR parameter (1–6).
+    pub fn to_decscusr(self) -> u8 {
+        match self {
+            Self::Block => 1,
+            Self::SteadyBlock => 2,
+            Self::Underline => 3,
+            Self::SteadyUnderline => 4,
+            Self::Bar => 5,
+            Self::SteadyBar => 6,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct ServerConfig {
+    /// Virtual terminal width used when no client is attached. Default: 120.
+    pub headless_cols: u16,
+    /// Virtual terminal height used when no client is attached. Default: 40.
+    pub headless_rows: u16,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct AdvancedConfig {
+    /// Maximum scrollback buffer size in bytes retained per pane terminal. Default: 10000000.
+    #[serde(alias = "scrollback_lines")]
+    pub scrollback_limit_bytes: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct RemoteConfig {
+    /// Add keepalive fallbacks and private connection reuse for `herdr --remote`.
+    /// Set false to run plain ssh unchanged. Default: true.
+    pub manage_ssh_config: bool,
+}
+
+impl Default for RemoteConfig {
+    fn default() -> Self {
+        Self {
+            manage_ssh_config: true,
+        }
+    }
+}
+
+/// `[web]` — the browser a web pane runs (TP-TAB-BROWSER-02).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct WebConfig {
+    /// The program a web pane is born running; the page url, when one was
+    /// asked for, is appended as its last argument. Default:
+    /// `["terminal-browser", "open"]`. An empty list falls back to the same.
+    pub command: Vec<String>,
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            command: Self::default_command(),
+        }
+    }
+}
+
+impl WebConfig {
+    pub fn default_command() -> Vec<String> {
+        vec!["terminal-browser".to_string(), "open".to_string()]
+    }
+
+    /// The configured command, or the default when the list was emptied —
+    /// a pane born running nothing would be a blank seat, not a browser.
+    pub fn effective_command(&self) -> Vec<String> {
+        if self.command.is_empty() {
+            Self::default_command()
+        } else {
+            self.command.clone()
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct ExperimentalConfig {
+    /// Allow launching herdr inside an existing herdr pane. Default: false.
+    pub allow_nested: bool,
+    /// Deprecated compatibility key for `terminal.kitty_graphics`.
+    pub kitty_graphics: Option<bool>,
+    /// Send Kitty graphics payloads deflated (`o=z`). A remote client pays for
+    /// every pixel of every frame over its connection, and the same frame that
+    /// costs 25 MB raw costs under 200 KB deflated. Terminals that speak the
+    /// graphics protocol inflate it; set this to `false` only for one that
+    /// cannot. Default: true (unset).
+    pub kitty_graphics_compression: Option<bool>,
+    /// Persist pane screen history to session-history.json. Default: false.
+    pub pane_history: bool,
+    /// Automatically put retired panes to sleep: a pane whose child process
+    /// has exited and that no display is watching gets its scrollback written
+    /// to disk and its runtime released after a quiet period. Touching the
+    /// pane wakes it with its history replayed. Panes with a running process
+    /// are never touched. Default: false.
+    pub pane_dormancy: bool,
+    /// Let an idle server exit: when no client is attached and no pane has a
+    /// running process for a grace period, the server writes every retired
+    /// pane's scrollback to disk, saves the session, and stops. The next
+    /// `herdr` start restores the session with that history. Default: false.
+    pub idle_server_exit: bool,
+    /// Expose the focused pane's cursor anchor to the outer terminal even when
+    /// the pane requested `?25l`, so macOS native input methods keep tracking
+    /// the candidate window when TUIs paint their own cursor (Claude Code, pi,
+    /// codex, etc.). Default: false.
+    ///
+    /// When the pane reports no cursor position, falls back to the pane's
+    /// top-left so a stable IME anchor is always available.
+    ///
+    /// Trade-off when enabled: an extra hardware cursor will be visible in the
+    /// outer terminal for apps that hide the cursor without painting a
+    /// replacement (vim normal mode, etc.). See #149.
+    pub reveal_hidden_cursor_for_cjk_ime: bool,
+    /// Restrict `reveal_hidden_cursor_for_cjk_ime` to focused panes whose
+    /// detected agent matches one of these names (case-insensitive). Empty
+    /// list means apply to any focused pane. Unknown agent names are ignored;
+    /// if the list contains no valid names, the reveal does not apply.
+    /// Accepted names: pi, claude, codex, gemini, cursor, devin, cline,
+    /// opencode, copilot, kimi, kiro, droid, amp, grok, hermes, kilo,
+    /// qodercli, qoder, qwen, qwen-code, maki.
+    /// Default: empty.
+    pub cjk_ime_agents: Vec<String>,
+    /// Cursor shape rendered for the IME anchor when
+    /// `reveal_hidden_cursor_for_cjk_ime` is enabled. Default: "steady_block".
+    pub cjk_ime_cursor_shape: ImeCursorShape,
+    /// While prefix mode is active, temporarily switch the host input source
+    /// to an ASCII-capable mode so prefix commands are read as ASCII even when
+    /// an IME is active, then restore the previous input source when prefix
+    /// mode exits. On macOS this selects the ASCII-capable keyboard layout; on
+    /// Windows it switches the IME to English (ASCII) input. Windows support is
+    /// currently limited to the Korean IME; with an IME for any other language,
+    /// the input source is left unchanged. macOS and Windows only; a no-op
+    /// elsewhere and a best-effort no-op if the switch fails.
+    /// Default: false.
+    pub switch_ascii_input_source_in_prefix: bool,
+}
+
+impl Default for KeysConfig {
+    fn default() -> Self {
+        Self {
+            prefix: "ctrl+b".into(),
+            help: BindingConfig::one("prefix+?"),
+            settings: BindingConfig::one("prefix+s"),
+            new_workspace: BindingConfig::one("prefix+shift+n"),
+            new_worktree: BindingConfig::one("prefix+shift+g"),
+            open_worktree: BindingConfig::empty(),
+            remove_worktree: BindingConfig::empty(),
+            rename_workspace: BindingConfig::one("prefix+shift+w"),
+            close_workspace: BindingConfig::one("prefix+shift+d"),
+            workspace_picker: BindingConfig::one("prefix+w"),
+            goto: BindingConfig::one("prefix+g"),
+            navigate_workspace_up: BindingConfig::one("up"),
+            navigate_workspace_down: BindingConfig::one("down"),
+            navigate_pane_left: BindingConfig::one("h"),
+            navigate_pane_down: BindingConfig::one("j"),
+            navigate_pane_up: BindingConfig::one("k"),
+            navigate_pane_right: BindingConfig::one("l"),
+            detach: BindingConfig::one("prefix+q"),
+            reload_config: BindingConfig::one("prefix+shift+r"),
+            open_notification_target: BindingConfig::one("prefix+o"),
+            previous_workspace: BindingConfig::empty(),
+            next_workspace: BindingConfig::empty(),
+            previous_agent: BindingConfig::empty(),
+            next_agent: BindingConfig::empty(),
+            focus_agent: BindingConfig::empty(),
+            remote_image_paste: "ctrl+v".into(),
+            new_tab: BindingConfig::one("prefix+c"),
+            new_chat_tab: BindingConfig::empty(),
+            rename_tab: BindingConfig::one("prefix+shift+t"),
+            previous_tab: BindingConfig::one("prefix+p"),
+            next_tab: BindingConfig::one("prefix+n"),
+            move_tab_previous: BindingConfig::empty(),
+            move_tab_next: BindingConfig::empty(),
+            switch_tab: BindingConfig::one("prefix+1..9"),
+            switch_workspace: BindingConfig::empty(),
+            close_tab: BindingConfig::one("prefix+shift+x"),
+            rename_pane: BindingConfig::one("prefix+shift+p"),
+            edit_scrollback: BindingConfig::one("prefix+e"),
+            copy_mode: BindingConfig::one("prefix+["),
+            focus_pane_left: BindingConfig::one("prefix+h"),
+            focus_pane_down: BindingConfig::one("prefix+j"),
+            focus_pane_up: BindingConfig::one("prefix+k"),
+            focus_pane_right: BindingConfig::one("prefix+l"),
+            swap_pane_left: BindingConfig::one("prefix+shift+h"),
+            swap_pane_down: BindingConfig::one("prefix+shift+j"),
+            swap_pane_up: BindingConfig::one("prefix+shift+k"),
+            swap_pane_right: BindingConfig::one("prefix+shift+l"),
+            cycle_pane_next: BindingConfig::one("prefix+tab"),
+            cycle_pane_previous: BindingConfig::one("prefix+shift+tab"),
+            last_pane: BindingConfig::empty(),
+            split_vertical: BindingConfig::one("prefix+v"),
+            split_horizontal: BindingConfig::one("prefix+minus"),
+            open_web_pane: BindingConfig::empty(),
+            close_pane: BindingConfig::one("prefix+x"),
+            zoom: BindingConfig::one("prefix+z"),
+            resize_mode: BindingConfig::one("prefix+r"),
+            resize_pane_left: BindingConfig::empty(),
+            resize_pane_down: BindingConfig::empty(),
+            resize_pane_up: BindingConfig::empty(),
+            resize_pane_right: BindingConfig::empty(),
+            toggle_sidebar: BindingConfig::one("prefix+b"),
+            toggle_bars: BindingConfig::one("prefix+shift+b"),
+            toggle_file_manager: BindingConfig::one("prefix+f"),
+            agent_attachment_picker: BindingConfig::one("prefix+a"),
+            indexed: IndexedKeysConfig::default(),
+            command: Vec::new(),
+            user_fields: BTreeSet::new(),
+        }
+    }
+}
+
+impl Default for WorktreesConfig {
+    fn default() -> Self {
+        Self {
+            directory: "~/.herdr/worktrees".into(),
+        }
+    }
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            // TP-TREE-13: the Spaces tab is a three-level tree — repository,
+            // checkout, chat — and depth is charged in columns. At 26 a branch
+            // name and its chat titles were both truncated before they said
+            // anything useful. 30 pays for the two levels of indent and leaves
+            // the names intact; `sidebar_max_width` still allows 36.
+            sidebar_width: 30,
+            sidebar_min_width: 18,
+            sidebar_max_width: 36,
+            sidebar_start_collapsed: false,
+            sidebar_collapsed_mode: SidebarCollapsedModeConfig::Compact,
+            mobile_width_threshold: DEFAULT_MOBILE_WIDTH_THRESHOLD,
+            mouse_capture: true,
+            copy_on_select: true,
+            host_cursor: HostCursorModeConfig::Auto,
+            right_click_passthrough_modifier: RightClickPassthroughModifierConfig::default(),
+            redraw_on_focus_gained: true,
+            mouse_scroll_lines: None,
+            mouse_wheel_host_scroll: MouseWheelHostScrollConfig::Mobile,
+            confirm_close: true,
+            prompt_new_tab_name: true,
+            prompt_new_workspace_name: false,
+            pane_borders: true,
+            pane_outer_borders: true,
+            pane_scrollbars: true,
+            pane_gaps: true,
+            show_agent_labels_on_pane_borders: false,
+            hide_tab_bar_when_single_tab: false,
+            tab_bar_position: TabBarPositionConfig::Top,
+            tab_bar_right: Vec::new(),
+            tab_bar_right_separator: " ".into(),
+            window_title: super::window_title::default_window_title(),
+            agent_panel_sort: AgentPanelSortConfig::Spaces,
+            chat_drawer_mode: ChatDrawerModeConfig::AllActive,
+            // The two openings a chat writes about itself: a scheduled task
+            // announces its own name and file, and a slash command announces
+            // the command. Both are declarations rather than guesses, which is
+            // why they can ship on by default. `<local-command-caveat>` is
+            // deliberately absent even though it is the single most common
+            // opening measured here (173 chats): the thing that writes it is
+            // the person's own `!` command, so hiding it by default would hide
+            // their own work.
+            routine_chat_markers: vec![
+                "<scheduled-task".into(),
+                "<command-name>".into(),
+                // Measured on the reported machine: 218 chats, 38 of them
+                // already in the graveyard. The code-review pass writes this
+                // sentence itself and writes nothing else first, so it is a
+                // declaration in the same sense the two tags above are — just
+                // spelled in English because a person never had to read it.
+                "review this change for security vulnerabilities".into(),
+            ],
+            routine_chat_prompt_patterns: Vec::new(),
+            routine_chat_repeat_threshold: DEFAULT_ROUTINE_CHAT_REPEAT_THRESHOLD,
+            hidden_chat_labels: vec![ROUTINE_CHAT_LABEL.to_string()],
+            _legacy_agent_panel_scope: None,
+            status_indicators: StatusIndicatorStyle::Dots,
+            sidebar: SidebarConfig::default(),
+            accent: "cyan".into(),
+            toast: ToastConfig::default(),
+            sound: SoundConfig::default(),
+        }
+    }
+}
+
+impl UiConfig {
+    pub fn mouse_scroll_lines(&self) -> usize {
+        self.mouse_scroll_lines
+            .map(NonZeroUsize::get)
+            .unwrap_or(DEFAULT_MOUSE_SCROLL_LINES)
+    }
+
+    pub fn right_click_passthrough_modifiers(&self) -> Option<KeyModifiers> {
+        self.right_click_passthrough_modifier.modifiers()
+    }
+}
+
+impl Default for ToastConfig {
+    fn default() -> Self {
+        Self {
+            delivery: ToastDelivery::Off,
+            delay_seconds: 1,
+            herdr: HerdrToastConfig::default(),
+            clipboard: ClipboardToastConfig::default(),
+        }
+    }
+}
+
+impl Default for HerdrToastConfig {
+    fn default() -> Self {
+        Self {
+            position: ToastHerdrPosition::BottomRight,
+        }
+    }
+}
+
+impl Default for ClipboardToastConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            position: ToastClipboardPosition::BottomCenter,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ToastConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize, Default)]
+        #[serde(default)]
+        struct RawToastConfig {
+            delivery: Option<ToastDelivery>,
+            enabled: Option<bool>,
+            delay_seconds: Option<u64>,
+            herdr: HerdrToastConfig,
+            clipboard: ClipboardToastConfig,
+        }
+
+        let raw = RawToastConfig::deserialize(deserializer)?;
+        let legacy_delivery = match raw.enabled {
+            Some(true) => ToastDelivery::Herdr,
+            Some(false) | None => ToastDelivery::Off,
+        };
+        let delivery = raw.delivery.unwrap_or(legacy_delivery);
+        let default = Self::default();
+        let delay_seconds = raw.delay_seconds.unwrap_or(default.delay_seconds);
+        if delay_seconds > MAX_TOAST_DELAY_SECONDS {
+            return Err(de::Error::custom(format!(
+                "ui.toast.delay_seconds must be between 0 and {MAX_TOAST_DELAY_SECONDS}"
+            )));
+        }
+        Ok(Self {
+            delivery,
+            delay_seconds,
+            herdr: raw.herdr,
+            clipboard: raw.clipboard,
+        })
+    }
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            headless_cols: crate::config::DEFAULT_HEADLESS_COLS,
+            headless_rows: crate::config::DEFAULT_HEADLESS_ROWS,
+        }
+    }
+}
+
+impl Default for AdvancedConfig {
+    fn default() -> Self {
+        Self {
+            scrollback_limit_bytes: DEFAULT_SCROLLBACK_LIMIT_BYTES,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // TP-ACT-DEFAULT: the default keybinds bind prefix+f to the file manager.
+    #[test]
+    fn default_binds_prefix_f_to_file_manager() {
+        assert_eq!(
+            KeysConfig::default().toggle_file_manager,
+            BindingConfig::one("prefix+f")
+        );
+    }
+
+    // TP-M1.1-KEYBIND: M1 owns one configurable prefix action and must use the
+    // existing user-first conflict registry instead of hard-coding input.
+    #[test]
+    fn default_binds_prefix_a_to_agent_attachment_picker_without_conflict() {
+        let defaults = Config::default();
+        assert_eq!(
+            defaults.keys.agent_attachment_picker,
+            BindingConfig::one("prefix+a")
+        );
+        assert_eq!(
+            defaults
+                .keybinds()
+                .agent_attachment_picker
+                .label()
+                .as_deref(),
+            Some("prefix+a")
+        );
+
+        let displaced: Config = toml::from_str(
+            r#"
+[keys]
+next_tab = "prefix+a"
+"#,
+        )
+        .unwrap();
+        let displaced = displaced.keybinds();
+        assert_eq!(displaced.next_tab.label().as_deref(), Some("prefix+a"));
+        assert!(displaced.agent_attachment_picker.bindings.is_empty());
+    }
+
+    #[test]
+    fn update_config_defaults_and_parses() {
+        let default_config = Config::default();
+        assert_eq!(default_config.update.channel, default_update_channel());
+        assert!(default_config.update.version_check);
+        assert!(default_config.update.manifest_check);
+
+        let toml = r#"
+[update]
+channel = "preview"
+version_check = false
+manifest_check = false
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.update.channel, UpdateChannelConfig::Preview);
+        assert_eq!(config.update.channel.as_str(), "preview");
+        assert!(!config.update.version_check);
+        assert!(!config.update.manifest_check);
+    }
+
+    #[test]
+    fn update_channel_default_follows_windows_build_identity() {
+        assert_eq!(
+            default_update_channel_for_build(true, true),
+            UpdateChannelConfig::Preview
+        );
+        assert_eq!(
+            default_update_channel_for_build(true, false),
+            UpdateChannelConfig::Stable
+        );
+        assert_eq!(
+            default_update_channel_for_build(false, true),
+            UpdateChannelConfig::Stable
+        );
+    }
+
+    #[test]
+    fn missing_update_channel_uses_build_default() {
+        let empty: Config = toml::from_str("").unwrap();
+        let without_update_channel: Config =
+            toml::from_str("[update]\nversion_check = false").unwrap();
+
+        assert_eq!(Config::default().update.channel, default_update_channel());
+        assert_eq!(empty.update.channel, default_update_channel());
+        assert_eq!(
+            without_update_channel.update.channel,
+            default_update_channel()
+        );
+    }
+
+    #[test]
+    fn terminal_default_shell_defaults_empty_and_parses() {
+        let default_config = Config::default();
+        assert!(default_config.terminal.default_shell.is_empty());
+        assert_eq!(default_config.terminal.shell_mode, ShellModeConfig::Auto);
+
+        let toml = r#"
+[terminal]
+default_shell = "nu"
+shell_mode = "non_login"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.terminal.default_shell, "nu");
+        assert_eq!(config.terminal.shell_mode, ShellModeConfig::NonLogin);
+    }
+
+    #[test]
+    fn terminal_new_cwd_defaults_follow_and_parses() {
+        let default_config = Config::default();
+        assert_eq!(
+            default_config.terminal.new_cwd,
+            NewTerminalCwdConfig::Follow
+        );
+
+        let config: Config = toml::from_str(
+            r#"
+[terminal]
+new_cwd = "home"
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.terminal.new_cwd, NewTerminalCwdConfig::Home);
+
+        let config: Config = toml::from_str(
+            r#"
+[terminal]
+new_cwd = "~/Projects"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.terminal.new_cwd,
+            NewTerminalCwdConfig::Path("~/Projects".into())
+        );
+    }
+
+    #[test]
+    fn resume_agents_on_restore_defaults_on_and_parses() {
+        let default_config = Config::default();
+        assert!(default_config.session.resume_agents_on_restore);
+
+        let toml = r#"
+[session]
+resume_agents_on_restore = false
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(!config.session.resume_agents_on_restore);
+    }
+
+    // Preview placement: absent section → implemented default; every declared
+    // mode round-trips through its persisted kebab-case value; only the
+    // default is available (the rest are announced "soon" and must be treated
+    // as fallback by runtime consumers).
+    #[test]
+    fn preview_placement_defaults_parses_and_roundtrips() {
+        let default_config = Config::default();
+        assert_eq!(
+            default_config.preview.placement,
+            PreviewPlacement::SameScreenHalf
+        );
+        assert!(default_config.preview.placement.is_available());
+
+        let toml_src = r#"
+[preview]
+placement = "other-monitor-per-chat"
+"#;
+        let config: Config = toml::from_str(toml_src).unwrap();
+        assert_eq!(
+            config.preview.placement,
+            PreviewPlacement::OtherMonitorPerChat
+        );
+        assert!(!config.preview.placement.is_available());
+
+        for mode in PreviewPlacement::ALL {
+            let parsed: PreviewConfig =
+                toml::from_str(&format!("placement = \"{}\"", mode.config_value())).unwrap();
+            assert_eq!(parsed.placement, *mode, "config_value must round-trip");
+        }
+        assert_eq!(
+            PreviewPlacement::ALL
+                .iter()
+                .filter(|mode| mode.is_available())
+                .count(),
+            1,
+            "exactly one implemented mode until a soon backend lands"
+        );
+    }
+
+    #[test]
+    fn agent_panel_sort_config_parses_alias_and_defaults() {
+        assert_eq!(
+            Config::default().ui.agent_panel_sort,
+            AgentPanelSortConfig::Spaces
+        );
+
+        let toml = r#"
+[ui]
+agent_panel_sort = "priority"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.ui.agent_panel_sort, AgentPanelSortConfig::Priority);
+
+        let toml = r#"
+[ui]
+agent_panel_sort = "workspaces"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.ui.agent_panel_sort, AgentPanelSortConfig::Spaces);
+
+        let toml = r#"
+[ui]
+agent_panel_scope = "current"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.ui.agent_panel_sort, AgentPanelSortConfig::Spaces);
+    }
+
+    // TP-DRAWER-01: the drawer mode is a config surface — three values,
+    // all-active default.
+    #[test]
+    fn chat_drawer_mode_config_parses_and_defaults() {
+        assert_eq!(
+            Config::default().ui.chat_drawer_mode,
+            ChatDrawerModeConfig::AllActive
+        );
+
+        let toml = r#"
+[ui]
+chat_drawer_mode = "focused"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.ui.chat_drawer_mode, ChatDrawerModeConfig::Focused);
+
+        let toml = r#"
+[ui]
+chat_drawer_mode = "manual"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.ui.chat_drawer_mode, ChatDrawerModeConfig::Manual);
+
+        let toml = r#"
+[ui]
+chat_drawer_mode = "all-active"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.ui.chat_drawer_mode, ChatDrawerModeConfig::AllActive);
+    }
+
+    /// TP-MOB-101 (V1/V2): the default is the pre-existing behaviour, and every
+    /// documented value round-trips. A value that silently falls back to the
+    /// default is the worst outcome here — the reader turns the key on, the
+    /// wheel keeps doing nothing, and nothing anywhere says why.
+    #[test]
+    fn mouse_wheel_host_scroll_parses_and_defaults_to_mobile() {
+        assert_eq!(
+            Config::default().ui.mouse_wheel_host_scroll,
+            MouseWheelHostScrollConfig::Mobile,
+            "the default must stay the shipped behaviour: only the phone shell claims the wheel"
+        );
+
+        let toml = r#"
+[ui]
+mouse_wheel_host_scroll = "scrollable"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            config.ui.mouse_wheel_host_scroll,
+            MouseWheelHostScrollConfig::Scrollable
+        );
+
+        let toml = r#"
+[ui]
+mouse_wheel_host_scroll = "never"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            config.ui.mouse_wheel_host_scroll,
+            MouseWheelHostScrollConfig::Never
+        );
+
+        let toml = r#"
+[ui]
+mouse_wheel_host_scroll = "mobile"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            config.ui.mouse_wheel_host_scroll,
+            MouseWheelHostScrollConfig::Mobile
+        );
+    }
+
+    /// TP-DAILY-20 (C1a–C1e): the four keys are the whole configuration
+    /// surface of chat labelling, and each one fails in its own direction. A
+    /// default that does not hold means a fresh install classifies nothing. A
+    /// value that is written but not read means the reader edits the file and
+    /// the sidebar never changes — the failure D73 is named after. And a table
+    /// that names one key must leave its neighbours alone, or writing one line
+    /// silently unwrites the other three.
+    #[test]
+    fn routine_chat_keys_parse_and_default() {
+        let defaults = Config::default();
+        assert_eq!(
+            defaults.ui.routine_chat_markers,
+            vec![
+                "<scheduled-task".to_string(),
+                "<command-name>".to_string(),
+                "review this change for security vulnerabilities".to_string()
+            ],
+            "a fresh install must already know the openings a chat writes about itself"
+        );
+        assert!(
+            defaults
+                .ui
+                .routine_chat_markers
+                .iter()
+                .any(|marker| marker == "review this change for security vulnerabilities"),
+            "the code-review pass declares itself in a sentence rather than a tag, and it              ships on by default because no person writes that line by hand"
+        );
+        assert!(
+            defaults.ui.routine_chat_prompt_patterns.is_empty(),
+            "the patterns describe a person's own routines, so the shipped list starts empty"
+        );
+        assert_eq!(defaults.ui.routine_chat_repeat_threshold, 3);
+        assert_eq!(defaults.ui.hidden_chat_labels, vec!["routine".to_string()]);
+
+        // C1b: every key is read back exactly as it was written.
+        let toml = r#"
+[ui]
+routine_chat_markers = ["<scheduled-task", "<local-command-caveat"]
+routine_chat_prompt_patterns = ["claude code update"]
+routine_chat_repeat_threshold = 7
+hidden_chat_labels = ["routine", "context"]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            config.ui.routine_chat_markers,
+            vec![
+                "<scheduled-task".to_string(),
+                "<local-command-caveat".to_string()
+            ]
+        );
+        assert_eq!(
+            config.ui.routine_chat_prompt_patterns,
+            vec!["claude code update".to_string()]
+        );
+        assert_eq!(config.ui.routine_chat_repeat_threshold, 7);
+        assert_eq!(
+            config.ui.hidden_chat_labels,
+            vec!["routine".to_string(), "context".to_string()]
+        );
+
+        // C1c: zero is a value here, not a missing one — it turns the
+        // repetition layer off without turning the feature off.
+        let config: Config = toml::from_str(
+            r#"
+[ui]
+routine_chat_repeat_threshold = 0
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.ui.routine_chat_repeat_threshold, 0);
+
+        // C1d: an empty hidden list is how a reader asks for every chat back.
+        let config: Config = toml::from_str(
+            r#"
+[ui]
+hidden_chat_labels = []
+"#,
+        )
+        .unwrap();
+        assert!(config.ui.hidden_chat_labels.is_empty());
+
+        // C1e: naming one key must not unwrite the three beside it.
+        let config: Config = toml::from_str(
+            r#"
+[ui]
+routine_chat_repeat_threshold = 5
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.ui.routine_chat_repeat_threshold, 5);
+        assert_eq!(
+            config.ui.routine_chat_markers,
+            crate::config::Config::default().ui.routine_chat_markers,
+            "a table that names one key must leave the other three at their defaults"
+        );
+        assert_eq!(config.ui.hidden_chat_labels, vec!["routine".to_string()]);
+    }
+
+    // TP-MOD-41: the switch parses, and its default is ON — both through
+    // serde (a config file without the key) and through Default::default()
+    // (every synthetic construction), because a bool derive-default would
+    // silently flip the second road to OFF.
+    // TP-FM-ACTIONS-01: the row buttons ship hidden and are summoned by key.
+    #[test]
+    fn files_show_row_actions_defaults_off_and_parses_on() {
+        let config: Config = toml::from_str("").expect("empty config parses");
+        assert!(!config.files.show_row_actions, "absent key means hidden");
+        assert!(
+            !FilesConfig::default().show_row_actions,
+            "Default::default() agrees"
+        );
+
+        let config: Config =
+            toml::from_str("[files]\nshow_row_actions = true\n").expect("explicit key parses");
+        assert!(config.files.show_row_actions);
+    }
+
+    #[test]
+    fn spaces_show_empty_defaults_on_and_parses_off() {
+        let config: Config = toml::from_str("").expect("empty config parses");
+        assert!(config.spaces.show_empty, "absent key means on");
+        assert!(
+            SpacesConfig::default().show_empty,
+            "Default::default() agrees"
+        );
+
+        let config: Config =
+            toml::from_str("[spaces]\nshow_empty = false\n").expect("explicit key parses");
+        assert!(!config.spaces.show_empty);
+    }
+
+    /// A hand-written tree of the shape measured on the reported machine: two
+    /// buckets on one repository, a node, and a project.
+    fn hand_written_spaces() -> Config {
+        toml::from_str(
+            r#"
+[[spaces.split]]
+repo = "~/projects/herdr-web"
+match = ["*tabs*"]
+key = "herdr-web:tabs"
+label = "Tabs"
+
+[[spaces.split]]
+repo = "~/projects/herdr-web"
+match = ["*"]
+key = "herdr-web:rest"
+label = "Rest"
+
+[[spaces.node]]
+key = "docs-render"
+name = "Docs Render"
+
+[[spaces.project]]
+key = "project:herdr"
+name = "herdr"
+repos = ["~/projects/herdr"]
+"#,
+        )
+        .expect("the fixture parses")
+    }
+
+    // T3.4 / TP-MOD-34: the rename reaches every header kind — bucket, node
+    // and project alike. A rename that worked on one of the three would leave
+    // the person guessing which headers can be renamed and which cannot.
+    #[test]
+    fn a_display_entry_renames_a_bucket_a_node_and_a_project() {
+        let mut config = hand_written_spaces();
+        config.spaces.display = vec![
+            SpaceDisplayEntry {
+                key: "herdr-web:tabs".into(),
+                name: "Sekmeler".into(),
+            },
+            SpaceDisplayEntry {
+                key: "docs-render".into(),
+                name: "Belgeler".into(),
+            },
+            SpaceDisplayEntry {
+                key: "project:herdr".into(),
+                name: "Ana proje".into(),
+            },
+        ];
+
+        let rules = config.spaces.rules();
+        let nodes = config.spaces.nodes();
+        let name_of = |key: &str| {
+            nodes
+                .iter()
+                .find(|node| node.key == key)
+                .map(|node| node.name.clone())
+        };
+
+        assert_eq!(rules[0].label, "Sekmeler");
+        assert_eq!(
+            rules[1].label, "Rest",
+            "an unnamed rule keeps its own label"
+        );
+        assert_eq!(name_of("docs-render").as_deref(), Some("Belgeler"));
+        assert_eq!(name_of("project:herdr").as_deref(), Some("Ana proje"));
+    }
+
+    // T3.5 / TP-MOD-34: the load-bearing assertion. A rename must not disturb
+    // resolution — first-match order, patterns and repo roots are what decide
+    // which checkout lands in which bucket, and quietly moving a branch into
+    // another module is a far worse bug than a header with the wrong name.
+    #[test]
+    fn a_display_entry_changes_no_part_of_rule_resolution() {
+        let plain = hand_written_spaces();
+        let before: Vec<_> = plain
+            .spaces
+            .rules()
+            .into_iter()
+            .map(|rule| (rule.key, rule.repo_root, rule.patterns, rule.parent))
+            .collect();
+
+        let mut renamed = hand_written_spaces();
+        renamed.spaces.display = vec![SpaceDisplayEntry {
+            key: "herdr-web:tabs".into(),
+            name: "Sekmeler".into(),
+        }];
+        let after: Vec<_> = renamed
+            .spaces
+            .rules()
+            .into_iter()
+            .map(|rule| (rule.key, rule.repo_root, rule.patterns, rule.parent))
+            .collect();
+
+        assert_eq!(
+            before, after,
+            "a rename may change a name and nothing else — order included"
+        );
+    }
+
+    // T3.7 / TP-MOD-34: a blank name is ignored rather than applied. An empty
+    // header cannot be pointed at or clicked, and writing one would also read
+    // as "reset", which is a different verb than the one that wrote this.
+    #[test]
+    fn a_blank_display_name_leaves_the_header_alone() {
+        let mut config = hand_written_spaces();
+        config.spaces.display = vec![SpaceDisplayEntry {
+            key: "herdr-web:tabs".into(),
+            name: "   ".into(),
+        }];
+
+        assert_eq!(config.spaces.rules()[0].label, "Tabs");
+    }
+
+    // TP-MOD-34: the last entry wins, because the managed overlay is appended
+    // after the user's own file — so "last" means "most recent decision".
+    // Reading it first-wins would pin a module to the first name it ever had.
+    #[test]
+    fn the_most_recent_display_entry_is_the_one_that_shows() {
+        let mut config = hand_written_spaces();
+        config.spaces.display = vec![
+            SpaceDisplayEntry {
+                key: "herdr-web:tabs".into(),
+                name: "Eski".into(),
+            },
+            SpaceDisplayEntry {
+                key: "herdr-web:tabs".into(),
+                name: "Yeni".into(),
+            },
+        ];
+
+        assert_eq!(config.spaces.rules()[0].label, "Yeni");
+    }
+
+    // TP-NODE-01 (config half): no [[spaces.node]] table, no nodes — and the
+    // old tables still normalize exactly as they always have.
+    #[test]
+    fn an_absent_node_table_produces_no_nodes() {
+        let config: Config = toml::from_str(
+            r#"
+[[spaces.project]]
+key = "project:x"
+repos = ["~/repo"]
+"#,
+        )
+        .unwrap();
+
+        // The project entry doubles as a parentless node, so the tree
+        // walker has one vocabulary — and the claims machinery is untouched
+        // (projects() still answers membership).
+        let nodes = config.spaces.nodes();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].key, "project:x");
+        assert_eq!(nodes[0].parent, None);
+        assert_eq!(config.spaces.projects().len(), 1);
+    }
+
+    #[test]
+    fn a_spaces_node_table_parses_with_parent_and_falls_back_to_key() {
+        let config: Config = toml::from_str(
+            r#"
+[[spaces.node]]
+key = "node:ui"
+name = "UI Katmani"
+icon = "X"
+parent = "project:herdr"
+
+[[spaces.node]]
+key = "node:bare"
+"#,
+        )
+        .unwrap();
+
+        let nodes = config.spaces.nodes();
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0].key, "node:ui");
+        assert_eq!(nodes[0].name, "UI Katmani");
+        assert_eq!(nodes[0].icon.as_deref(), Some("X"));
+        assert_eq!(nodes[0].parent.as_deref(), Some("project:herdr"));
+        assert_eq!(nodes[1].name, "node:bare", "a blank name falls back to key");
+        assert_eq!(nodes[1].parent, None, "a blank parent means top level");
+    }
+
+    // TP-NODE-02
+    #[test]
+    fn a_project_entry_may_carry_a_parent_too() {
+        // The sugar is complete: a project is a node, so it can hang under
+        // another node the same way.
+        let config: Config = toml::from_str(
+            r#"
+[[spaces.node]]
+key = "node:root"
+
+[[spaces.project]]
+key = "project:x"
+repos = ["~/repo"]
+parent = "node:root"
+"#,
+        )
+        .unwrap();
+
+        let nodes = config.spaces.nodes();
+        let project_node = nodes.iter().find(|n| n.key == "project:x").unwrap();
+        assert_eq!(project_node.parent.as_deref(), Some("node:root"));
+    }
+
+    #[test]
+    fn split_parent_parses_and_reaches_the_rule() {
+        let config: Config = toml::from_str(
+            r#"
+[[spaces.split]]
+repo = "~/repo"
+match = ["feat/*"]
+key = "repo:feat"
+parent = "node:ui"
+"#,
+        )
+        .unwrap();
+
+        let rules = config.spaces.rules();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].parent.as_deref(), Some("node:ui"));
+    }
+
+    #[test]
+    fn node_diagnostics_report_unusable_entries() {
+        let config: Config = toml::from_str(
+            r#"
+[[spaces.node]]
+name = "keysiz"
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            config.spaces.nodes().is_empty(),
+            "a keyless node is unusable"
+        );
+        assert!(
+            config
+                .spaces
+                .diagnostics()
+                .iter()
+                .any(|d| d.contains("spaces.node[0]")),
+            "and the author is told: {:?}",
+            config.spaces.diagnostics()
+        );
+    }
+
+    #[test]
+    fn status_indicator_style_defaults_to_dots_and_parses_symbols() {
+        assert_eq!(
+            Config::default().ui.status_indicators,
+            StatusIndicatorStyle::Dots
+        );
+
+        let config: Config = toml::from_str(
+            r#"
+[ui]
+status_indicators = "symbols"
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.ui.status_indicators, StatusIndicatorStyle::Symbols);
+    }
+
+    #[test]
+    fn pane_appearance_defaults_and_parse() {
+        let default_config = Config::default();
+        assert!(default_config.ui.pane_borders);
+        assert!(default_config.ui.pane_outer_borders);
+        assert!(default_config.ui.pane_scrollbars);
+        assert!(default_config.ui.pane_gaps);
+        assert!(!default_config.ui.show_agent_labels_on_pane_borders);
+        assert!(!default_config.ui.hide_tab_bar_when_single_tab);
+        assert_eq!(
+            default_config.ui.tab_bar_position,
+            TabBarPositionConfig::Top
+        );
+        assert!(default_config.ui.tab_bar_right.is_empty());
+        assert_eq!(default_config.ui.tab_bar_right_separator, " ");
+        let toml = r#"
+[ui]
+pane_borders = false
+pane_outer_borders = false
+pane_scrollbars = false
+pane_gaps = true
+show_agent_labels_on_pane_borders = true
+hide_tab_bar_when_single_tab = true
+tab_bar_position = "bottom"
+tab_bar_right = [
+  { type = "zoom" },
+  { type = "hostname" },
+  { type = "datetime", format = "%H:%M" },
+  { type = "text", text = "prod" },
+  { type = "command", command = "status.sh", interval_seconds = 10, timeout_seconds = 3 },
+]
+tab_bar_right_separator = " · "
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(!config.ui.pane_borders);
+        assert!(!config.ui.pane_outer_borders);
+        assert!(!config.ui.pane_scrollbars);
+        assert!(config.ui.pane_gaps);
+        assert!(config.ui.show_agent_labels_on_pane_borders);
+        assert!(config.ui.hide_tab_bar_when_single_tab);
+        assert_eq!(config.ui.tab_bar_position, TabBarPositionConfig::Bottom);
+        assert_eq!(config.ui.tab_bar_right.len(), 5);
+        assert!(matches!(
+            config.ui.tab_bar_right[1],
+            TabBarRightEntryConfig::Hostname
+        ));
+        assert_eq!(config.ui.tab_bar_right_separator, " · ");
+    }
+
+    #[test]
+    fn worktrees_directory_defaults_and_parses() {
+        let default_config = Config::default();
+        assert_eq!(default_config.worktrees.directory, "~/.herdr/worktrees");
+
+        let toml = r#"
+[worktrees]
+directory = "~/Projects/herdr-worktrees"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.worktrees.directory, "~/Projects/herdr-worktrees");
+    }
+
+    #[test]
+    fn prompt_new_tab_name_defaults_on_and_parses() {
+        let default_config = Config::default();
+        assert!(default_config.ui.prompt_new_tab_name);
+
+        let toml = r#"
+[ui]
+prompt_new_tab_name = false
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(!config.ui.prompt_new_tab_name);
+    }
+
+    #[test]
+    fn prompt_new_workspace_name_defaults_off_and_parses() {
+        let default_config = Config::default();
+        assert!(!default_config.ui.prompt_new_workspace_name);
+
+        let toml = r#"
+[ui]
+prompt_new_workspace_name = true
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.ui.prompt_new_workspace_name);
+    }
+
+    #[test]
+    fn reveal_hidden_cursor_for_cjk_ime_default_off_and_parse() {
+        let default_config = Config::default();
+        assert!(!default_config.experimental.reveal_hidden_cursor_for_cjk_ime);
+
+        let toml = r#"
+[experimental]
+reveal_hidden_cursor_for_cjk_ime = true
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.experimental.reveal_hidden_cursor_for_cjk_ime);
+    }
+
+    #[test]
+    fn switch_ascii_input_source_in_prefix_default_off_and_parse() {
+        let default_config = Config::default();
+        assert!(
+            !default_config
+                .experimental
+                .switch_ascii_input_source_in_prefix
+        );
+
+        let toml = r#"
+[experimental]
+switch_ascii_input_source_in_prefix = true
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.experimental.switch_ascii_input_source_in_prefix);
+    }
+
+    #[test]
+    fn cjk_ime_cursor_shape_default_steady_block_and_parse() {
+        let default_config = Config::default();
+        assert_eq!(
+            default_config.experimental.cjk_ime_cursor_shape,
+            ImeCursorShape::SteadyBlock
+        );
+
+        let toml = r#"
+[experimental]
+cjk_ime_cursor_shape = "bar"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            config.experimental.cjk_ime_cursor_shape,
+            ImeCursorShape::Bar
+        );
+    }
+
+    #[test]
+    fn cjk_ime_agents_default_empty_and_parse() {
+        let default_config = Config::default();
+        assert!(default_config.experimental.cjk_ime_agents.is_empty());
+
+        let toml = r#"
+[experimental]
+cjk_ime_agents = ["claude", "codex"]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            config.experimental.cjk_ime_agents,
+            vec!["claude".to_string(), "codex".to_string()]
+        );
+    }
+
+    #[test]
+    fn sidebar_bounds_default_and_parse() {
+        let default_config = Config::default();
+        assert_eq!(default_config.ui.sidebar_min_width, 18);
+        assert_eq!(default_config.ui.sidebar_max_width, 36);
+        assert_eq!(
+            default_config.ui.mobile_width_threshold,
+            DEFAULT_MOBILE_WIDTH_THRESHOLD
+        );
+
+        let toml = r#"
+[ui]
+sidebar_min_width = 12
+sidebar_max_width = 80
+mobile_width_threshold = 96
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.ui.sidebar_min_width, 12);
+        assert_eq!(config.ui.sidebar_max_width, 80);
+        assert_eq!(config.ui.mobile_width_threshold, 96);
+    }
+
+    #[test]
+    fn sidebar_start_collapsed_defaults_off_and_parses_on() {
+        let default_config = Config::default();
+        assert!(!default_config.ui.sidebar_start_collapsed);
+
+        let toml = r#"
+[ui]
+sidebar_start_collapsed = true
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.ui.sidebar_start_collapsed);
+    }
+
+    #[test]
+    fn sidebar_collapsed_mode_defaults_compact_and_parses_hidden() {
+        let default_config = Config::default();
+        assert_eq!(
+            default_config.ui.sidebar_collapsed_mode,
+            SidebarCollapsedModeConfig::Compact
+        );
+
+        let toml = r#"
+[ui]
+sidebar_collapsed_mode = "hidden"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            config.ui.sidebar_collapsed_mode,
+            SidebarCollapsedModeConfig::Hidden
+        );
+    }
+
+    #[test]
+    fn validated_sidebar_bounds_rejects_inverted() {
+        assert_eq!(validated_sidebar_bounds(18, 36), Some((18, 36)));
+        assert_eq!(validated_sidebar_bounds(20, 20), Some((20, 20)));
+        assert_eq!(validated_sidebar_bounds(0, u16::MAX), Some((0, u16::MAX)));
+        assert_eq!(validated_sidebar_bounds(50, 30), None);
+        assert_eq!(validated_sidebar_bounds(u16::MAX, 0), None);
+    }
+
+    #[test]
+    fn mouse_capture_default_on_and_parse() {
+        let default_config = Config::default();
+        assert!(default_config.ui.mouse_capture);
+
+        let toml = r#"
+[ui]
+mouse_capture = false
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(!config.ui.mouse_capture);
+    }
+
+    #[test]
+    fn copy_on_select_default_on_and_parse() {
+        let default_config = Config::default();
+        assert!(default_config.ui.copy_on_select);
+
+        let toml = r#"
+[ui]
+copy_on_select = false
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(!config.ui.copy_on_select);
+    }
+
+    #[test]
+    fn right_click_passthrough_modifier_defaults_off_and_parses() {
+        let default_config = Config::default();
+        assert_eq!(default_config.ui.right_click_passthrough_modifiers(), None);
+
+        for value in ["", "off", "none", "disabled"] {
+            let toml = format!(
+                r#"
+[ui]
+right_click_passthrough_modifier = "{value}"
+"#
+            );
+            let config: Config = toml::from_str(&toml).unwrap();
+            assert_eq!(
+                config.ui.right_click_passthrough_modifiers(),
+                None,
+                "value {value:?} should disable passthrough"
+            );
+        }
+
+        for (value, expected) in [
+            ("ctrl", KeyModifiers::CONTROL),
+            ("control", KeyModifiers::CONTROL),
+            ("alt", KeyModifiers::ALT),
+            ("option", KeyModifiers::ALT),
+            ("cmd", KeyModifiers::SUPER),
+            ("command", KeyModifiers::SUPER),
+            ("super", KeyModifiers::SUPER),
+            ("meta", KeyModifiers::META),
+            ("hyper", KeyModifiers::HYPER),
+        ] {
+            let toml = format!(
+                r#"
+[ui]
+right_click_passthrough_modifier = "{value}"
+"#
+            );
+            let config: Config = toml::from_str(&toml).unwrap();
+            assert_eq!(
+                config.ui.right_click_passthrough_modifiers(),
+                Some(expected),
+                "value {value:?} should parse"
+            );
+        }
+
+        let toml = r#"
+[ui]
+right_click_passthrough_modifier = "cmd+alt"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            config.ui.right_click_passthrough_modifiers(),
+            Some(KeyModifiers::SUPER | KeyModifiers::ALT)
+        );
+    }
+
+    #[test]
+    fn right_click_passthrough_modifier_rejects_shift() {
+        for value in ["shift", "shift+ctrl", "ctrl+", "ctrl++alt", "banana"] {
+            let toml = format!(
+                r#"
+[ui]
+right_click_passthrough_modifier = "{value}"
+"#
+            );
+            assert!(
+                toml::from_str::<Config>(&toml).is_err(),
+                "value {value:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn redraw_on_focus_gained_default_on_and_parse() {
+        let default_config = Config::default();
+        assert!(default_config.ui.redraw_on_focus_gained);
+
+        let toml = r#"
+[ui]
+redraw_on_focus_gained = false
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(!config.ui.redraw_on_focus_gained);
+    }
+
+    #[test]
+    fn mouse_scroll_lines_defaults_to_three_and_parses() {
+        let default_config = Config::default();
+        assert_eq!(
+            default_config.ui.mouse_scroll_lines(),
+            DEFAULT_MOUSE_SCROLL_LINES
+        );
+
+        let toml = r#"
+[ui]
+mouse_scroll_lines = 1
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.ui.mouse_scroll_lines(), 1);
+    }
+
+    #[test]
+    fn mouse_scroll_lines_rejects_zero() {
+        let toml = r#"
+[ui]
+mouse_scroll_lines = 0
+"#;
+        assert!(toml::from_str::<Config>(toml).is_err());
+    }
+
+    #[test]
+    fn toast_config_parses() {
+        let toml = r#"
+[ui.toast]
+delivery = "terminal"
+delay_seconds = 2
+
+[ui.toast.herdr]
+position = "top-left"
+
+[ui.toast.clipboard]
+enabled = false
+position = "top-center"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.ui.toast.delivery, ToastDelivery::Terminal);
+        assert_eq!(config.ui.toast.delay_seconds, 2);
+        assert_eq!(config.ui.toast.herdr.position, ToastHerdrPosition::TopLeft);
+        assert!(!config.ui.toast.clipboard.enabled);
+        assert_eq!(
+            config.ui.toast.clipboard.position,
+            ToastClipboardPosition::TopCenter
+        );
+    }
+
+    #[test]
+    fn toast_config_defaults_preserve_existing_behavior_with_delay() {
+        let config = Config::default();
+        assert_eq!(config.ui.toast.delivery, ToastDelivery::Off);
+        assert_eq!(config.ui.toast.delay_seconds, 1);
+        assert_eq!(
+            config.ui.toast.herdr.position,
+            ToastHerdrPosition::BottomRight
+        );
+        assert!(config.ui.toast.clipboard.enabled);
+        assert_eq!(
+            config.ui.toast.clipboard.position,
+            ToastClipboardPosition::BottomCenter
+        );
+    }
+
+    #[test]
+    fn toast_config_parses_system_delivery() {
+        let toml = r#"
+[ui.toast]
+delivery = "system"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.ui.toast.delivery, ToastDelivery::System);
+    }
+
+    #[test]
+    fn toast_config_legacy_enabled_true_maps_to_herdr() {
+        let toml = r#"
+[ui.toast]
+enabled = true
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.ui.toast.delivery, ToastDelivery::Herdr);
+    }
+
+    #[test]
+    fn toast_config_legacy_enabled_false_maps_to_off() {
+        let toml = r#"
+[ui.toast]
+enabled = false
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.ui.toast.delivery, ToastDelivery::Off);
+    }
+
+    #[test]
+    fn toast_config_delivery_wins_over_legacy_enabled() {
+        let toml = r#"
+[ui.toast]
+enabled = true
+delivery = "terminal"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.ui.toast.delivery, ToastDelivery::Terminal);
+    }
+
+    #[test]
+    fn toast_config_rejects_unbounded_delay() {
+        let toml = format!(
+            r#"
+[ui.toast]
+delay_seconds = {}
+"#,
+            MAX_TOAST_DELAY_SECONDS + 1
+        );
+
+        let error = toml::from_str::<Config>(&toml).unwrap_err().to_string();
+
+        assert!(error.contains("ui.toast.delay_seconds must be between 0 and 3600"));
+    }
+
+    #[test]
+    fn missing_onboarding_shows_setup() {
+        let config = Config::default();
+        assert!(config.should_show_onboarding());
+    }
+
+    #[test]
+    fn onboarding_false_skips_setup() {
+        let config: Config = toml::from_str("onboarding = false").unwrap();
+        assert!(!config.should_show_onboarding());
+    }
+
+    #[test]
+    fn server_headless_size_defaults_and_parses() {
+        let default_config = Config::default();
+        assert_eq!(
+            default_config.server.headless_cols,
+            crate::config::DEFAULT_HEADLESS_COLS
+        );
+        assert_eq!(
+            default_config.server.headless_rows,
+            crate::config::DEFAULT_HEADLESS_ROWS
+        );
+
+        let config: Config = toml::from_str(
+            r#"[server]
+headless_cols = 160
+headless_rows = 50
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.server.headless_cols, 160);
+        assert_eq!(config.server.headless_rows, 50);
+
+        let invalid: Config = toml::from_str(
+            r#"[server]
+headless_cols = 0
+headless_rows = 50
+"#,
+        )
+        .unwrap();
+        assert!(invalid.invalid_headless_size_diagnostic().is_some());
+        assert_eq!(
+            invalid.headless_size(),
+            (
+                crate::config::DEFAULT_HEADLESS_COLS,
+                crate::config::DEFAULT_HEADLESS_ROWS
+            )
+        );
+    }
+
+    #[test]
+    fn advanced_defaults_include_scrollback_limit_bytes() {
+        let config = Config::default();
+        assert_eq!(
+            config.advanced.scrollback_limit_bytes,
+            DEFAULT_SCROLLBACK_LIMIT_BYTES
+        );
+    }
+
+    #[test]
+    fn pane_history_persistence_is_opt_in() {
+        assert!(!Config::default().experimental.pane_history);
+
+        let toml = r#"
+[experimental]
+pane_history = true
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+
+        assert!(config.experimental.pane_history);
+    }
+
+    #[test]
+    fn kitty_graphics_default_on_with_stable_opt_out() {
+        assert!(Config::default().kitty_graphics_enabled());
+
+        let config: Config = toml::from_str(
+            r#"
+[terminal]
+kitty_graphics = false
+"#,
+        )
+        .unwrap();
+        assert!(!config.kitty_graphics_enabled());
+    }
+
+    #[test]
+    fn legacy_experimental_kitty_graphics_setting_remains_compatible() {
+        let disabled: Config = toml::from_str(
+            r#"
+[experimental]
+kitty_graphics = false
+"#,
+        )
+        .unwrap();
+        assert!(!disabled.kitty_graphics_enabled());
+
+        let stable_setting_wins: Config = toml::from_str(
+            r#"
+[terminal]
+kitty_graphics = false
+
+[experimental]
+kitty_graphics = true
+"#,
+        )
+        .unwrap();
+        assert!(!stable_setting_wins.kitty_graphics_enabled());
+    }
+
+    /// TP-GFX-ZLIB-01: unset means on. A remote client that would otherwise
+    /// pay raw RGBA for every frame should not have to discover a setting
+    /// first, and `Config::default()` must agree with a parsed empty config —
+    /// a default that differs from the parsed one is a silent two-mode system.
+    #[test]
+    fn kitty_graphics_compression_defaults_to_on_and_can_be_turned_off() {
+        assert!(Config::default()
+            .experimental
+            .kitty_graphics_compression
+            .unwrap_or(true));
+
+        let empty: Config = toml::from_str("[experimental]\n").unwrap();
+        assert!(empty
+            .experimental
+            .kitty_graphics_compression
+            .unwrap_or(true));
+
+        let off: Config = toml::from_str(
+            r#"
+[experimental]
+kitty_graphics_compression = false
+"#,
+        )
+        .unwrap();
+        assert_eq!(off.experimental.kitty_graphics_compression, Some(false));
+    }
+
+    // TP-TAB-BROWSER-02: `[web] command` names the browser a web pane runs;
+    // unwritten or emptied, it is terminal-browser.
+    #[test]
+    fn web_config_names_the_browser_and_defaults_to_terminal_browser() {
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.web.command, ["terminal-browser", "open"]);
+        assert_eq!(config.web.effective_command(), ["terminal-browser", "open"]);
+
+        let config: Config = toml::from_str(
+            r#"
+[web]
+command = ["chromium", "--app"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.web.effective_command(), ["chromium", "--app"]);
+
+        let config: Config = toml::from_str("[web]\ncommand = []\n").unwrap();
+        assert!(config.web.command.is_empty());
+        assert_eq!(config.web.effective_command(), ["terminal-browser", "open"]);
+    }
+
+    #[test]
+    fn experimental_config_parses() {
+        let toml = r#"
+[experimental]
+allow_nested = true
+kitty_graphics = true
+pane_history = true
+switch_ascii_input_source_in_prefix = true
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.experimental.allow_nested);
+        assert_eq!(config.experimental.kitty_graphics, Some(true));
+        assert!(config.kitty_graphics_enabled());
+        assert!(config.experimental.pane_history);
+        assert!(config.experimental.switch_ascii_input_source_in_prefix);
+    }
+
+    #[test]
+    fn advanced_config_parses() {
+        let toml = r#"
+[advanced]
+scrollback_limit_bytes = 12345
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.advanced.scrollback_limit_bytes, 12345);
+    }
+
+    #[test]
+    fn advanced_legacy_scrollback_lines_alias_parses() {
+        let toml = r#"
+[advanced]
+scrollback_lines = 12345
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.advanced.scrollback_limit_bytes, 12345);
+    }
+
+    #[test]
+    fn spaces_rules_drop_unusable_entries() {
+        let config: Config = toml::from_str(
+            r#"
+[[spaces.split]]
+repo = ""
+match = ["a"]
+key = "k1"
+
+[[spaces.split]]
+repo = "relative/path"
+match = ["a"]
+key = "k2"
+
+[[spaces.split]]
+repo = "/repo/ok"
+match = ["a"]
+key = ""
+
+[[spaces.split]]
+repo = "/repo/ok"
+match = ["   "]
+key = "k4"
+
+[[spaces.split]]
+repo = "/repo/ok"
+match = ["feat/*"]
+key = "k5"
+"#,
+        )
+        .expect("config parses");
+
+        let rules = config.spaces.rules();
+        assert_eq!(
+            rules
+                .iter()
+                .map(|rule| rule.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["k5"],
+            "only the usable rule survives"
+        );
+        assert_eq!(
+            config.spaces.diagnostics().len(),
+            4,
+            "each dropped entry is reported: {:?}",
+            config.spaces.diagnostics()
+        );
+    }
+
+    // TP-AGPANEL-51: the authored ink must survive validation into the rule
+    // the renderer reads — a broken carry here would leave every module on
+    // the global colour while the config claims otherwise, silently.
+    #[test]
+    fn a_split_rules_passive_ink_survives_validation() {
+        let spaces = SpacesConfig {
+            split: vec![
+                SpaceSplitEntry {
+                    repo: "~/panel".into(),
+                    patterns: vec!["feat/*".into()],
+                    key: "panel:feat".into(),
+                    passive_color: "  blue  ".into(),
+                    ..Default::default()
+                },
+                SpaceSplitEntry {
+                    repo: "~/panel".into(),
+                    patterns: vec!["fix/*".into()],
+                    key: "panel:fix".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let rules = spaces.rules();
+        assert_eq!(
+            rules[0].passive_color.as_deref(),
+            Some("blue"),
+            "trimmed and carried"
+        );
+        assert_eq!(
+            rules[1].passive_color, None,
+            "blank inherits the global ink"
+        );
+    }
+
+    #[test]
+    fn space_split_entry_problem_rejects_unusable_entries() {
+        let usable = SpaceSplitEntry {
+            repo: "~/panel".into(),
+            patterns: vec!["feat/*".into()],
+            key: "panel:feat".into(),
+            label: String::new(),
+            icon: String::new(),
+            parent: String::new(),
+            passive_color: String::new(),
+        };
+        assert_eq!(space_split_entry_problem(&usable), None);
+
+        let mut no_key = usable.clone();
+        no_key.key = "  ".into();
+        assert_eq!(space_split_entry_problem(&no_key), Some("has no key"));
+
+        let mut relative = usable.clone();
+        relative.repo = "panel".into();
+        assert_eq!(
+            space_split_entry_problem(&relative),
+            Some("repo is not an absolute path")
+        );
+
+        let mut no_pattern = usable.clone();
+        no_pattern.patterns = vec![String::new()];
+        assert_eq!(
+            space_split_entry_problem(&no_pattern),
+            Some("has no usable match pattern")
+        );
+    }
+
+    #[test]
+    fn spaces_rule_label_falls_back_to_key() {
+        let config: Config = toml::from_str(
+            r#"
+[[spaces.split]]
+repo = "/repo/ok"
+match = ["feat/*"]
+key = "panel:feat"
+"#,
+        )
+        .expect("config parses");
+        assert_eq!(config.spaces.rules()[0].label, "panel:feat");
+    }
+
+    #[test]
+    fn spaces_diagnostics_report_duplicate_keys() {
+        let config: Config = toml::from_str(
+            r#"
+[[spaces.split]]
+repo = "/repo/ok"
+match = ["feat/*"]
+key = "panel:dup"
+
+[[spaces.split]]
+repo = "/repo/ok"
+match = ["fix/*"]
+key = "panel:dup"
+"#,
+        )
+        .expect("config parses");
+
+        assert!(
+            config
+                .spaces
+                .diagnostics()
+                .iter()
+                .any(|d| d.contains("already used by an earlier rule")),
+            "a duplicate key must be reported: {:?}",
+            config.spaces.diagnostics()
+        );
+    }
+
+    // TP-SPLIT-CONF-04: the same key in two different repositories is a
+    // deliberate cross-repository module, not a typo — the sidebar gathers
+    // both repositories' checkouts under one group, so no warning banner.
+    #[test]
+    fn spaces_diagnostics_ignore_shared_key_across_repos() {
+        let config: Config = toml::from_str(
+            r#"
+[[spaces.split]]
+repo = "/repo/fork"
+match = ["herdr-web"]
+key = "herdr:web"
+
+[[spaces.split]]
+repo = "/repo/pwa"
+match = ["main"]
+key = "herdr:web"
+"#,
+        )
+        .expect("config parses");
+
+        assert!(
+            config.spaces.diagnostics().is_empty(),
+            "two repositories may share one module key on purpose: {:?}",
+            config.spaces.diagnostics()
+        );
+    }
+
+    // TP-PROJ-CONF-01.
+    #[test]
+    fn spaces_projects_drop_unusable_entries() {
+        let config: Config = toml::from_str(
+            r#"
+[[spaces.project]]
+name = "keysiz"
+repos = ["/repo/a"]
+
+[[spaces.project]]
+key = "project:rel"
+repos = ["relative/path"]
+
+[[spaces.project]]
+key = "project:bos"
+
+[[spaces.project]]
+key = "project:ok"
+name = "Herdr"
+icon = " 🚀 "
+repos = ["/repo/a", "  "]
+spaces = ["a:acme", "   "]
+"#,
+        )
+        .expect("config parses");
+
+        let projects = config.spaces.projects();
+        assert_eq!(
+            projects
+                .iter()
+                .map(|project| project.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["project:ok"],
+            "only the usable project survives"
+        );
+        assert_eq!(projects[0].name, "Herdr");
+        assert_eq!(projects[0].icon.as_deref(), Some("🚀"));
+        assert_eq!(
+            projects[0].repo_roots,
+            vec![std::path::PathBuf::from("/repo/a")],
+            "blank repos entries are dropped, not treated as members"
+        );
+        assert_eq!(projects[0].space_keys, vec!["a:acme".to_string()]);
+        assert_eq!(
+            config.spaces.diagnostics().len(),
+            3,
+            "each dropped project is reported: {:?}",
+            config.spaces.diagnostics()
+        );
+    }
+
+    // TP-PROJ-CONF-01.
+    #[test]
+    fn space_project_entry_problem_rejects_unusable_entries() {
+        let usable = SpaceProjectEntry {
+            name: String::new(),
+            key: "project:x".into(),
+            icon: String::new(),
+            repos: vec!["~/panel".into()],
+            spaces: Vec::new(),
+            parent: String::new(),
+        };
+        assert_eq!(space_project_entry_problem(&usable), None);
+
+        let mut no_key = usable.clone();
+        no_key.key = "  ".into();
+        assert_eq!(space_project_entry_problem(&no_key), Some("has no key"));
+
+        let mut relative = usable.clone();
+        relative.repos = vec!["panel".into()];
+        assert_eq!(
+            space_project_entry_problem(&relative),
+            Some("has a repo that is not an absolute path")
+        );
+
+        let mut no_members = usable.clone();
+        no_members.repos = Vec::new();
+        no_members.spaces = vec!["   ".into()];
+        assert_eq!(
+            space_project_entry_problem(&no_members),
+            Some("has no usable repos or spaces member")
+        );
+
+        let mut spaces_only = usable.clone();
+        spaces_only.repos = Vec::new();
+        spaces_only.spaces = vec!["a:acme".into()];
+        assert_eq!(
+            space_project_entry_problem(&spaces_only),
+            None,
+            "a project may consist of promoted spaces alone"
+        );
+    }
+
+    // TP-PROJ-CONF-02.
+    #[test]
+    fn projects_diagnostics_report_duplicate_project_keys() {
+        let config: Config = toml::from_str(
+            r#"
+[[spaces.project]]
+key = "project:dup"
+repos = ["/repo/a"]
+
+[[spaces.project]]
+key = "project:dup"
+repos = ["/repo/b"]
+"#,
+        )
+        .expect("config parses");
+
+        assert!(
+            config
+                .spaces
+                .diagnostics()
+                .iter()
+                .any(|d| d.contains("already used by an earlier project")),
+            "a duplicate project key must be reported: {:?}",
+            config.spaces.diagnostics()
+        );
+    }
+
+    #[test]
+    fn spaces_project_name_falls_back_to_key() {
+        let config: Config = toml::from_str(
+            r#"
+[[spaces.project]]
+key = "project:herdr"
+repos = ["/repo/a"]
+"#,
+        )
+        .expect("config parses");
+        assert_eq!(config.spaces.projects()[0].name, "project:herdr");
+        assert_eq!(
+            config.spaces.projects()[0].icon,
+            None,
+            "a blank icon means \"use the configured default\", not an empty glyph"
+        );
+    }
+
+    /// The switch defaults on, and it has to survive two different ways of
+    /// writing a config that never mentions it.
+    ///
+    /// A `bool` field's own type default is `false`, so a switch that leans on
+    /// `#[serde(default)]` alone would turn every existing bar's glyphs off the
+    /// moment it shipped — a silent change to a screen nobody asked to change.
+    /// The neighbouring `[shell.bars]` fields carry per-field defaults for the
+    /// same reason, and this test is here so the next person does not have to
+    /// remember which of the two serde rules applies.
+    #[test]
+    fn glyph_icons_stay_on_until_someone_turns_them_off() {
+        let absent: Config = toml::from_str("").expect("empty config parses");
+        assert!(
+            absent.shell.glyph_icons,
+            "a config with no [shell] section must not disable glyph icons"
+        );
+
+        let shell_written: Config =
+            toml::from_str("[shell.bars.top]\n").expect("bar-only config parses");
+        assert!(
+            shell_written.shell.glyph_icons,
+            "writing a bar must not disable the glyphs that bar might draw"
+        );
+
+        let off: Config =
+            toml::from_str("[shell]\nglyph_icons = false\n").expect("switch config parses");
+        assert!(
+            !off.shell.glyph_icons,
+            "the switch has to be reachable, or the fallback can never be seen"
+        );
+    }
+
+    // TP-ICON-02 (parse half; the render half lives in ui::sidebar).
+    #[test]
+    fn split_rules_carry_optional_icons() {
+        let config: Config = toml::from_str(
+            r#"
+[[spaces.split]]
+repo = "/repo/ok"
+match = ["feat/*"]
+key = "panel:feat"
+icon = " 🌐 "
+
+[[spaces.split]]
+repo = "/repo/ok"
+match = ["fix/*"]
+key = "panel:fix"
+"#,
+        )
+        .expect("config parses");
+        let rules = config.spaces.rules();
+        assert_eq!(rules[0].icon.as_deref(), Some("🌐"));
+        assert_eq!(rules[1].icon, None);
+    }
+
+    // TP-ICON-04.
+    #[test]
+    fn space_icons_defaults_and_partial_override() {
+        let defaults = SpacesConfig::default().icons;
+        assert_eq!(
+            (
+                defaults.project.as_str(),
+                defaults.branch.as_str(),
+                defaults.chat.as_str()
+            ),
+            ("📁", "", "💬"),
+            "row-kind icons work without any config"
+        );
+
+        let config: Config = toml::from_str(
+            r#"
+[spaces.icons]
+chat = "✉"
+"#,
+        )
+        .expect("config parses");
+        assert_eq!(config.spaces.icons.chat, "✉");
+        assert_eq!(
+            config.spaces.icons.branch, "\u{e0a0}",
+            "an unmentioned icon keeps its default"
+        );
+    }
+
+    #[test]
+    fn projects_pinned_defaults_empty() {
+        let config = Config::default();
+        assert!(config.projects.pinned.is_empty());
+        assert!(config.projects.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn projects_pinned_parses_absolute_paths() {
+        let toml = r#"
+[projects]
+pinned = ["/home/a/projects/x", "/home/a/work/y"]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            config.projects.pinned,
+            vec![
+                "/home/a/projects/x".to_string(),
+                "/home/a/work/y".to_string(),
+            ]
+        );
+        assert!(config.projects.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn projects_pinned_accepts_tilde_rooted_entries() {
+        let toml = r#"
+[projects]
+pinned = ["~/projects/herdr"]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        // `~`-rooted entries are treated as usable (no diagnostic).
+        assert!(config.projects.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn projects_pinned_blank_entries_are_reported() {
+        let toml = r#"
+[projects]
+pinned = ["/home/a/x", "", "   ", "/home/a/y"]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let diagnostics = config.projects.diagnostics();
+        assert_eq!(diagnostics.len(), 2, "two blank entries should warn");
+        assert!(
+            diagnostics.iter().all(|d| d.contains("blank")),
+            "blank entries should be reported as blank: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn projects_pinned_relative_entries_are_reported() {
+        let toml = r#"
+[projects]
+pinned = ["/home/a/abs", "relative/dir", "./also/relative"]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let diagnostics = config.projects.diagnostics();
+        assert_eq!(diagnostics.len(), 2);
+        assert!(
+            diagnostics
+                .iter()
+                .all(|d| d.contains("not an absolute path")),
+            "relative entries should be reported: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn projects_pinned_trims_before_validation() {
+        let toml = r#"
+[projects]
+pinned = ["  /home/a/x  "]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        // Surrounding whitespace is trimmed before the absolute-path check,
+        // so this entry is usable and produces no diagnostic.
+        assert!(config.projects.diagnostics().is_empty());
+    }
+
+    // P1: pinned_paths() keeps usable entries in order (absolute + tilde),
+    // trims surrounding whitespace, and drops blank/relative entries.
+    #[test]
+    fn projects_pinned_paths_keeps_usable_and_drops_unusable() {
+        let toml = r#"
+[projects]
+pinned = ["/a", "", "  ~/z  ", "relative/dir", "./nope", "  /w  "]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            config.projects.pinned_paths(),
+            vec!["/a".to_string(), "~/z".to_string(), "/w".to_string(),]
+        );
+    }
+
+    #[test]
+    fn projects_pinned_paths_default_empty() {
+        assert!(Config::default().projects.pinned_paths().is_empty());
+    }
+}

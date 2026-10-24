@@ -1,0 +1,57 @@
+/target
+node_modules/
+/vendor/libghostty-vt/zig-pkg/
+__pycache__/
+*.pyc
+*.swp
+*.swo
+*~
+.DS_Store
+
+/docs/*
+!/docs/next/
+!/docs/next/**
+!/docs/preview/
+!/docs/preview/**
+!/docs/versions/
+!/docs/versions/**
+# Fork-owned catalogues. These are cited as authoritative by this repo's own
+# agent routing, so losing them breaks the workflow rather than just the docs.
+# They were kept alive by `git add -f` until now, which meant every file added
+# later silently fell back out of the tree.
+!/docs/patterns/
+!/docs/patterns/**
+!/docs/references/
+!/docs/references/**
+# Dated analysis notes. Same reason as the two above, one step earlier in the
+# workflow: these are the written record of measurements this repo's agents cite
+# when they decide what to build, and a measurement nobody can find again is a
+# measurement that gets made twice.
+!/docs/analysis/
+!/docs/analysis/**
+# The surfaces registry: which user surface, which content class, which layer is
+# solved and on what evidence. It exists because an agent re-derived a six-day-old
+# measurement from scratch; the answer to that is a findable record, not a better memory.
+!/docs/surfaces/
+!/docs/surfaces/**
+# Lesson ledger: known errors, proven paths, edge cases. Kept in git so a lesson
+# can be diffed across versions rather than living only in a session transcript.
+!/docs/lessons/
+!/docs/lessons/**
+/.local/
+/backlog
+
+/.pi/todos
+/.pi/issues
+/.pi/cache
+/result
+/result-*
+
+/.wrangler/
+**/.wrangler/
+.cartography/
+.superpowers/
+
+# Tool residue that is not work: playwright MCP output and wt.sh reconcile logs
+.playwright-mcp/
+.wt-rec-test.log
