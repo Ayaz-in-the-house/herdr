@@ -22,8 +22,8 @@ include = [
 
 [dependencies]
 # the files surface writes archives with it; the sheet preview tests read them.
-zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
-base64 = "0.22.1"
+zip = { version = "9.0.0", default-features = false, features = ["deflate"] }
+base64 = "0.23.1"
 flate2 = "1.1.9"
 bincode = { version = "2", features = ["serde"] }
 bytes = "1"
@@ -32,19 +32,19 @@ clap_complete = "4.5"
 crossterm = "0.29"
 ctrlc = { version = "3", features = ["termination"] }
 interprocess = "2.4.2"
-jsonc-parser = { version = "0.33.1", default-features = false, features = ["cst", "serde_json"] }
+jsonc-parser = { version = "0.34.0", default-features = false, features = ["cst", "serde_json"] }
 libc = "0.2"
 portable-pty = "=0.9.0"
-png = "0.17"
+png = "0.18"
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_ignored = "0.1.14"
 serde_json = "1"
-sha2 = "0.10"
-time = { version = "=0.3.47", features = ["local-offset", "parsing", "formatting"] }
+sha2 = "0.11"
+time = { version = "=0.3.55", features = ["local-offset", "parsing", "formatting"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util"] }
-toml = "0.8"
+toml = "1.1"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 unicode-width = "0.2"
@@ -63,15 +63,15 @@ syntect = { version = "5.3.0", default-features = false, features = ["default-sy
 # sample of each so a feature dropped here cannot pass silently.
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico", "tiff"] }
 trash = { version = "5.2.6", default-features = false, features = ["coinit_multithreaded"] }
-calamine = "0.36.0"
-hayro = "0.7.1"
+calamine = "0.37.0"
+hayro = "0.8.0"
 # Pure-Rust Opus (BSD-3-Clause), pinned exactly: the crate is young (0.1.x) and
 # publishes often, and a codec that silently changes its output between patch
 # releases is the one dependency whose drift is inaudible until playback.
 # Chosen over the libopus bindings because the gate lints a Windows target and
 # the build box has no audio system headers: a C dependency would make the
 # codec untestable on the only machine allowed to compile this repo.
-opus-rs = { version = "=0.1.32", default-features = false, features = ["std", "heap"] }
+opus-rs = { version = "=0.1.39", default-features = false, features = ["std", "heap"] }
 
 [patch.crates-io]
 portable-pty = { path = "vendor/portable-pty" }
